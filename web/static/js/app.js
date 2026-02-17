@@ -1,0 +1,434 @@
+const $ = id => document.getElementById(id);
+let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
+let roomUsers = [], myClientID = null;
+let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential', pendingTrackIndex = -1;
+
+function renderAudiencePanel() {
+    const list = $('audienceList');
+    if (!list) return;
+    list.innerHTML = roomUsers.map(u => {
+        const hostBadge = u.isHost ? '<span class="host-badge">👑</span>' : '';
+        const kickBtn = (isHost && !u.isHost) ? `<button class="btn-kick" data-cid="${u.clientID}">踢出</button>` : '';
+        return `<div class="audience-row"><span class="audience-info">${hostBadge}${u.username} <span class="audience-uid">(UID:${String(u.uid).padStart(5,'0')})</span></span>${kickBtn}</div>`;
+    }).join('');
+    list.querySelectorAll('.btn-kick').forEach(btn => {
+        btn.onclick = () => {
+            if (confirm('确定踢出该用户？')) ws.send(JSON.stringify({ type: 'kick', targetClientID: btn.dataset.cid }));
+        };
+    });
+    renderAvatarBar();
+}
+
+function renderAvatarBar() {
+    const bar = $('avatarBar');
+    if (!bar) return;
+    const maxShow = 5;
+    const show = roomUsers.slice(0, maxShow);
+    const overflow = roomUsers.length - maxShow;
+    bar.innerHTML = show.map(u => {
+        const initial = (u.username || '?')[0].toUpperCase();
+        const cls = u.isHost ? 'avatar-bubble owner' : 'avatar-bubble';
+        return `<div class="${cls}"><span>${initial}</span><span class="avatar-tooltip">${u.isHost ? '👑 ' : ''}${u.username}</span></div>`;
+    }).join('');
+    if (overflow > 0) bar.innerHTML += `<div class="avatar-bubble overflow">+${overflow}</div>`;
+    bar.onclick = () => { $('audiencePanel').classList.toggle('hidden'); renderAudiencePanel(); };
+}
+
+function showScreen(id) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    $(id).classList.add('active');
+}
+
+function formatTime(s) {
+    if (!s || isNaN(s) || !isFinite(s) || s < 0) return '0:00';
+    const m = Math.floor(s / 60);
+    return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+}
+
+function connect(onOpen) {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    ws.onopen = () => { console.log('WS connected'); if (onOpen) onOpen(); };
+    ws.onmessage = e => handleMessage(JSON.parse(e.data));
+    ws.onclose = () => setTimeout(() => connect(), 3000);
+    ws.onerror = e => console.error('WS error', e);
+}
+
+async function handleMessage(msg) {
+    console.log('WS:', msg.type, msg);
+    switch (msg.type) {
+        case 'created': case 'joined':
+            roomCode = msg.roomCode; isHost = msg.isHost;
+            if (msg.users) { roomUsers = msg.users; renderAudiencePanel(); }
+            location.hash = roomCode;
+            $('displayCode').textContent = roomCode;
+            $('userCount').textContent = msg.clientCount || 1;
+            showScreen('room');
+            window.clockSync.start(ws);
+            if (msg.audio) { audioInfo = msg.audio; await setupAudio(); }
+            loadPlaylist();
+            $('playlistPanel').classList.remove('hidden');
+            break;
+        case 'userJoined': case 'userLeft':
+            $('userCount').textContent = msg.clientCount;
+            if (msg.users) { roomUsers = msg.users; renderAudiencePanel(); }
+            break;
+        case 'kicked':
+            alert('你已被房主移出房间');
+            if (window.audioPlayer) window.audioPlayer.stop();
+            stopUIUpdate();
+            location.hash = '';
+            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            $('audiencePanel').classList.add('hidden');
+            showScreen('home');
+            break;
+        case 'audioReady':
+            audioInfo = msg.audio; await setupAudio(); break;
+        case 'play':
+            await doPlay(msg.position, msg.serverTime, msg.scheduledAt); break;
+        case 'pause':
+            doPause(); break;
+        case 'seek':
+            if (window.audioPlayer.isPlaying) {
+                await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+            } else {
+                pausedPosition = msg.position;
+                window.audioPlayer.lastPosition = msg.position;
+                window.audioPlayer.startOffset = msg.position;
+                $('currentTime').textContent = formatTime(msg.position);
+                $('progressBar').value = msg.position;
+            }
+            break;
+        case 'hostTransfer':
+            isHost = true;
+            $('userCount').textContent = msg.clientCount;
+            $('syncStatus').textContent = 'You are now the host';
+            if (msg.users) { roomUsers = msg.users; renderAudiencePanel(); }
+            break;
+        case 'roleChanged':
+            // Role was changed by owner
+            Auth.updateUIForRole(msg.role);
+            if (msg.role === 'user') {
+                // If in a room as host, the room will be closed server-side
+                // Just update UI
+            }
+            break;
+        case 'roomClosed':
+            // Room was closed (e.g. owner demoted)
+            alert(msg.error || '房间已关闭');
+            if (window.audioPlayer) window.audioPlayer.stop();
+            stopUIUpdate();
+            location.hash = '';
+            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            $('audiencePanel').classList.add('hidden');
+            showScreen('home');
+            break;
+        case 'pong': window.clockSync.handlePong(msg); break;
+        case 'error': alert(msg.error); break;
+        case 'playlistUpdate':
+            if (msg.playlistData) {
+                playlist = msg.playlistData.playlist;
+                playlistItems = msg.playlistData.items || [];
+                if (playlist) playMode = playlist.play_mode || 'sequential';
+                renderPlaylist();
+                if (pendingTrackIndex >= 0 && playlistItems.length) {
+                    const idx = pendingTrackIndex; pendingTrackIndex = -1;
+                    await playTrackByIndex(idx);
+                }
+            }
+            break;
+        case 'nextTrack':
+            // Wait for playlistItems if not yet loaded
+            if (!playlistItems || !playlistItems.length) {
+                pendingTrackIndex = msg.trackIndex;
+            } else {
+                await playTrackByIndex(msg.trackIndex);
+            }
+            break;
+    }
+}
+
+async function setupAudio() {
+    $('trackName').textContent = audioInfo.filename;
+    $('totalTime').textContent = formatTime(audioInfo.duration);
+    $('progressBar').max = audioInfo.duration;
+    $('progressBar').value = 0;
+    $('currentTime').textContent = '0:00';
+    $('playPauseBtn').disabled = true;
+    $('syncStatus').textContent = 'Loading audio...';
+    window.audioPlayer.init();
+    window.audioPlayer.onBuffering = (buffering) => {
+        $('syncStatus').textContent = buffering ? 'Buffering...' : (window.clockSync.synced ? `RTT: ${Math.round(window.clockSync.rtt)}ms | Offset: ${window.clockSync.offset >= 0 ? '+' : ''}${Math.round(window.clockSync.offset)}ms` : 'Ready');
+    };
+    await window.audioPlayer.loadAudio(audioInfo, roomCode);
+    $('playPauseBtn').disabled = false;
+    $('syncStatus').textContent = 'Ready';
+}
+
+async function doPlay(position, serverTime, scheduledAt) {
+    if (!audioInfo) return;
+    updatePlayButton(true);
+    startUIUpdate();
+    window.audioPlayer.init();
+    await window.audioPlayer.playAtPosition(position || 0, serverTime, scheduledAt);
+}
+
+function doPause() {
+    pausedPosition = window.audioPlayer.getCurrentTime() || 0;
+    window.audioPlayer.stop();
+    updatePlayButton(false);
+    stopUIUpdate();
+}
+
+let uiInterval = null, driftInterval = null;
+function startUIUpdate() {
+    stopUIUpdate();
+    uiInterval = setInterval(() => {
+        if (!window.audioPlayer.isPlaying) return;
+        const t = window.audioPlayer.getCurrentTime();
+        if (t >= (audioInfo?.duration || Infinity)) { doPause(); onTrackEnd(); return; }
+        $('currentTime').textContent = formatTime(t);
+        if (!seeking) $('progressBar').value = t;
+    }, 250);
+    driftInterval = setInterval(() => { // every 1s
+        if (!window.audioPlayer.isPlaying) return;
+        const drift = window.audioPlayer.correctDrift();
+        if (drift) console.log('Drift corrected:', drift, 'ms');
+    }, 1000);
+}
+function stopUIUpdate() {
+    if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+    if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
+}
+
+function updatePlayButton(playing) {
+    $('playPauseBtn').textContent = playing ? '⏸' : '▶';
+}
+
+// --- Events ---
+window.addEventListener('load', () => {
+    const hash = location.hash.replace('#', '').trim();
+    if (hash.length === 6) {
+        const checkAuth = setInterval(() => {
+            if (window.Auth && window.Auth.user) {
+                clearInterval(checkAuth);
+                connect(() => ws.send(JSON.stringify({ type: 'join', roomCode: hash.toUpperCase() })));
+            }
+        }, 200);
+        setTimeout(() => clearInterval(checkAuth), 5000);
+    }
+});
+
+$('createBtn').onclick = () => connect(() => ws.send(JSON.stringify({ type: 'create' })));
+$('joinBtn').onclick = () => {
+    const code = $('roomCodeInput').value.trim().toUpperCase();
+    if (code.length !== 6) return alert('Enter a 6-character room code');
+    connect(() => ws.send(JSON.stringify({ type: 'join', roomCode: code })));
+};
+$('roomCodeInput').onkeypress = e => { if (e.key === 'Enter') $('joinBtn').click(); };
+$('copyCode').onclick = () => { navigator.clipboard.writeText(roomCode); $('copyCode').textContent = '✓'; setTimeout(() => $('copyCode').textContent = '📋', 1500); };
+
+$('playPauseBtn').onclick = () => {
+    if (!isHost || !audioInfo) return;
+    if (window.audioPlayer.isPlaying) {
+        ws.send(JSON.stringify({ type: 'pause' }));
+    } else {
+        const pos = window.audioPlayer.getCurrentTime() || 0;
+        ws.send(JSON.stringify({ type: 'play', position: pos }));
+    }
+};
+
+let seeking = false;
+$('progressBar').oninput = () => {
+    seeking = true;
+    const val = parseFloat($('progressBar').value);
+    $('currentTime').textContent = formatTime(val);
+    $('seekTooltip').textContent = formatTime(val);
+    $('seekTooltip').classList.remove('hidden');
+};
+$('progressBar').onchange = e => {
+    seeking = false;
+    $('seekTooltip').classList.add('hidden');
+    if (!isHost) return;
+    const pos = parseFloat(e.target.value) || 0;
+    ws.send(JSON.stringify({ type: 'seek', position: pos }));
+};
+
+$('volumeSlider').oninput = e => window.audioPlayer.setVolume(e.target.value / 100);
+
+$('audiencePanelClose').onclick = () => $('audiencePanel').classList.add('hidden');
+$('copyInviteLink').onclick = () => {
+    const link = location.origin + '/#' + roomCode;
+    navigator.clipboard.writeText(link);
+    $('copyInviteLink').textContent = '✅ 已复制';
+    setTimeout(() => $('copyInviteLink').textContent = '📎 复制邀请链接', 1500);
+};
+
+// --- Playlist Functions ---
+
+async function loadPlaylist() {
+    if (!roomCode) return;
+    try {
+        const res = await fetch(`/api/room/${roomCode}/playlist`, { method: 'POST', credentials:'include' });
+        const data = await res.json();
+        playlist = data.playlist;
+        playlistItems = data.items || [];
+        if (playlist) playMode = playlist.play_mode || 'sequential';
+        renderPlaylist();
+    } catch (e) { console.error('loadPlaylist:', e); }
+}
+
+function renderPlaylist() {
+    const container = $('playlistItems');
+    const empty = $('playlistEmpty');
+    if (!playlistItems || !playlistItems.length) {
+        container.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+    }
+    empty.style.display = 'none';
+    container.innerHTML = playlistItems.map((item, i) => {
+        const active = i === currentTrackIndex ? ' active' : '';
+        const delBtn = isHost ? `<button class="pi-del" data-id="${item.id}">✕</button>` : '';
+        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-info"><div class="pi-title">${item.title || item.original_name}</div><div class="pi-meta">${item.artist || ''} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
+    }).join('');
+    container.querySelectorAll('.pi-del').forEach(btn => {
+        btn.onclick = async (e) => {
+            e.stopPropagation();
+            const id = btn.dataset.id;
+            await fetch(`/api/room/${roomCode}/playlist/${id}`, { method: 'DELETE', credentials:'include' });
+        };
+    });
+    container.querySelectorAll('.playlist-item').forEach(el => {
+        el.onclick = () => {
+            if (!isHost) return;
+            const idx = parseInt(el.dataset.idx);
+            ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
+        };
+    });
+    updatePlayModeBtn();
+}
+
+function updatePlayModeBtn() {
+    const btn = $('playModeBtn');
+    if (playMode === 'shuffle') btn.textContent = '🔀';
+    else if (playMode === 'repeat_one') btn.textContent = '🔂';
+    else btn.textContent = '🔁';
+}
+
+$('playModeBtn').onclick = async () => {
+    if (!isHost || !roomCode) return;
+    const modes = ['sequential', 'shuffle', 'repeat_one'];
+    const next = modes[(modes.indexOf(playMode) + 1) % modes.length];
+    await fetch(`/api/room/${roomCode}/playlist/mode`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: next }),
+        credentials: 'include'
+    });
+    playMode = next;
+    updatePlayModeBtn();
+};
+
+async function playTrackByIndex(idx) {
+    if (!playlistItems || idx < 0 || idx >= playlistItems.length) return;
+    // Stop current playback first to prevent mixing
+    if (window.audioPlayer) window.audioPlayer.stop();
+    currentTrackIndex = idx;
+    const item = playlistItems[idx];
+    renderPlaylist();
+
+    // Parse qualities from the playlist item
+    let qualities = [];
+    try { qualities = JSON.parse(item.qualities || '[]'); } catch(e) {}
+    const preferredQ = localStorage.getItem('lt_quality') || 'medium';
+    const quality = qualities.includes(preferredQ) ? preferredQ : (qualities.includes('medium') ? 'medium' : qualities[qualities.length - 1] || 'medium');
+
+    try {
+        const res = await fetch(`/api/library/files/${item.audio_id}/segments/${quality}/`, {credentials:'include'});
+        if (!res.ok) throw new Error('segments not found');
+        const data = await res.json();
+        audioInfo = {
+            filename: item.original_name,
+            duration: data.duration || item.duration,
+            segmentCount: (data.segments || []).length,
+            segmentTime: data.segment_time || 5,
+            segments: data.segments || [],
+            qualities: qualities,
+            ownerID: data.owner_id || item.owner_id,
+            audioID: item.audio_id,
+            audioUUID: data.audio_uuid
+        };
+        window.audioPlayer._trackSegBase = null;
+        await setupAudio();
+        updateQualitySelector();
+        // Auto-play after loading — each client plays independently after setup
+        updatePlayButton(true);
+        startUIUpdate();
+        window.audioPlayer.init();
+        await window.audioPlayer.playAtPosition(0, window.clockSync.getServerTime(), window.clockSync.getServerTime() + 500);
+    } catch (e) { console.error('playTrack:', e); }
+}
+
+function updateQualitySelector() {
+    const sel = $('qualitySelector');
+    if (!sel) return;
+    const qualities = window.audioPlayer.getQualities();
+    if (!qualities || !qualities.length) { sel.classList.add('hidden'); return; }
+    sel.classList.remove('hidden');
+    const current = window.audioPlayer.getQuality();
+    const labels = { lossless: 'Lossless', high: 'High (256k)', medium: 'Medium (128k)', low: 'Low (64k)' };
+    sel.innerHTML = qualities.map(q =>
+        `<option value="${q}" ${q === current ? 'selected' : ''}>${labels[q] || q}</option>`
+    ).join('');
+    sel.onchange = async () => {
+        await window.audioPlayer.setQuality(sel.value);
+    };
+}
+
+function onTrackEnd() {
+    if (!isHost || !playlistItems || !playlistItems.length) return;
+    let nextIdx = -1;
+    if (playMode === 'repeat_one') {
+        nextIdx = currentTrackIndex;
+    } else if (playMode === 'shuffle') {
+        nextIdx = Math.floor(Math.random() * playlistItems.length);
+    } else {
+        nextIdx = currentTrackIndex + 1;
+        if (nextIdx >= playlistItems.length) nextIdx = 0;
+    }
+    if (nextIdx >= 0 && ws) {
+        ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: nextIdx }));
+    }
+}
+
+// Library modal
+$('addFromLibBtn').onclick = async () => {
+    if (!isHost) return;
+    const modal = $('libraryModal');
+    modal.classList.remove('hidden');
+    const list = $('libraryList');
+    const empty = $('libraryEmpty');
+    list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted)">加载中...</div>';
+    empty.style.display = 'none';
+    try {
+        const res = await fetch('/api/library/files?accessible=true', {credentials:'include'});
+        const files = await res.json();
+        if (!files || !files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
+        list.innerHTML = files.map(f => `<div class="library-item"><div class="li-info"><div class="li-title">${f.title}</div><div class="li-meta">${f.artist || ''} · ${formatTime(f.duration)}${f.owner_name ? ' · ' + f.owner_name : ''}</div></div><button class="btn-add" data-id="${f.id}">添加</button></div>`).join('');
+        list.querySelectorAll('.btn-add').forEach(btn => {
+            btn.onclick = async () => {
+                btn.disabled = true; btn.textContent = '...';
+                try {
+                    await fetch(`/api/room/${roomCode}/playlist/add`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ audio_id: parseInt(btn.dataset.id) }),
+                        credentials: 'include'
+                    });
+                    btn.textContent = '✓';
+                } catch { btn.textContent = '✗'; }
+            };
+        });
+    } catch (e) { list.innerHTML = ''; empty.style.display = 'block'; }
+};
+$('libraryModalClose').onclick = () => $('libraryModal').classList.add('hidden');
+$('libraryModal').onclick = e => { if (e.target === e.currentTarget) e.currentTarget.classList.add('hidden'); };

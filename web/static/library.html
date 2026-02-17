@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>音频库 - ListenTogether</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { align-items: flex-start; padding-top: 60px; }
+        .lib-container { width: 100%; max-width: 700px; margin: 0 auto; padding: 20px; }
+        .lib-section { background: var(--bg-secondary); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+        .lib-title { color: var(--accent); font-size: 16px; font-weight: 600; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+        .lib-table { width: 100%; font-size: 13px; }
+        .lib-table th { text-align: left; color: var(--text-muted); padding: 6px 8px; border-bottom: 1px solid var(--bg-tertiary); }
+        .lib-table td { padding: 8px; border-bottom: 1px solid var(--bg-tertiary); color: var(--text-secondary); }
+        .lib-table tr:last-child td { border-bottom: none; }
+        .lib-empty { color: var(--text-muted); text-align: center; padding: 20px; }
+        .share-form { display: flex; gap: 8px; margin-top: 12px; }
+        .share-form input { flex: 1; padding: 10px; border: none; border-radius: 8px; background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; }
+        .share-form .btn { padding: 10px 20px; border-radius: 8px; font-size: 14px; }
+        .btn-del { background: none; border: none; color: #e74c3c; cursor: pointer; font-size: 16px; }
+        .btn-del:hover { color: #ff6b6b; }
+        .upload-area { text-align: center; padding: 24px; border: 2px dashed #555; border-radius: 12px; transition: all 0.2s; }
+        .upload-area.dragover { border-color: var(--accent); background: rgba(29,185,84,0.1); }
+        .upload-area label { display: inline-block; padding: 12px 24px; background: var(--accent); color: #000; border-radius: 8px; cursor: pointer; font-weight: 600; }
+        .upload-area input { display: none; }
+        .upload-area .status { margin-top: 10px; font-size: 13px; color: var(--text-secondary); }
+        .upload-item { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; color: var(--text-secondary); }
+        .upload-item .bar { flex:1; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }
+        .upload-item .bar-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.2s; }
+        .back-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="lib-container">
+        <div style="margin-bottom:16px"><a href="/" class="back-link">← 返回首页</a></div>
+        <h2 style="margin-bottom:20px">🎵 音频库管理</h2>
+
+        <div class="lib-section">
+            <div class="lib-title"><span>我的音频库</span></div>
+            <div class="upload-area" id="dropZone">
+                <label><input type="file" id="uploadInput" accept="audio/*" multiple> 📁 上传音频（或拖拽到此处）</label>
+                <div id="uploadList" style="margin-top:10px;"></div>
+                <div class="status" id="uploadStatus"></div>
+            </div>
+            <table class="lib-table"><thead><tr><th>标题</th><th>艺术家</th><th>时长</th><th>大小</th><th>上传时间</th><th></th></tr></thead><tbody id="myFiles"></tbody></table>
+            <div class="lib-empty" id="myFilesEmpty">暂无音频文件</div>
+        </div>
+
+        <div class="lib-section">
+            <div class="lib-title"><span>共享管理</span></div>
+            <h4 style="color:var(--text-secondary);font-size:13px;margin-bottom:8px">我共享给：</h4>
+            <div id="myShares"></div>
+            <div class="share-form">
+                <input type="number" id="shareUID" placeholder="输入对方UID">
+                <button class="btn primary" id="shareBtn">共享</button>
+            </div>
+            <h4 style="color:var(--text-secondary);font-size:13px;margin:16px 0 8px">共享给我的：</h4>
+            <div id="sharedWithMe"></div>
+        </div>
+    </div>
+<script>
+const fmt = s => { if(!s||isNaN(s))return'0:00'; const m=Math.floor(s/60); return m+':'+String(Math.floor(s%60)).padStart(2,'0'); };
+const fmtSize = b => b>1048576?(b/1048576).toFixed(1)+'MB':(b/1024).toFixed(0)+'KB';
+const fmtDate = d => new Date(d).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+
+async function loadFiles(){
+    const res=await fetch('/api/library/files'); const files=await res.json();
+    const tb=document.getElementById('myFiles'); const empty=document.getElementById('myFilesEmpty');
+    if(!files||!files.length){tb.innerHTML='';empty.style.display='block';return;}
+    empty.style.display='none';
+    tb.innerHTML=files.map(f=>`<tr><td>${f.title}</td><td>${f.artist||'-'}</td><td>${fmt(f.duration)}</td><td>${fmtSize(f.size)}</td><td>${fmtDate(f.created_at)}</td><td><button class="btn-del" onclick="delFile(${f.id})">🗑</button></td></tr>`).join('');
+}
+async function delFile(id){
+    if(!confirm('确定删除？'))return;
+    await fetch('/api/library/files/'+id,{method:'DELETE'}); loadFiles();
+}
+async function loadShares(){
+    const res=await fetch('/api/library/shares'); const data=await res.json();
+    document.getElementById('myShares').innerHTML=(data.my_shares||[]).map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;color:var(--text-secondary)">${s.shared_name} (UID:${s.shared_uid}) <button class="btn-del" onclick="unshare(${s.shared_uid})">✕</button></div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
+    document.getElementById('sharedWithMe').innerHTML=(data.shared_with_me||[]).map(s=>`<div style="padding:4px 0;font-size:13px;color:var(--text-secondary)">${s.owner_name} (UID:${s.owner_uid})</div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
+}
+async function unshare(uid){
+    await fetch('/api/library/share/'+uid,{method:'DELETE'}); loadShares();
+}
+document.getElementById('shareBtn').onclick=async()=>{
+    const uid=document.getElementById('shareUID').value.trim();
+    if(!uid)return;
+    const res=await fetch('/api/library/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shared_with_uid:parseInt(uid)})});
+    const data=await res.json();
+    if(!res.ok){alert(data.error);return;}
+    document.getElementById('shareUID').value=''; loadShares();
+};
+function uploadFile(file) {
+    const list = document.getElementById('uploadList');
+    const item = document.createElement('div'); item.className = 'upload-item';
+    const name = file.name.length > 30 ? file.name.slice(0,27)+'...' : file.name;
+    item.innerHTML = `<span style="min-width:120px">${name}</span><div class="bar"><div class="bar-fill"></div></div><span class="info">0%</span>`;
+    list.appendChild(item);
+    const fill = item.querySelector('.bar-fill');
+    const info = item.querySelector('.info');
+    const fd = new FormData(); fd.append('audio', file);
+    const xhr = new XMLHttpRequest(); const t0 = Date.now();
+    xhr.open('POST', '/api/library/upload');
+    xhr.upload.onprogress = ev => {
+        if (ev.lengthComputable) {
+            const pct = Math.round(ev.loaded/ev.total*100);
+            const sec = (Date.now()-t0)/1000;
+            const spd = sec > 0 ? (ev.loaded/1024/1024/sec).toFixed(1) : '0';
+            fill.style.width = (pct*0.7)+'%'; info.textContent = pct+'% '+spd+'MB/s';
+        }
+    };
+    xhr.upload.onload = () => { fill.style.width = '70%'; info.textContent = '转码中...'; };
+    xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+            const data = JSON.parse(xhr.responseText);
+            let q = data.qualities || '[]'; if (typeof q === 'string') q = JSON.parse(q);
+            fill.style.width = '100%'; info.textContent = '✓ ' + q.join('/');
+            loadFiles(); setTimeout(() => item.remove(), 5000);
+        } else { fill.style.background = '#ff6b6b'; fill.style.width = '100%'; info.textContent = '✗ 失败'; }
+    };
+    xhr.onerror = () => { fill.style.background = '#ff6b6b'; fill.style.width = '100%'; info.textContent = '✗ 网络错误'; };
+    xhr.send(fd);
+}
+function handleFiles(files) { Array.from(files).filter(f => f.type.startsWith('audio/')||f.name.match(/\.(mp3|flac|wav|m4a|aac|ogg|wma)$/i)).forEach(uploadFile); }
+document.getElementById('uploadInput').onchange = e => { handleFiles(e.target.files); e.target.value = ''; };
+const dz = document.getElementById('dropZone');
+dz.ondragover = e => { e.preventDefault(); dz.classList.add('dragover'); };
+dz.ondragleave = () => dz.classList.remove('dragover');
+dz.ondrop = e => { e.preventDefault(); dz.classList.remove('dragover'); handleFiles(e.dataTransfer.files); };
+loadFiles(); loadShares();
+</script>
+</body>
+</html>

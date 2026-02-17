@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ListenTogether</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="userBar" class="user-bar hidden">
+        <span id="currentUsername"></span>
+        <button id="settingsBtn" class="btn-icon" title="设置">⚙️</button>
+        <button id="libraryBtn" class="btn-icon hidden" title="音频库">📚</button>
+        <button id="adminBtn" class="btn-icon hidden" title="用户管理">👥</button>
+        <button id="logoutBtn" class="btn-icon" title="登出">🚪</button>
+    </div>
+
+    <div class="container">
+        <!-- Login Screen -->
+        <div id="loginScreen" class="screen">
+            <div class="logo">
+                <span class="icon">🎵</span>
+                <h1>ListenTogether</h1>
+                <p class="tagline">Sync music with friends</p>
+            </div>
+            <div class="auth-box">
+                <div class="auth-tabs">
+                    <button id="loginTab" class="auth-tab active">登录</button>
+                    <button id="registerTab" class="auth-tab">注册</button>
+                </div>
+                <div id="loginForm">
+                    <input type="text" id="loginUsername" placeholder="用户名" autocomplete="username">
+                    <input type="password" id="loginPassword" placeholder="密码" autocomplete="current-password">
+                    <button id="loginSubmit" class="btn primary">登录</button>
+                </div>
+                <div id="registerForm" class="hidden">
+                    <input type="text" id="regUsername" placeholder="用户名（3-20字符，字母数字下划线）" autocomplete="username">
+                    <input type="password" id="regPassword" placeholder="密码（至少6位）" autocomplete="new-password">
+                    <input type="password" id="regPassword2" placeholder="确认密码" autocomplete="new-password">
+                    <button id="registerSubmit" class="btn primary">注册</button>
+                </div>
+                <div id="authError" class="auth-error"></div>
+            </div>
+        </div>
+
+        <!-- Home Screen -->
+        <div id="home" class="screen">
+            <div class="logo">
+                <span class="icon">🎵</span>
+                <h1>ListenTogether</h1>
+                <p class="tagline">Sync music with friends</p>
+            </div>
+            <div class="actions">
+                <button id="createBtn" class="btn primary">Create Room</button>
+                <div id="createDivider" class="divider"><span>or</span></div>
+                <div class="join-form">
+                    <input type="text" id="roomCodeInput" placeholder="Enter room code" maxlength="6">
+                    <button id="joinBtn" class="btn secondary">Join</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Room Screen -->
+        <div id="room" class="screen">
+            <div class="room-header">
+                <div class="room-info">
+                    <span class="room-code" id="displayCode"></span>
+                    <span class="user-count"><span id="userCount">1</span> listening</span>
+                </div>
+                <button id="copyCode" class="btn-icon" title="Copy room code">📋</button>
+            </div>
+
+            <div id="avatarBar" class="avatar-bar"></div>
+
+            <div id="audiencePanel" class="audience-panel hidden">
+                <div class="audience-header">
+                    <span>听众列表</span>
+                    <button id="audiencePanelClose" class="btn-icon">✕</button>
+                </div>
+                <div id="audienceList" class="audience-list"></div>
+                <div class="audience-footer">
+                    <button id="copyInviteLink" class="btn primary btn-full">📎 复制邀请链接</button>
+                </div>
+            </div>
+
+            <div class="player">
+                <div class="track-info">
+                    <div class="track-name" id="trackName">No track loaded</div>
+                    <div class="sync-status" id="syncStatus">Syncing...</div>
+                </div>
+
+                <div class="progress-container">
+                    <span id="seekTooltip" class="seek-tooltip hidden"></span>
+                    <input type="range" id="progressBar" class="progress" min="0" max="100" value="0">
+                    <div class="time-display">
+                        <span id="currentTime">0:00</span>
+                        <span id="totalTime">0:00</span>
+                    </div>
+                </div>
+
+                <div class="controls">
+                    <button id="playPauseBtn" class="btn-control play" disabled>▶</button>
+                </div>
+
+                <div class="volume-control">
+                    <span>🔊</span>
+                    <input type="range" id="volumeSlider" class="volume" min="0" max="100" value="80">
+                    <select id="qualitySelector" class="quality-select hidden" title="音质选择"></select>
+                </div>
+            </div>
+
+            <!-- Playlist Panel -->
+            <div id="playlistPanel" class="playlist-panel hidden">
+                <div class="playlist-header">
+                    <span>🎶 播放列表</span>
+                    <div class="playlist-actions">
+                        <button id="playModeBtn" class="btn-icon" title="播放模式">🔁</button>
+                        <button id="addFromLibBtn" class="btn-icon" title="从音频库添加">➕</button>
+                    </div>
+                </div>
+                <div id="playlistItems" class="playlist-items"></div>
+                <div id="playlistEmpty" class="playlist-empty">播放列表为空</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Library Modal -->
+    <div id="libraryModal" class="modal-overlay hidden">
+        <div class="modal-card">
+            <div class="modal-header">
+                <span>从音频库添加</span>
+                <button id="libraryModalClose" class="btn-icon">✕</button>
+            </div>
+            <div class="modal-body">
+                <div id="libraryList" class="library-list"></div>
+                <div id="libraryEmpty" class="playlist-empty">无可用音频</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsOverlay" class="modal-overlay hidden">
+        <div class="modal-card">
+            <div class="modal-header">
+                <span>账号设置</span>
+                <button id="settingsClose" class="btn-icon">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-section">
+                    <h3 class="settings-title">账号信息</h3>
+                    <div class="settings-info">
+                        <div>UID：<span id="settingsUID" class="uid-display"></span> <span id="settingsSUID" class="suid-display"></span></div>
+                        <div>用户名：<span id="settingsUsername"></span></div>
+                        <div>角色：<span id="settingsRole"></span></div>
+                        <div>注册时间：<span id="settingsCreatedAt"></span></div>
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h3 class="settings-title">修改用户名</h3>
+                    <input type="text" id="newUsernameInput" placeholder="新用户名（3-20字符，字母数字下划线）">
+                    <input type="password" id="usernamePassword" placeholder="当前密码">
+                    <div id="usernameError" class="settings-error"></div>
+                    <button id="changeUsernameBtn" class="btn primary btn-full">确认修改</button>
+                </div>
+                <div class="settings-section">
+                    <h3 class="settings-title">修改密码</h3>
+                    <input type="password" id="oldPwInput" placeholder="旧密码">
+                    <input type="password" id="newPwInput" placeholder="新密码（至少6位）">
+                    <input type="password" id="confirmPwInput" placeholder="确认新密码">
+                    <div id="passwordError" class="settings-error"></div>
+                    <button id="changePasswordBtn" class="btn primary btn-full">确认修改</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/auth.js?v=16"></script>
+    <script src="js/cache.js?v=16"></script>
+    <script src="js/sync.js?v=16"></script>
+    <script src="js/player.js?v=16"></script>
+    <script src="js/app.js?v=16"></script>
+</body>
+</html>

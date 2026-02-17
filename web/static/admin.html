@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ListenTogether Admin</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { display: block; }
+        .admin-nav { display: flex; align-items: center; justify-content: space-between; padding: 14px 24px; background: var(--bg-secondary); border-bottom: 1px solid var(--bg-tertiary); }
+        .admin-nav-left { display: flex; align-items: center; gap: 16px; }
+        .admin-nav-title { font-size: 18px; font-weight: 700; color: var(--accent); }
+        .admin-nav-right { display: flex; align-items: center; gap: 12px; }
+        .admin-nav-right span { color: var(--text-secondary); font-size: 14px; }
+        .admin-nav a, .admin-nav button { background: var(--bg-tertiary); border: none; color: var(--text-primary); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; text-decoration: none; }
+        .admin-nav a:hover, .admin-nav button:hover { background: #444; }
+        .admin-content { max-width: 900px; margin: 24px auto; padding: 0 20px; }
+        .admin-section { margin-bottom: 32px; }
+        .admin-section-title { font-size: 16px; font-weight: 600; color: var(--accent); margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--bg-tertiary); }
+        .admin-table { width: 100%; border-collapse: collapse; }
+        .admin-table th { text-align: left; padding: 10px 12px; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--bg-tertiary); }
+        .admin-table td { padding: 10px 12px; font-size: 14px; border-bottom: 1px solid var(--bg-tertiary); }
+        .admin-table tr:hover { background: var(--bg-secondary); }
+        .uid-cell { font-family: monospace; color: var(--accent); }
+        .suid-cell { font-family: monospace; color: #ffd700; }
+        .role-badge { font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+        .role-owner { background: #b8860b33; color: #ffd700; }
+        .role-admin { background: #1db95433; color: var(--accent); }
+        .admin-actions { display: flex; gap: 6px; }
+        .admin-empty { text-align: center; color: var(--text-muted); padding: 24px; }
+    </style>
+</head>
+<body>
+    <nav class="admin-nav">
+        <div class="admin-nav-left"><span class="admin-nav-title">🎵 ListenTogether Admin</span></div>
+        <div class="admin-nav-right">
+            <span id="navUsername"></span>
+            <a href="/">返回首页</a>
+            <button id="logoutBtn">登出</button>
+        </div>
+    </nav>
+    <div class="admin-content">
+        <div class="admin-section">
+            <div class="admin-section-title">👑 管理员</div>
+            <table class="admin-table">
+                <thead><tr><th>SUID</th><th>UID</th><th>用户名</th><th>角色</th><th>注册时间</th><th>操作</th></tr></thead>
+                <tbody id="adminList"></tbody>
+            </table>
+        </div>
+        <div class="admin-section">
+            <div class="admin-section-title">👤 普通用户</div>
+            <table class="admin-table">
+                <thead><tr><th>UID</th><th>用户名</th><th>注册时间</th><th>操作</th></tr></thead>
+                <tbody id="userList"></tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+    (function() {
+        function pad(n, len) { return String(n).padStart(len, '0'); }
+        function fmtTime(t) { return new Date(t).toLocaleString('zh-CN'); }
+        async function api(url, opts) {
+            const res = await fetch(url, opts);
+            const nt = res.headers.get('X-New-Token');
+            if (nt) localStorage.setItem('token', nt);
+            return res;
+        }
+        async function load() {
+            const res = await api('/api/admin/users?page=1&pageSize=500');
+            if (res.status === 401 || res.status === 403) { window.location.href = '/'; return; }
+            const data = await res.json();
+            const admins = (data.users||[]).filter(u => u.role==='owner'||u.role==='admin');
+            const users = (data.users||[]).filter(u => u.role==='user');
+            const aT = document.getElementById('adminList');
+            const uT = document.getElementById('userList');
+            aT.innerHTML = ''; uT.innerHTML = '';
+            if (!admins.length) aT.innerHTML = '<tr><td colspan="6" class="admin-empty">暂无</td></tr>';
+            admins.forEach(u => {
+                const rl = u.role==='owner' ? '👑 站长' : '⭐ 管理员';
+                const rc = u.role==='owner' ? 'role-owner' : 'role-admin';
+                let acts = '';
+                if (u.role !== 'owner') acts = `<button class="btn-sm" onclick="doRole(${u.uid},'user')">降级</button> <button class="btn-sm btn-danger" onclick="doDel(${u.uid},'${u.username}')">删除</button>`;
+                aT.innerHTML += `<tr><td class="suid-cell">${pad(u.suid,3)}</td><td class="uid-cell">${pad(u.uid,5)}</td><td>${u.username}</td><td><span class="role-badge ${rc}">${rl}</span></td><td>${fmtTime(u.created_at)}</td><td class="admin-actions">${acts}</td></tr>`;
+            });
+            if (!users.length) uT.innerHTML = '<tr><td colspan="4" class="admin-empty">暂无</td></tr>';
+            users.forEach(u => {
+                uT.innerHTML += `<tr><td class="uid-cell">${pad(u.uid,5)}</td><td>${u.username}</td><td>${fmtTime(u.created_at)}</td><td class="admin-actions"><button class="btn-sm" onclick="doRole(${u.uid},'admin')">升为管理员</button> <button class="btn-sm btn-danger" onclick="doDel(${u.uid},'${u.username}')">删除</button></td></tr>`;
+            });
+        }
+        window.doRole = async (uid, role) => { const r = await api(`/api/admin/users/${uid}/role`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({role})}); if(!r.ok){const d=await r.json();alert(d.error||'失败');return;} load(); };
+        window.doDel = async (uid, name) => { if(!confirm(`确定删除 ${name}？`))return; const r=await api(`/api/admin/users/${uid}`,{method:'DELETE'}); if(!r.ok){const d=await r.json();alert(d.error||'失败');return;} load(); };
+        document.getElementById('logoutBtn').onclick = async()=>{await fetch('/api/auth/logout',{method:'POST'});window.location.href='/';};
+        (async()=>{
+            const r=await api('/api/auth/me'); if(!r.ok){window.location.href='/';return;}
+            const me=await r.json(); if(me.role!=='owner'){alert('无权限');window.location.href='/';return;}
+            document.getElementById('navUsername').textContent='👑 '+me.username;
+            load();
+        })();
+    })();
+    </script>
+</body>
+</html>
