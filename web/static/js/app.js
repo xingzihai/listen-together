@@ -128,9 +128,16 @@ async function handleMessage(msg) {
         case 'error': alert(msg.error); break;
         case 'playlistUpdate':
             if (msg.playlistData) {
+                const oldItems = playlistItems;
+                const oldTrackId = (oldItems && oldItems[currentTrackIndex]) ? oldItems[currentTrackIndex].audio_id : null;
                 playlist = msg.playlistData.playlist;
                 playlistItems = msg.playlistData.items || [];
                 if (playlist) playMode = playlist.play_mode || 'sequential';
+                // Adjust currentTrackIndex to follow the same track
+                if (oldTrackId != null) {
+                    const newIdx = playlistItems.findIndex(it => it.audio_id === oldTrackId);
+                    currentTrackIndex = newIdx >= 0 ? newIdx : -1;
+                }
                 renderPlaylist();
             }
             break;
@@ -343,10 +350,11 @@ async function handleTrackChange(msg) {
 
     const qualities = ta.qualities || [];
     const preferredQ = localStorage.getItem('lt_quality') || 'medium';
-    const quality = qualities.includes(preferredQ) ? preferredQ : (qualities.includes('medium') ? 'medium' : qualities[qualities.length - 1] || 'medium');
+    // Phase 1: always fetch medium segments first for sync consistency
+    const initialQ = qualities.includes('medium') ? 'medium' : (qualities[qualities.length - 1] || 'medium');
 
     try {
-        const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${quality}/`, {credentials:'include'});
+        const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`, {credentials:'include'});
         if (!res.ok) throw new Error('segments fetch failed: ' + res.status);
         const data = await res.json();
         audioInfo = {
@@ -373,6 +381,11 @@ async function handleTrackChange(msg) {
             // Host: track loaded, send play to server to coordinate all clients
             ws.send(JSON.stringify({ type: 'play', position: 0 }));
         }
+
+        // Phase 2: background quality upgrade temporarily disabled for sync debugging
+        // if (preferredQ !== initialQ && qualities.includes(preferredQ)) {
+        //     window.audioPlayer._upgradeQuality(preferredQ);
+        // }
     } catch (e) {
         console.error('handleTrackChange:', e);
         trackLoading = false;
@@ -393,10 +406,22 @@ function updateQualitySelector() {
     if (!qualities || !qualities.length) { sel.classList.add('hidden'); return; }
     sel.classList.remove('hidden');
     const current = window.audioPlayer.getQuality();
+    const actual = window.audioPlayer.getActualQuality();
+    const upgrading = window.audioPlayer._upgrading;
     const labels = { lossless: 'Lossless', high: 'High (256k)', medium: 'Medium (128k)', low: 'Low (64k)' };
-    sel.innerHTML = qualities.map(q =>
-        `<option value="${q}" ${q === current ? 'selected' : ''}>${labels[q] || q}</option>`
-    ).join('');
+    sel.innerHTML = qualities.map(q => {
+        let label = labels[q] || q;
+        if (q === current && upgrading && actual !== current) {
+            label = `${labels[actual] || actual} → ${labels[q] || q}`;
+        }
+        return `<option value="${q}" ${q === current ? 'selected' : ''}>${label}</option>`;
+    }).join('');
+
+    // Wire up quality change callback to refresh selector display
+    window.audioPlayer.onQualityChange = (actualQ, isUpgrading) => {
+        updateQualitySelector();
+    };
+
     sel.onchange = async () => {
         await window.audioPlayer.setQuality(sel.value);
     };
