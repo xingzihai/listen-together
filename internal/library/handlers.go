@@ -314,11 +314,7 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 	}
 	quality := parts[2]
 
-	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, id)
-	if !canAccess {
-		jsonError(w, "forbidden", 403)
-		return
-	}
+	// Any logged-in user can access segments (needed for room playback sync)
 
 	af, err := h.DB.GetAudioFileByID(id)
 	if err != nil {

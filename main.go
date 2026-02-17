@@ -4,8 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -46,23 +44,24 @@ type PlaylistBroadcast struct {
 }
 
 type WSResponse struct {
-	Type         string             `json:"type"`
-	Success      bool               `json:"success,omitempty"`
-	RoomCode     string             `json:"roomCode,omitempty"`
-	IsHost       bool               `json:"isHost,omitempty"`
-	ClientCount  int                `json:"clientCount,omitempty"`
-	Audio        *room.AudioInfo    `json:"audio,omitempty"`
-	State        string             `json:"state,omitempty"`
-	Position     float64            `json:"position,omitempty"`
-	ServerTime   int64              `json:"serverTime,omitempty"`
-	ClientTime   int64              `json:"clientTime,omitempty"`
-	ScheduledAt  int64              `json:"scheduledAt,omitempty"`
-	Error        string             `json:"error,omitempty"`
-	Username     string             `json:"username,omitempty"`
-	Role         string             `json:"role,omitempty"`
-	Users        []room.ClientInfo  `json:"users,omitempty"`
-	PlaylistData *PlaylistBroadcast `json:"playlistData,omitempty"`
-	TrackIndex   int                `json:"trackIndex"`
+	Type         string                `json:"type"`
+	Success      bool                  `json:"success,omitempty"`
+	RoomCode     string                `json:"roomCode,omitempty"`
+	IsHost       bool                  `json:"isHost,omitempty"`
+	ClientCount  int                   `json:"clientCount,omitempty"`
+	Audio        *room.AudioInfo       `json:"audio,omitempty"`
+	TrackAudio   *room.TrackAudioInfo  `json:"trackAudio,omitempty"`
+	State        string                `json:"state,omitempty"`
+	Position     float64               `json:"position,omitempty"`
+	ServerTime   int64                 `json:"serverTime,omitempty"`
+	ClientTime   int64                 `json:"clientTime,omitempty"`
+	ScheduledAt  int64                 `json:"scheduledAt,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	Username     string                `json:"username,omitempty"`
+	Role         string                `json:"role,omitempty"`
+	Users        []room.ClientInfo     `json:"users,omitempty"`
+	PlaylistData *PlaylistBroadcast    `json:"playlistData,omitempty"`
+	TrackIndex   int                   `json:"trackIndex"`
 }
 
 func main() {
@@ -115,8 +114,6 @@ func main() {
 	plHandlers.RegisterRoutes(mux)
 
 	mux.HandleFunc("/ws", handleWebSocket)
-	mux.HandleFunc("/api/upload", handleUpload)
-	mux.HandleFunc("/api/segments/", handleSegments)
 
 	// Admin page (owner only)
 	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
@@ -212,14 +209,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				sendJSON(conn, WSResponse{Type: "playlistUpdate", PlaylistData: &PlaylistBroadcast{Playlist: pl, Items: items}})
 			}
 			broadcast(currentRoom, WSResponse{Type: "userJoined", ClientCount: currentRoom.ClientCount(), Username: username, Users: currentRoom.GetClientList()}, clientID)
-			if state == room.StatePlaying && currentRoom.Audio != nil {
-				elapsed := time.Since(startT).Seconds()
-				currentPos := pos + elapsed
-				scheduledTime := syncpkg.GetServerTime() + 500
-				sendJSON(conn, WSResponse{Type: "nextTrack", TrackIndex: currentRoom.CurrentTrack, ServerTime: syncpkg.GetServerTime()})
-				sendJSON(conn, WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
-			} else if currentRoom.Audio != nil {
-				sendJSON(conn, WSResponse{Type: "nextTrack", TrackIndex: currentRoom.CurrentTrack, ServerTime: syncpkg.GetServerTime()})
+
+			// Send current track info with full audio metadata
+			currentRoom.Mu.RLock()
+			trackAudio := currentRoom.TrackAudio
+			trackIdx := currentRoom.CurrentTrack
+			currentRoom.Mu.RUnlock()
+
+			if trackAudio != nil {
+				sendJSON(conn, WSResponse{
+					Type:       "trackChange",
+					TrackIndex: trackIdx,
+					TrackAudio: trackAudio,
+					ServerTime: syncpkg.GetServerTime(),
+				})
+				// If currently playing, send play to sync position
+				if state == room.StatePlaying {
+					elapsed := time.Since(startT).Seconds()
+					currentPos := pos + elapsed
+					scheduledTime := syncpkg.GetServerTime() + 500
+					sendJSON(conn, WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
+				}
 			}
 
 		case "ping":
@@ -283,13 +293,56 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom == nil {
 				continue
 			}
+			// Only room owner can change tracks
+			if currentRoom.OwnerID != userID {
+				continue
+			}
+
+			// Build complete TrackAudioInfo from DB
+			var trackAudio *room.TrackAudioInfo
+			pl, err := globalDB.GetPlaylistByRoom(currentRoom.Code)
+			if err != nil || pl == nil {
+				continue
+			}
+			items, err := globalDB.GetPlaylistItems(pl.ID)
+			if err != nil || msg.TrackIndex < 0 || msg.TrackIndex >= len(items) {
+				continue
+			}
+			item := items[msg.TrackIndex]
+			af, err := globalDB.GetAudioFileByID(item.AudioID)
+			if err != nil {
+				continue
+			}
+			var qualities []string
+			json.Unmarshal([]byte(af.Qualities), &qualities)
+			trackAudio = &room.TrackAudioInfo{
+				AudioID:   af.ID,
+				OwnerID:   af.OwnerID,
+				AudioUUID: af.Filename,
+				Filename:  af.OriginalName,
+				Duration:  af.Duration,
+				Qualities: qualities,
+			}
+
 			currentRoom.Mu.Lock()
 			currentRoom.CurrentTrack = msg.TrackIndex
-			currentRoom.State = room.StatePlaying
+			currentRoom.TrackAudio = trackAudio
+			currentRoom.Audio = &room.AudioInfo{
+				Filename: af.OriginalName,
+				Duration: af.Duration,
+			}
+			// Reset playback state — don't set to Playing yet, wait for host's play message
+			currentRoom.State = room.StateStopped
 			currentRoom.Position = 0
-			currentRoom.StartTime = time.Now()
 			currentRoom.Mu.Unlock()
-			broadcast(currentRoom, WSResponse{Type: "nextTrack", TrackIndex: msg.TrackIndex, ServerTime: syncpkg.GetServerTime()}, "")
+
+			// Broadcast trackChange with full audio metadata
+			broadcast(currentRoom, WSResponse{
+				Type:       "trackChange",
+				TrackIndex: msg.TrackIndex,
+				TrackAudio: trackAudio,
+				ServerTime: syncpkg.GetServerTime(),
+			}, "")
 		}
 	}
 
@@ -309,85 +362,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-func handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	roomCode := r.URL.Query().Get("room")
-	rm := manager.GetRoom(roomCode)
-	if rm == nil {
-		http.Error(w, "Room not found", http.StatusNotFound)
-		return
-	}
-
-	// Check upload permission: only room owner can upload
-	userInfo := auth.ExtractUserFromRequest(r)
-	if userInfo == nil || rm.OwnerID != userInfo.UserID {
-		http.Error(w, "Forbidden: only room owner can upload", http.StatusForbidden)
-		return
-	}
-
-	log.Printf("Upload request for room: %s", roomCode)
-	r.ParseMultipartForm(100 << 20)
-	file, header, err := r.FormFile("audio")
-	if err != nil {
-		log.Printf("Failed to read file: %v", err)
-		http.Error(w, "Failed to read file", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-	log.Printf("Received file: %s, size: %d", header.Filename, header.Size)
-
-	roomDir := filepath.Join(dataDir, roomCode)
-	os.RemoveAll(roomDir)
-	os.MkdirAll(roomDir, 0755)
-
-	tmpFile := filepath.Join(roomDir, "input"+filepath.Ext(header.Filename))
-	out, _ := os.Create(tmpFile)
-	io.Copy(out, file)
-	out.Close()
-
-	log.Printf("Processing audio: %s", tmpFile)
-	manifest, err := audio.ProcessAudio(tmpFile, roomDir, header.Filename)
-	os.Remove(tmpFile)
-	if err != nil {
-		log.Printf("Audio processing failed: %v", err)
-		http.Error(w, fmt.Sprintf("Processing failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-	log.Printf("Audio processed: %d segments, %.1fs duration", manifest.SegmentCount, manifest.Duration)
-
-	audioInfo := &room.AudioInfo{
-		Filename: manifest.Filename, Duration: manifest.Duration,
-		SegmentCount: manifest.SegmentCount, SegmentTime: manifest.SegmentTime, Segments: manifest.Segments,
-	}
-	rm.SetAudio(audioInfo)
-	broadcast(rm, WSResponse{Type: "audioReady", Audio: audioInfo}, "")
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(audioInfo)
-}
-
-func handleSegments(w http.ResponseWriter, r *http.Request) {
-	// Auth check: must be logged in
-	userInfo := auth.ExtractUserFromRequest(r)
-	if userInfo == nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/segments/"), "/")
-	if len(parts) != 2 {
-		http.NotFound(w, r)
-		return
-	}
-	filePath := filepath.Join(dataDir, parts[0], parts[1])
-	w.Header().Set("Cache-Control", "public, max-age=31536000")
-	w.Header().Set("Content-Type", "audio/mp4")
-	http.ServeFile(w, r, filePath)
 }
 
 func sendJSON(conn *websocket.Conn, v interface{}) {

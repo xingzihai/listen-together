@@ -1,7 +1,8 @@
 const $ = id => document.getElementById(id);
 let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
 let roomUsers = [], myClientID = null;
-let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential', pendingTrackIndex = -1;
+let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
+let trackLoading = false, pendingPlay = null;
 
 function renderAudiencePanel() {
     const list = $('audienceList');
@@ -131,19 +132,11 @@ async function handleMessage(msg) {
                 playlistItems = msg.playlistData.items || [];
                 if (playlist) playMode = playlist.play_mode || 'sequential';
                 renderPlaylist();
-                if (pendingTrackIndex >= 0 && playlistItems.length) {
-                    const idx = pendingTrackIndex; pendingTrackIndex = -1;
-                    await playTrackByIndex(idx);
-                }
             }
             break;
-        case 'nextTrack':
-            // Wait for playlistItems if not yet loaded
-            if (!playlistItems || !playlistItems.length) {
-                pendingTrackIndex = msg.trackIndex;
-            } else {
-                await playTrackByIndex(msg.trackIndex);
-            }
+        case 'trackChange':
+            // Server sends full audio metadata — use it directly
+            await handleTrackChange(msg);
             break;
     }
 }
@@ -166,7 +159,13 @@ async function setupAudio() {
 }
 
 async function doPlay(position, serverTime, scheduledAt) {
+    if (trackLoading) {
+        // Track still loading from nextTrack — queue this play for when it's ready
+        pendingPlay = { position, serverTime, scheduledAt };
+        return;
+    }
     if (!audioInfo) return;
+    pendingPlay = null;
     updatePlayButton(true);
     startUIUpdate();
     window.audioPlayer.init();
@@ -329,44 +328,62 @@ $('playModeBtn').onclick = async () => {
     updatePlayModeBtn();
 };
 
-async function playTrackByIndex(idx) {
-    if (!playlistItems || idx < 0 || idx >= playlistItems.length) return;
-    // Stop current playback first to prevent mixing
+// handleTrackChange: server sends full audio metadata via trackChange
+async function handleTrackChange(msg) {
+    const ta = msg.trackAudio;
+    if (!ta) return;
+
+    // Stop current playback
     if (window.audioPlayer) window.audioPlayer.stop();
-    currentTrackIndex = idx;
-    const item = playlistItems[idx];
+    stopUIUpdate();
+    updatePlayButton(false);
+    trackLoading = true;
+    currentTrackIndex = msg.trackIndex;
     renderPlaylist();
 
-    // Parse qualities from the playlist item
-    let qualities = [];
-    try { qualities = JSON.parse(item.qualities || '[]'); } catch(e) {}
+    const qualities = ta.qualities || [];
     const preferredQ = localStorage.getItem('lt_quality') || 'medium';
     const quality = qualities.includes(preferredQ) ? preferredQ : (qualities.includes('medium') ? 'medium' : qualities[qualities.length - 1] || 'medium');
 
     try {
-        const res = await fetch(`/api/library/files/${item.audio_id}/segments/${quality}/`, {credentials:'include'});
-        if (!res.ok) throw new Error('segments not found');
+        const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${quality}/`, {credentials:'include'});
+        if (!res.ok) throw new Error('segments fetch failed: ' + res.status);
         const data = await res.json();
         audioInfo = {
-            filename: item.original_name,
-            duration: data.duration || item.duration,
+            filename: ta.filename,
+            duration: data.duration || ta.duration,
             segmentCount: (data.segments || []).length,
             segmentTime: data.segment_time || 5,
             segments: data.segments || [],
             qualities: qualities,
-            ownerID: data.owner_id || item.owner_id,
-            audioID: item.audio_id,
-            audioUUID: data.audio_uuid
+            ownerID: data.owner_id || ta.owner_id,
+            audioID: ta.audio_id,
+            audioUUID: data.audio_uuid || ta.audio_uuid
         };
         window.audioPlayer._trackSegBase = null;
         await setupAudio();
         updateQualitySelector();
-        // Auto-play after loading — each client plays independently after setup
-        updatePlayButton(true);
-        startUIUpdate();
-        window.audioPlayer.init();
-        await window.audioPlayer.playAtPosition(0, window.clockSync.getServerTime(), window.clockSync.getServerTime() + 500);
-    } catch (e) { console.error('playTrack:', e); }
+        trackLoading = false;
+
+        // If there's a pending play (non-host received play before track loaded), execute it
+        if (pendingPlay) {
+            const pp = pendingPlay; pendingPlay = null;
+            await doPlay(pp.position, pp.serverTime, pp.scheduledAt);
+        } else if (isHost && ws) {
+            // Host: track loaded, send play to server to coordinate all clients
+            ws.send(JSON.stringify({ type: 'play', position: 0 }));
+        }
+    } catch (e) {
+        console.error('handleTrackChange:', e);
+        trackLoading = false;
+    }
+}
+
+// Legacy fallback: playTrackByIndex still used for pendingTrackIndex from old nextTrack
+async function playTrackByIndex(idx) {
+    if (!playlistItems || idx < 0 || idx >= playlistItems.length) return;
+    // This path is only for backward compat; new flow uses handleTrackChange
+    ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
 }
 
 function updateQualitySelector() {

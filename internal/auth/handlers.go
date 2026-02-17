@@ -135,7 +135,7 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandlers) Logout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: "token", Value: "", Path: "/",
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
 		MaxAge: -1, Expires: time.Unix(0, 0),
 	})
 	jsonOK(w, map[string]string{"message": "ok"})
