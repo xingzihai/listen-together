@@ -138,7 +138,7 @@ func main() {
 
 	// SyncTick: broadcast current playback position to all playing rooms every 2s
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			for _, rm := range manager.GetRooms() {

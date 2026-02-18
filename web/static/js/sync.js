@@ -1,12 +1,11 @@
-// Clock sync — NTP-like, using Date.now() consistently
-// Keep it simple: Date.now() for wall clock, performance.now() only for RTT measurement
+// Clock sync — NTP-like, aggressive tuning for <10ms precision
 class ClockSync {
     constructor() {
-        this.offset = 0;       // server_time - Date.now() (ms)
+        this.offset = 0;
         this.rtt = Infinity;
         this.synced = false;
         this.samples = [];
-        this.maxSamples = 48;
+        this.maxSamples = 64;
         this._lastNetType = null;
     }
 
@@ -15,14 +14,15 @@ class ClockSync {
         this.samples = [];
         this.synced = false;
         this.rtt = Infinity;
-        // Burst 8 pings for fast initial sync
-        for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 60);
+        // Burst 16 pings for fast initial sync
+        for (let i = 0; i < 16; i++) setTimeout(() => this.ping(), i * 40);
         this._scheduleNext();
     }
 
     _scheduleNext() {
         if (this._timer) clearTimeout(this._timer);
-        const interval = !this.synced ? 200 : (this.rtt > 150 ? 500 : 1000);
+        // Aggressive: 150ms when unsynced, 300ms always after synced
+        const interval = !this.synced ? 150 : 300;
         this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
     }
 
@@ -40,7 +40,6 @@ class ClockSync {
         const rtt = performance.now() - this._pending;
         this._pending = null;
 
-        // Network change detection — flush samples
         if (navigator.connection) {
             const net = (navigator.connection.type || '') + '/' + (navigator.connection.effectiveType || '');
             if (this._lastNetType && net !== this._lastNetType) {
@@ -51,34 +50,33 @@ class ClockSync {
             this._lastNetType = net;
         }
 
-        if (rtt > 2000) return;
-        if (this.rtt < Infinity && rtt > this.rtt * 3) return;
+        if (rtt > 1000) return;
+        if (this.rtt < Infinity && rtt > this.rtt * 2.5) return;
 
-        // offset = serverTime - (clientSendTime + rtt/2)
         const offset = msg.serverTime - (this._pendingWall + rtt / 2);
-
         this.samples.push({ offset, rtt, ts: performance.now() });
         if (this.samples.length > this.maxSamples) this.samples.shift();
 
-        // Expire old samples (30s)
-        const cutoff = performance.now() - 30000;
+        // Expire old samples (10s — only keep very fresh data)
+        const cutoff = performance.now() - 10000;
         this.samples = this.samples.filter(s => s.ts > cutoff);
 
         if (this.samples.length < 3) { this.synced = false; this.updateUI(); return; }
 
-        // Use average offset from the 3 lowest-RTT samples — most accurate & stable
+        // Use average offset from the 3 lowest-RTT samples
         const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
         const topN = Math.min(3, byRtt.length);
         let sum = 0;
         for (let i = 0; i < topN; i++) sum += byRtt[i].offset;
         const newOffset = sum / topN;
-        // EMA smoothing: small changes (<20ms) blend gradually, large jumps apply immediately
-        if (this.synced && Math.abs(newOffset - this.offset) < 20) {
-            this.offset = 0.7 * this.offset + 0.3 * newOffset;
+
+        // Tight EMA: small changes (<10ms) blend aggressively, large jumps apply immediately
+        if (this.synced && Math.abs(newOffset - this.offset) < 10) {
+            this.offset = 0.9 * this.offset + 0.1 * newOffset;
         } else {
             this.offset = newOffset;
         }
-        this.rtt = best[0].rtt;
+        this.rtt = byRtt[0].rtt;
         this.synced = true;
         this.updateUI();
     }

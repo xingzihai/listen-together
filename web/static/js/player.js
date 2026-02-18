@@ -282,9 +282,7 @@ class AudioPlayer {
 
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime) return 0;
-        // Debounce: skip if last resync was <2s ago
-        if (this._lastResync && Date.now() - this._lastResync < 2000) return 0;
-
+        // Debounce hard resync: skip if last resync was <1s ago
         const now = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
@@ -297,9 +295,19 @@ class AudioPlayer {
             driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
         }
 
-        // Hard resync when drift exceeds 50ms
-        if (Math.abs(drift) > 0.05) {
-            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms actual=${actualPos.toFixed(3)} expected=${expectedPos.toFixed(3)}`);
+        const absDrift = Math.abs(drift);
+
+        // Soft correction for 10-80ms drift: nudge startTime to realign
+        // This is glitch-free — no stop/restart, just shifts the time reference
+        if (absDrift > 0.01 && absDrift <= 0.08) {
+            this.startTime += drift;
+            return Math.round(drift * 1000);
+        }
+
+        // Hard resync for >80ms drift (with debounce)
+        if (absDrift > 0.08) {
+            if (this._lastResync && Date.now() - this._lastResync < 1500) return 0;
+            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms`);
             this._lastResync = Date.now();
             this.playAtPosition(this.serverPlayPosition, this.serverPlayTime);
             return Math.round(drift * 1000);
