@@ -146,20 +146,27 @@ func main() {
 				state := rm.State
 				pos := rm.Position
 				startT := rm.StartTime
+				var clients []*room.Client
+				if state == room.StatePlaying {
+					clients = make([]*room.Client, 0, len(rm.Clients))
+					for _, c := range rm.Clients {
+						clients = append(clients, c)
+					}
+				}
+				rm.Mu.RUnlock()
 				if state != room.StatePlaying {
-					rm.Mu.RUnlock()
 					continue
 				}
 				elapsed := time.Since(startT).Seconds()
 				currentPos := pos + elapsed
-				for _, c := range rm.Clients {
-					c.Send(map[string]interface{}{
-						"type":       "syncTick",
-						"position":   currentPos,
-						"serverTime": syncpkg.GetServerTime(),
-					})
+				msg := map[string]interface{}{
+					"type":       "syncTick",
+					"position":   currentPos,
+					"serverTime": syncpkg.GetServerTime(),
 				}
-				rm.Mu.RUnlock()
+				for _, c := range clients {
+					c.Send(msg)
+				}
 			}
 		}
 	}()
@@ -187,7 +194,28 @@ type rateLimiter struct {
 }
 
 func newRateLimiter() *rateLimiter {
-	return &rateLimiter{entries: make(map[string][]time.Time)}
+	rl := &rateLimiter{entries: make(map[string][]time.Time)}
+	go func() {
+		for range time.NewTicker(10 * time.Minute).C {
+			rl.mu.Lock()
+			now := time.Now()
+			for k, times := range rl.entries {
+				valid := times[:0]
+				for _, t := range times {
+					if now.Sub(t) < 5*time.Minute {
+						valid = append(valid, t)
+					}
+				}
+				if len(valid) == 0 {
+					delete(rl.entries, k)
+				} else {
+					rl.entries[k] = valid
+				}
+			}
+			rl.mu.Unlock()
+		}
+	}()
+	return rl
 }
 
 func (rl *rateLimiter) allow(key string, maxAttempts int, window time.Duration) bool {
@@ -239,15 +267,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	clientID := generateClientID()
 	var currentRoom *room.Room
-	var connMu sync.Mutex // protects all writes to this conn
+	var myClient *room.Client // set after join/create, used for unified write locking
 
-	// Safe write helper for this connection
+	// Safe write: before joining a room uses connMu, after joining uses Client.mu
+	var connMu sync.Mutex
 	safeWrite := func(v interface{}) {
-		connMu.Lock()
-		defer connMu.Unlock()
-		conn.WriteJSON(v)
+		if myClient != nil {
+			myClient.Send(v)
+		} else {
+			connMu.Lock()
+			defer connMu.Unlock()
+			conn.WriteJSON(v)
+		}
 	}
 	safePing := func() error {
+		if myClient != nil {
+			myClient.Lock()
+			defer myClient.Unlock()
+			return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+		}
 		connMu.Lock()
 		defer connMu.Unlock()
 		return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
@@ -296,6 +334,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			currentRoom.OwnerName = username
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
 			currentRoom.AddClient(client)
+			myClient = client
 			safeWrite(WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
 
 		case "join":
@@ -311,6 +350,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
 			currentRoom.AddClient(client)
+			myClient = client
 			isHost := currentRoom.IsHost(clientID)
 			currentRoom.Mu.RLock()
 			resp := WSResponse{

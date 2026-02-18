@@ -32,6 +32,10 @@ func (c *Client) Send(v interface{}) error {
 	return c.Conn.WriteJSON(v)
 }
 
+// Lock/Unlock expose the write mutex for WriteControl (ping) calls
+func (c *Client) Lock()   { c.mu.Lock() }
+func (c *Client) Unlock() { c.mu.Unlock() }
+
 type ClientInfo struct {
 	ClientID string `json:"clientID"`
 	Username string `json:"username"`
@@ -127,27 +131,40 @@ func (m *Manager) DeleteRoom(code string) {
 // broadcasts a room closed message, and removes them.
 // Returns the list of room codes that were closed.
 func (m *Manager) CloseRoomsByOwnerID(ownerID int64) []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	type closedRoom struct {
+		code    string
+		clients []*Client
+	}
+	var toClose []closedRoom
 
-	var closed []string
+	m.mu.Lock()
 	for code, rm := range m.rooms {
 		rm.Mu.RLock()
 		isOwner := rm.OwnerID == ownerID
+		var clients []*Client
+		if isOwner {
+			clients = make([]*Client, 0, len(rm.Clients))
+			for _, c := range rm.Clients {
+				clients = append(clients, c)
+			}
+		}
 		rm.Mu.RUnlock()
 		if isOwner {
-			// Notify all clients
-			rm.Mu.RLock()
-			for _, c := range rm.Clients {
-				c.Send(map[string]interface{}{
-					"type":  "roomClosed",
-					"error": "房间已被关闭（房主权限变更）",
-				})
-			}
-			rm.Mu.RUnlock()
+			toClose = append(toClose, closedRoom{code, clients})
 			delete(m.rooms, code)
-			closed = append(closed, code)
 		}
+	}
+	m.mu.Unlock()
+
+	var closed []string
+	for _, cr := range toClose {
+		for _, c := range cr.clients {
+			c.Send(map[string]interface{}{
+				"type":  "roomClosed",
+				"error": "房间已被关闭（房主权限变更）",
+			})
+		}
+		closed = append(closed, cr.code)
 	}
 	return closed
 }
@@ -174,17 +191,42 @@ func (m *Manager) cleanupLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// Phase 1: collect inactive rooms under lock
+		type closedRoom struct {
+			code    string
+			clients []*Client
+		}
+		var toClose []closedRoom
+
 		m.mu.Lock()
 		now := time.Now()
 		for code, room := range m.rooms {
 			room.Mu.RLock()
 			inactive := now.Sub(room.LastActive) > 30*time.Minute
+			var clients []*Client
+			if inactive {
+				clients = make([]*Client, 0, len(room.Clients))
+				for _, c := range room.Clients {
+					clients = append(clients, c)
+				}
+			}
 			room.Mu.RUnlock()
 			if inactive {
+				toClose = append(toClose, closedRoom{code, clients})
 				delete(m.rooms, code)
 			}
 		}
 		m.mu.Unlock()
+
+		// Phase 2: notify clients outside all locks
+		for _, cr := range toClose {
+			for _, c := range cr.clients {
+				c.Send(map[string]interface{}{
+					"type":  "roomClosed",
+					"error": "房间因长时间不活跃已关闭",
+				})
+			}
+		}
 	}
 }
 

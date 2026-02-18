@@ -19,6 +19,7 @@ class AudioPlayer {
         this._nextSegTime = 0;      // AudioContext time for next segment
         this._driftOffset = 0;      // accumulated soft drift correction (seconds)
         this._lastResync = 0;
+        this._resyncGen = 0;        // generation counter: incremented on each playAtPosition
     }
 
     init() {
@@ -180,6 +181,7 @@ class AudioPlayer {
         this.init(); this.stop();
         this.isPlaying = true;
         this._driftOffset = 0;
+        this._resyncGen++;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
@@ -280,7 +282,7 @@ class AudioPlayer {
 
     // === Drift Correction ===
     correctDrift() {
-        if (!this.isPlaying || !this.serverPlayTime) return 0;
+        if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
         const now = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
@@ -295,16 +297,25 @@ class AudioPlayer {
         // Soft correction (<100ms): adjust _nextSegTime for the next segment
         // Already-playing segments are untouched — zero glitch
         if (absDrift > 0.01 && absDrift <= 0.1) {
-            this._nextSegTime -= drift;
-            this._driftOffset += drift;
-            this.startTime += drift; // keep getCurrentTime() aligned
-            return Math.round(drift * 1000);
+            // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
+            if (Math.abs(this._driftOffset + drift) > 0.5) {
+                console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
+                // Fall through to hard resync below
+            } else {
+                this._nextSegTime -= drift;
+                this._driftOffset += drift;
+                this.startTime += drift; // keep getCurrentTime() aligned
+                this._resyncBackoff = 1500; // reset backoff on successful soft correction
+                return Math.round(drift * 1000);
+            }
         }
-        // Hard resync (>100ms): stop and restart (with debounce)
+        // Hard resync (>100ms): stop and restart (with exponential backoff debounce)
         if (absDrift > 0.1) {
-            if (this._lastResync && Date.now() - this._lastResync < 1500) return 0;
-            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms`);
+            const backoff = this._resyncBackoff || 1500;
+            if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
+            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
             this._lastResync = Date.now();
+            this._resyncBackoff = Math.min(backoff * 2, 10000); // cap at 10s
             // Fire-and-forget but prevent concurrent resyncs
             if (!this._resyncing) {
                 this._resyncing = true;
