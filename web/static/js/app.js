@@ -174,6 +174,9 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
+                // Immediate drift check after anchor update
+                const drift = window.audioPlayer.correctDrift();
+                if (drift) console.log('syncTick drift corrected:', drift, 'ms');
             }
             break;
         case 'deviceKick':

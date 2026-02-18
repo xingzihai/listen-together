@@ -282,6 +282,9 @@ class AudioPlayer {
 
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime) return 0;
+        // Debounce: skip if last resync was <2s ago
+        if (this._lastResync && Date.now() - this._lastResync < 2000) return 0;
+
         const now = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
@@ -294,9 +297,10 @@ class AudioPlayer {
             driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
         }
 
-        // Hard resync when drift exceeds 100ms
-        if (Math.abs(drift) > 0.1) {
+        // Hard resync when drift exceeds 50ms
+        if (Math.abs(drift) > 0.05) {
             console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms actual=${actualPos.toFixed(3)} expected=${expectedPos.toFixed(3)}`);
+            this._lastResync = Date.now();
             this.playAtPosition(this.serverPlayPosition, this.serverPlayTime);
             return Math.round(drift * 1000);
         }

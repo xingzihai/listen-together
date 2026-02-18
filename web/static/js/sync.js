@@ -66,13 +66,12 @@ class ClockSync {
 
         if (this.samples.length < 3) { this.synced = false; this.updateUI(); return; }
 
-        // Take lowest-RTT samples, use median offset
+        // Use average offset from the 3 lowest-RTT samples — most accurate & stable
         const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
-        const bestN = Math.max(3, Math.ceil(this.samples.length * 0.3));
-        const best = byRtt.slice(0, bestN);
-        const offsets = best.map(x => x.offset).sort((a, b) => a - b);
-        const mid = Math.floor(offsets.length / 2);
-        const newOffset = offsets.length % 2 ? offsets[mid] : (offsets[mid - 1] + offsets[mid]) / 2;
+        const topN = Math.min(3, byRtt.length);
+        let sum = 0;
+        for (let i = 0; i < topN; i++) sum += byRtt[i].offset;
+        const newOffset = sum / topN;
         // EMA smoothing: small changes (<20ms) blend gradually, large jumps apply immediately
         if (this.synced && Math.abs(newOffset - this.offset) < 20) {
             this.offset = 0.7 * this.offset + 0.3 * newOffset;
