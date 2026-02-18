@@ -74,6 +74,7 @@ type User struct {
 	PasswordHash    string    `json:"-"`
 	Role            string    `json:"role"`
 	PasswordVersion int64     `json:"password_version"`
+	SessionVersion  int64     `json:"session_version"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -127,6 +128,7 @@ func (d *DB) init() error {
 			password_hash TEXT NOT NULL,
 			role TEXT NOT NULL DEFAULT 'user',
 			password_version INTEGER NOT NULL DEFAULT 1,
+			session_version INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`)
 		if err != nil {
@@ -238,6 +240,7 @@ func (d *DB) init() error {
 			// Ensure columns exist
 			d.conn.Exec(`ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1`)
 			d.conn.Exec(`ALTER TABLE users ADD COLUMN suid INTEGER NOT NULL DEFAULT 0`)
+			d.conn.Exec(`ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1`)
 		}
 	}
 
@@ -343,8 +346,8 @@ func (d *DB) CreateUser(username, password, role string) (*User, error) {
 
 func (d *DB) GetUserByUsername(username string) (*User, error) {
 	u := &User{}
-	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,created_at FROM users WHERE username=?", username).
-		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,session_version,created_at FROM users WHERE username=?", username).
+		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -353,8 +356,8 @@ func (d *DB) GetUserByUsername(username string) (*User, error) {
 
 func (d *DB) GetUserByID(id int64) (*User, error) {
 	u := &User{}
-	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,created_at FROM users WHERE id=?", id).
-		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,session_version,created_at FROM users WHERE id=?", id).
+		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -363,17 +366,27 @@ func (d *DB) GetUserByID(id int64) (*User, error) {
 
 func (d *DB) GetUserByUID(uid int64) (*User, error) {
 	u := &User{}
-	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,created_at FROM users WHERE uid=?", uid).
-		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,session_version,created_at FROM users WHERE uid=?", uid).
+		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return u, nil
 }
 
-func (d *DB) GetUserRoleAndVersion(id int64) (role string, pwVersion int64, err error) {
-	err = d.conn.QueryRow("SELECT role, password_version FROM users WHERE id=?", id).Scan(&role, &pwVersion)
+func (d *DB) GetUserRoleAndVersion(id int64) (role string, pwVersion int64, sessVersion int64, err error) {
+	err = d.conn.QueryRow("SELECT role, password_version, session_version FROM users WHERE id=?", id).Scan(&role, &pwVersion, &sessVersion)
 	return
+}
+
+func (d *DB) BumpSessionVersion(id int64) (int64, error) {
+	_, err := d.conn.Exec("UPDATE users SET session_version=session_version+1 WHERE id=?", id)
+	if err != nil {
+		return 0, err
+	}
+	var v int64
+	d.conn.QueryRow("SELECT session_version FROM users WHERE id=?", id).Scan(&v)
+	return v, nil
 }
 
 func (d *DB) UpdatePassword(id int64, newPassword string) error {
@@ -413,7 +426,7 @@ func (d *DB) ListUsersPaged(page, pageSize int) ([]*User, int, error) {
 	d.conn.QueryRow("SELECT COUNT(*) FROM users").Scan(&total)
 
 	offset := (page - 1) * pageSize
-	rows, err := d.conn.Query("SELECT id,uid,suid,username,role,password_version,created_at FROM users ORDER BY uid LIMIT ? OFFSET ?", pageSize, offset)
+	rows, err := d.conn.Query("SELECT id,uid,suid,username,role,password_version,session_version,created_at FROM users ORDER BY uid LIMIT ? OFFSET ?", pageSize, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -421,14 +434,14 @@ func (d *DB) ListUsersPaged(page, pageSize int) ([]*User, int, error) {
 	var users []*User
 	for rows.Next() {
 		u := &User{}
-		rows.Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.Role, &u.PasswordVersion, &u.CreatedAt)
+		rows.Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
 		users = append(users, u)
 	}
 	return users, total, nil
 }
 
 func (d *DB) ListUsers() ([]*User, error) {
-	rows, err := d.conn.Query("SELECT id,uid,suid,username,role,password_version,created_at FROM users ORDER BY uid")
+	rows, err := d.conn.Query("SELECT id,uid,suid,username,role,password_version,session_version,created_at FROM users ORDER BY uid")
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +449,7 @@ func (d *DB) ListUsers() ([]*User, error) {
 	var users []*User
 	for rows.Next() {
 		u := &User{}
-		rows.Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.Role, &u.PasswordVersion, &u.CreatedAt)
+		rows.Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
 		users = append(users, u)
 	}
 	return users, nil

@@ -2,3 +2,5 @@ gouqi-app
 data/
 listen-together
 *.db
+*.crt
+*.key

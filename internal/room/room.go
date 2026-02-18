@@ -173,9 +173,16 @@ func (m *Manager) cleanupLoop() {
 func (r *Room) AddClient(client *Client) {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
-
 	r.Clients[client.ID] = client
 	if r.Host == nil {
+		r.Host = client
+		client.IsHost = true
+	}
+	// Room owner always gets host
+	if r.OwnerID != 0 && client.UID == r.OwnerID {
+		if r.Host != nil && r.Host.ID != client.ID {
+			r.Host.IsHost = false
+		}
 		r.Host = client
 		client.IsHost = true
 	}

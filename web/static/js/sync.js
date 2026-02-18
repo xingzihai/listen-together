@@ -1,65 +1,90 @@
+// Clock sync — NTP-like, using Date.now() consistently
+// Keep it simple: Date.now() for wall clock, performance.now() only for RTT measurement
 class ClockSync {
     constructor() {
-        this.offset = 0; this.rtt = 0; this.synced = false;
-        this.samples = []; this.maxSamples = 30;
+        this.offset = 0;       // server_time - Date.now() (ms)
+        this.rtt = Infinity;
+        this.synced = false;
+        this.samples = [];
+        this.maxSamples = 48;
+        this._lastNetType = null;
     }
 
     start(ws) {
         this.ws = ws;
-        // Burst 5 pings quickly for fast initial sync
-        for (let i = 0; i < 5; i++) setTimeout(() => this.ping(), i * 100);
-        this.interval = setInterval(() => this.ping(), 500); // 2x per second
+        this.samples = [];
+        this.synced = false;
+        this.rtt = Infinity;
+        // Burst 8 pings for fast initial sync
+        for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 60);
+        this._scheduleNext();
     }
 
-    stop() { if (this.interval) { clearInterval(this.interval); this.interval = null; } }
+    _scheduleNext() {
+        if (this._timer) clearTimeout(this._timer);
+        const interval = !this.synced ? 200 : (this.rtt > 150 ? 500 : 1000);
+        this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
+    }
+
+    stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } }
 
     ping() {
-        if (!this.ws || this.ws.readyState !== 1 || this._pendingPing) return;
-        const clientTime = performance.now();
-        this._pendingPing = clientTime;
+        if (!this.ws || this.ws.readyState !== 1 || this._pending) return;
+        this._pending = performance.now();
         this._pendingWall = Date.now();
         this.ws.send(JSON.stringify({ type: 'ping', clientTime: this._pendingWall }));
     }
 
     handlePong(msg) {
-        if (!this._pendingPing || msg.clientTime !== this._pendingWall) return;
-        const now = performance.now();
-        const rtt = now - this._pendingPing;
-        this._pendingPing = null;
-        this._pendingWall = null;
+        if (!this._pending) return;
+        const rtt = performance.now() - this._pending;
+        this._pending = null;
 
-        // Discard outliers (RTT > 500ms likely network hiccup)
-        if (rtt > 500) return;
+        // Network change detection — flush samples
+        if (navigator.connection) {
+            const net = (navigator.connection.type || '') + '/' + (navigator.connection.effectiveType || '');
+            if (this._lastNetType && net !== this._lastNetType) {
+                this.samples = [];
+                this.synced = false;
+                this.rtt = Infinity;
+            }
+            this._lastNetType = net;
+        }
 
-        const serverTime = msg.serverTime;
-        const offset = serverTime + rtt / 2 - Date.now();
+        if (rtt > 2000) return;
+        if (this.rtt < Infinity && rtt > this.rtt * 3) return;
 
-        this.samples.push({ offset, rtt, ts: now });
+        // offset = serverTime - (clientSendTime + rtt/2)
+        const offset = msg.serverTime - (this._pendingWall + rtt / 2);
+
+        this.samples.push({ offset, rtt, ts: performance.now() });
         if (this.samples.length > this.maxSamples) this.samples.shift();
 
-        // Use median of best 10 by RTT for stability
-        const sorted = [...this.samples].sort((a, b) => a.rtt - b.rtt);
-        const best = sorted.slice(0, Math.min(10, sorted.length));
+        // Expire old samples (30s)
+        const cutoff = performance.now() - 30000;
+        this.samples = this.samples.filter(s => s.ts > cutoff);
 
-        // Median offset (more robust than mean against outliers)
+        if (this.samples.length < 3) { this.synced = false; this.updateUI(); return; }
+
+        // Take lowest-RTT samples, use median offset
+        const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
+        const bestN = Math.max(3, Math.ceil(this.samples.length * 0.3));
+        const best = byRtt.slice(0, bestN);
         const offsets = best.map(x => x.offset).sort((a, b) => a - b);
         const mid = Math.floor(offsets.length / 2);
         this.offset = offsets.length % 2 ? offsets[mid] : (offsets[mid - 1] + offsets[mid]) / 2;
-        this.rtt = best.reduce((s, x) => s + x.rtt, 0) / best.length;
-        this.synced = this.samples.length >= 3;
-
+        this.rtt = best[0].rtt;
+        this.synced = true;
         this.updateUI();
     }
 
     updateUI() {
         const el = document.getElementById('syncStatus');
-        if (el) {
-            const sign = this.offset >= 0 ? '+' : '';
-            el.textContent = `RTT: ${Math.round(this.rtt)}ms | Offset: ${sign}${this.offset.toFixed(1)}ms | Samples: ${this.samples.length}`;
-        }
+        if (!el) return;
+        const sign = this.offset >= 0 ? '+' : '';
+        el.textContent = `RTT: ${Math.round(this.rtt)}ms | Offset: ${sign}${this.offset.toFixed(1)}ms | Samples: ${this.samples.length}`;
     }
 
-    serverToLocal(serverTime) { return serverTime - this.offset; }
     getServerTime() { return Date.now() + this.offset; }
 }
 

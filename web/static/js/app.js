@@ -3,6 +3,7 @@ let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
 let roomUsers = [], myClientID = null;
 let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
 let trackLoading = false, pendingPlay = null;
+let deviceKicked = false;
 
 function renderAudiencePanel() {
     const list = $('audienceList');
@@ -51,14 +52,50 @@ function connect(onOpen) {
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
     ws.onopen = () => { console.log('WS connected'); if (onOpen) onOpen(); };
     ws.onmessage = e => handleMessage(JSON.parse(e.data));
-    ws.onclose = () => setTimeout(() => connect(), 3000);
+    ws.onclose = (ev) => {
+        if (deviceKicked) return;
+        // 1006 = abnormal close (server rejected, e.g. 401)
+        // Check if session is still valid before reconnecting
+        fetch('/api/auth/me', {credentials:'include'}).then(r => {
+            if (!r.ok) {
+                // JWT invalid — kicked by new login on another device
+                sessionExpired();
+            } else {
+                setTimeout(() => connect(), 3000);
+            }
+        }).catch(() => setTimeout(() => connect(), 3000));
+    };
     ws.onerror = e => console.error('WS error', e);
+}
+
+function sessionExpired() {
+    deviceKicked = true;
+    if (window.audioPlayer) window.audioPlayer.stop();
+    stopUIUpdate();
+    if (window.clockSync) window.clockSync.stop();
+    location.hash = '';
+    roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+    alert('你的账号已在其他设备登录，当前会话已失效');
+    location.reload();
 }
 
 async function handleMessage(msg) {
     console.log('WS:', msg.type, msg);
     switch (msg.type) {
-        case 'created': case 'joined':
+        case 'created':
+            // Clean slate for new room
+            if (window.audioPlayer) window.audioPlayer.stop();
+            stopUIUpdate();
+            audioInfo = null; pausedPosition = 0;
+            playlist = null; playlistItems = []; currentTrackIndex = -1;
+            trackLoading = false; pendingPlay = null;
+            $('trackName').textContent = '未选择歌曲';
+            $('currentTime').textContent = '0:00';
+            $('totalTime').textContent = '0:00';
+            $('progressBar').value = 0; $('progressBar').max = 0;
+            updatePlayButton(false);
+            // fall through to shared logic
+        case 'joined':
             roomCode = msg.roomCode; isHost = msg.isHost;
             if (msg.users) { roomUsers = msg.users; renderAudiencePanel(); }
             location.hash = roomCode;
@@ -86,7 +123,14 @@ async function handleMessage(msg) {
         case 'audioReady':
             audioInfo = msg.audio; await setupAudio(); break;
         case 'play':
-            await doPlay(msg.position, msg.serverTime, msg.scheduledAt); break;
+            // If play carries trackAudio and we don't have audio loaded, load it first
+            if (msg.trackAudio && !audioInfo) {
+                await handleTrackChange(msg);
+                if (!pendingPlay) await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+            } else {
+                await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+            }
+            break;
         case 'pause':
             doPause(); break;
         case 'seek':
@@ -125,6 +169,17 @@ async function handleMessage(msg) {
             showScreen('home');
             break;
         case 'pong': window.clockSync.handlePong(msg); break;
+        case 'deviceKick':
+            deviceKicked = true;
+            if (window.audioPlayer) window.audioPlayer.stop();
+            stopUIUpdate();
+            window.clockSync.stop();
+            location.hash = '';
+            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            $('audiencePanel').classList.add('hidden');
+            showScreen('home');
+            alert(msg.error || '你的账号已在其他设备连接');
+            break;
         case 'error': alert(msg.error); break;
         case 'playlistUpdate':
             if (msg.playlistData) {
@@ -212,6 +267,7 @@ function updatePlayButton(playing) {
 }
 
 // --- Events ---
+// Auto-connect on page load for single-device enforcement
 window.addEventListener('load', () => {
     const hash = location.hash.replace('#', '').trim();
     if (hash.length === 6) {
@@ -222,17 +278,44 @@ window.addEventListener('load', () => {
             }
         }, 200);
         setTimeout(() => clearInterval(checkAuth), 5000);
+    } else {
+        // Connect immediately so server can enforce single-device
+        const checkAuth = setInterval(() => {
+            if (window.Auth && window.Auth.user) {
+                clearInterval(checkAuth);
+                connect();
+            }
+        }, 200);
+        setTimeout(() => clearInterval(checkAuth), 5000);
     }
 });
 
-$('createBtn').onclick = () => connect(() => ws.send(JSON.stringify({ type: 'create' })));
+function ensureWS(cb) {
+    if (ws && ws.readyState === 1) { cb(); return; }
+    connect(cb);
+}
+
+$('createBtn').onclick = () => ensureWS(() => ws.send(JSON.stringify({ type: 'create' })));
 $('joinBtn').onclick = () => {
     const code = $('roomCodeInput').value.trim().toUpperCase();
-    if (code.length !== 6) return alert('Enter a 6-character room code');
-    connect(() => ws.send(JSON.stringify({ type: 'join', roomCode: code })));
+    if (code.length !== 6) return alert('请输入6位房间码');
+    ensureWS(() => ws.send(JSON.stringify({ type: 'join', roomCode: code })));
 };
 $('roomCodeInput').onkeypress = e => { if (e.key === 'Enter') $('joinBtn').click(); };
 $('copyCode').onclick = () => { navigator.clipboard.writeText(roomCode); $('copyCode').textContent = '✓'; setTimeout(() => $('copyCode').textContent = '📋', 1500); };
+
+$('leaveBtn').onclick = () => {
+    if (window.audioPlayer) window.audioPlayer.stop();
+    stopUIUpdate();
+    if (window.clockSync) window.clockSync.stop();
+    if (ws) { ws.close(); ws = null; }
+    location.hash = '';
+    roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+    pausedPosition = 0; playlist = null; playlistItems = []; currentTrackIndex = -1;
+    trackLoading = false; pendingPlay = null;
+    $('audiencePanel').classList.add('hidden');
+    showScreen('home');
+};
 
 $('playPauseBtn').onclick = () => {
     if (!isHost || !audioInfo) return;
@@ -350,8 +433,10 @@ async function handleTrackChange(msg) {
 
     const qualities = ta.qualities || [];
     const preferredQ = localStorage.getItem('lt_quality') || 'medium';
-    // Phase 1: always fetch medium segments first for sync consistency
-    const initialQ = qualities.includes('medium') ? 'medium' : (qualities[qualities.length - 1] || 'medium');
+    // Use user's preferred quality if available, otherwise fallback to medium
+    const initialQ = qualities.includes(preferredQ) ? preferredQ
+        : qualities.includes('medium') ? 'medium'
+        : (qualities[qualities.length - 1] || 'medium');
 
     try {
         const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`, {credentials:'include'});

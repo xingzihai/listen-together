@@ -38,9 +38,12 @@ class AudioPlayer {
         this._audioUUID = audioInfo.audioUUID || null;
         this._upgrading = false;
 
-        // Phase 1: always load medium first for sync consistency
+        // Load user's preferred quality (remembered in localStorage), fallback to medium
         if (this._qualities.length > 0) {
-            const initialQ = this._qualities.includes('medium') ? 'medium' : this._qualities[this._qualities.length - 1];
+            const preferred = this._quality; // from localStorage or 'medium'
+            const initialQ = this._qualities.includes(preferred) ? preferred
+                : this._qualities.includes('medium') ? 'medium'
+                : this._qualities[this._qualities.length - 1];
             this._actualQuality = initialQ;
             await this._loadQualitySegments(initialQ);
         } else {
@@ -69,17 +72,9 @@ class AudioPlayer {
     async setQuality(quality) {
         this._quality = quality;
         localStorage.setItem('lt_quality', quality);
-        // If already at this quality, nothing to do
         if (quality === this._actualQuality && this.segments.length > 0) return;
-        // Use two-phase upgrade if playing, otherwise direct load
-        if (this.isPlaying) {
-            this._upgradeQuality(quality);
-        } else {
-            this.buffers.clear();
-            await this._loadQualitySegments(quality);
-            this._actualQuality = quality;
-            if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
-        }
+        // Always use upgrade path — it handles both playing and paused states
+        await this._upgradeQuality(quality);
     }
 
     getQuality() { return this._quality; }
@@ -93,7 +88,6 @@ class AudioPlayer {
         this._upgrading = true;
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, true);
         try {
-            // Fetch target quality segment list
             const res = await fetch(`/api/library/files/${this._audioID}/segments/${targetQuality}/`, {credentials:'include'});
             if (!res.ok) throw new Error('upgrade segments fetch failed: ' + res.status);
             const data = await res.json();
@@ -105,7 +99,7 @@ class AudioPlayer {
             // Preload all segment buffers in background
             const newBuffers = new Map();
             for (let i = 0; i < newSegments.length; i++) {
-                if (!this._upgrading) return; // cancelled (e.g. track changed)
+                if (!this._upgrading) return;
                 const url = `/api/library/segments/${this._ownerID}/${newAudioUUID}/${targetQuality}/${newSegments[i]}`;
                 let arrayBuf = await window.audioCache.get(url);
                 if (!arrayBuf) {
@@ -126,15 +120,37 @@ class AudioPlayer {
                 newBuffers.set(i, buffer);
             }
 
-            if (!this._upgrading) return; // cancelled during loading
+            if (!this._upgrading) return;
 
-            // Swap: replace segments and buffers atomically
+            // Fix #4: Wait for current segment boundary before swapping
+            if (this.isPlaying) {
+                const curPos = this.getCurrentTime();
+                const curSegEnd = (Math.floor(curPos / this.segmentTime) + 1) * this.segmentTime;
+                const waitMs = Math.max(0, (curSegEnd - curPos) * 1000);
+                if (waitMs > 50) {
+                    await new Promise(r => setTimeout(r, waitMs));
+                }
+                if (!this._upgrading || !this.isPlaying) return;
+            }
+
+            // Stop current playback, swap buffers, restart from current position
+            const resumePos = this.isPlaying ? this.getCurrentTime() : this.lastPosition;
+            const wasPlaying = this.isPlaying;
+            this.stop();
             this.segments = newSegments;
             this.segmentTime = newSegTime;
             this._audioUUID = newAudioUUID;
             this.buffers = newBuffers;
             this._actualQuality = targetQuality;
             if (data.duration) this.duration = data.duration;
+
+            if (wasPlaying) {
+                this._scheduleAbort = false;
+                this.isPlaying = true;
+                this.startOffset = resumePos;
+                this.startTime = this.ctx.currentTime;
+                await this._scheduleFrom(resumePos);
+            }
         } catch (e) {
             console.error('_upgradeQuality failed:', e);
         } finally {
@@ -195,10 +211,11 @@ class AudioPlayer {
             await this.preloadSegments(segIdx, 2);
             if (this.onBuffering) this.onBuffering(false);
         }
+        // Wait for scheduled time if in the future
         if (scheduledAt) {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - Date.now();
-            if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+            if (waitMs > 0 && waitMs < 3000) await new Promise(r => setTimeout(r, waitMs));
         }
         if (!this.isPlaying) return;
         const now = window.clockSync.getServerTime();
@@ -258,14 +275,13 @@ class AudioPlayer {
         if (Math.abs(drift) > 0.5) {
             this.playAtPosition(this.serverPlayPosition, this.serverPlayTime);
             return Math.round(drift * 1000);
-        } else if (Math.abs(drift) > 0.008) {
-            const correction = 1.0 - Math.max(-0.02, Math.min(0.02, drift * 0.5));
+        } else if (Math.abs(drift) > 0.01) {
+            const correction = 1.0 - Math.max(-0.03, Math.min(0.03, drift * 0.5));
             this.sources.forEach(s => { try { s.playbackRate.value = correction; } catch {} });
-            const holdMs = Math.min(1000, Math.abs(drift) * 5000);
             clearTimeout(this._rateTimer);
             this._rateTimer = setTimeout(() => {
                 this.sources.forEach(s => { try { s.playbackRate.value = 1.0; } catch {} });
-            }, holdMs);
+            }, Math.min(2000, Math.abs(drift) * 8000));
             return Math.round(drift * 1000);
         }
         return 0;

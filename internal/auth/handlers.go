@@ -105,7 +105,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "注册失败，用户名可能已存在", 400)
 		return
 	}
-	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion)
+	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, user.SessionVersion)
 	setTokenCookie(w, token)
 	jsonOK(w, map[string]interface{}{"user": user, "token": token})
 }
@@ -125,7 +125,11 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "用户名或密码错误", 401)
 		return
 	}
-	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion)
+	// Don't bump session_version on normal login — it breaks multi-tab usage
+	// session_version is only bumped on password change
+	sessVer := user.SessionVersion
+	GlobalRoleCache.Invalidate(user.ID)
+	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, sessVer)
 	setTokenCookie(w, token)
 	// Check if owner with default password
 	needChangePassword := user.Role == "owner" && CheckPassword(user.PasswordHash, "admin123")
@@ -196,7 +200,7 @@ func (h *AuthHandlers) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "修改失败", 500)
 		return
 	}
-	token, _ := GenerateToken(user.UserID, user.Username, user.Role, updatedUser.PasswordVersion)
+	token, _ := GenerateToken(user.UserID, user.Username, user.Role, updatedUser.PasswordVersion, updatedUser.SessionVersion)
 	setTokenCookie(w, token)
 	jsonOK(w, map[string]string{"message": "ok"})
 }
@@ -238,7 +242,7 @@ func (h *AuthHandlers) ChangeUsername(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	GlobalRoleCache.Invalidate(user.UserID)
-	token, _ := GenerateToken(user.UserID, req.NewUsername, user.Role, dbUser.PasswordVersion)
+	token, _ := GenerateToken(user.UserID, req.NewUsername, user.Role, dbUser.PasswordVersion, dbUser.SessionVersion)
 	setTokenCookie(w, token)
 	jsonOK(w, map[string]interface{}{"message": "ok", "username": req.NewUsername})
 }

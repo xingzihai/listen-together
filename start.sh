@@ -1,8 +1,17 @@
 #!/bin/bash
 # ListenTogether 启动脚本
 
-# 启动Go服务
 cd /root/.openclaw/workspace/github-projects/listen-together
+
+# Fixed JWT secret so tokens survive restarts
+export JWT_SECRET="lt-s3cr3t-k8y-2026-xzh-permanent"
+
+# 杀掉旧进程
+pkill -f './listen-together' 2>/dev/null
+pkill -f 'frpc.*25995194' 2>/dev/null
+sleep 1
+
+# 启动Go服务
 nohup ./listen-together > /tmp/listen-together.log 2>&1 &
 echo "ListenTogether started on :8080"
 

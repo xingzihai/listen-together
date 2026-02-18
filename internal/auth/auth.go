@@ -24,6 +24,7 @@ type Claims struct {
 	Username        string `json:"username"`
 	Role            string `json:"role"`
 	PasswordVersion int64  `json:"pw_ver"`
+	SessionVersion  int64  `json:"sess_ver"`
 	jwt.RegisteredClaims
 }
 
@@ -40,6 +41,7 @@ var jwtSecret []byte
 type cachedEntry struct {
 	Role            string
 	PasswordVersion int64
+	SessionVersion  int64
 	ExpiresAt       time.Time
 }
 
@@ -52,23 +54,24 @@ func NewRoleCache() *RoleCache {
 	return &RoleCache{items: make(map[int64]cachedEntry)}
 }
 
-func (c *RoleCache) Get(userID int64) (role string, pwVer int64, ok bool) {
+func (c *RoleCache) Get(userID int64) (role string, pwVer int64, sessVer int64, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	e, exists := c.items[userID]
 	if !exists || time.Now().After(e.ExpiresAt) {
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	return e.Role, e.PasswordVersion, true
+	return e.Role, e.PasswordVersion, e.SessionVersion, true
 }
 
-func (c *RoleCache) Set(userID int64, role string, pwVer int64) {
+func (c *RoleCache) Set(userID int64, role string, pwVer int64, sessVer int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[userID] = cachedEntry{
 		Role:            role,
 		PasswordVersion: pwVer,
-		ExpiresAt:       time.Now().Add(30 * time.Second),
+		SessionVersion:  sessVer,
+		ExpiresAt:       time.Now().Add(5 * time.Second),
 	}
 }
 
@@ -106,12 +109,13 @@ func InitJWT() {
 	}
 }
 
-func GenerateToken(userID int64, username, role string, pwVersion int64) (string, error) {
+func GenerateToken(userID int64, username, role string, pwVersion, sessVersion int64) (string, error) {
 	claims := Claims{
 		UserID:          userID,
 		Username:        username,
 		Role:            role,
 		PasswordVersion: pwVersion,
+		SessionVersion:  sessVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -134,27 +138,23 @@ func ValidateToken(tokenStr string) (*Claims, error) {
 	return nil, jwt.ErrSignatureInvalid
 }
 
-// validateClaimsAgainstDB checks role and password_version against DB/cache.
-// Returns the current DB role (which may differ from claims) or error.
+// validateClaimsAgainstDB checks role, password_version and session_version against DB/cache.
 func validateClaimsAgainstDB(claims *Claims) (string, error) {
 	if authDB == nil {
 		return claims.Role, nil
 	}
-	// Check cache first
-	if role, pwVer, ok := GlobalRoleCache.Get(claims.UserID); ok {
-		if pwVer != claims.PasswordVersion || role != claims.Role {
+	if role, pwVer, sessVer, ok := GlobalRoleCache.Get(claims.UserID); ok {
+		if pwVer != claims.PasswordVersion || sessVer != claims.SessionVersion || role != claims.Role {
 			return "", jwt.ErrSignatureInvalid
 		}
 		return role, nil
 	}
-	// Cache miss — query DB
-	role, pwVer, err := authDB.GetUserRoleAndVersion(claims.UserID)
+	role, pwVer, sessVer, err := authDB.GetUserRoleAndVersion(claims.UserID)
 	if err != nil {
-		// User deleted or DB error
 		return "", jwt.ErrSignatureInvalid
 	}
-	GlobalRoleCache.Set(claims.UserID, role, pwVer)
-	if pwVer != claims.PasswordVersion || role != claims.Role {
+	GlobalRoleCache.Set(claims.UserID, role, pwVer, sessVer)
+	if pwVer != claims.PasswordVersion || sessVer != claims.SessionVersion || role != claims.Role {
 		return "", jwt.ErrSignatureInvalid
 	}
 	return role, nil
@@ -189,7 +189,7 @@ func tryAutoRenew(w http.ResponseWriter, claims *Claims) {
 	}
 	remaining := time.Until(claims.ExpiresAt.Time)
 	if remaining > 0 && remaining < 2*time.Hour {
-		newToken, err := GenerateToken(claims.UserID, claims.Username, claims.Role, claims.PasswordVersion)
+		newToken, err := GenerateToken(claims.UserID, claims.Username, claims.Role, claims.PasswordVersion, claims.SessionVersion)
 		if err != nil {
 			return
 		}

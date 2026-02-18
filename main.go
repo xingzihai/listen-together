@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -127,8 +128,16 @@ func main() {
 
 	mux.Handle("/", http.FileServer(http.Dir("./web/static")))
 
+	// Fix #2: Global request body limit (1MB for non-upload routes; upload has its own 50MB limit)
+	limitedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/library/upload" {
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	log.Println("ListenTogether server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(http.ListenAndServe(":8080", limitedMux))
 }
 
 func generateCode() string {
@@ -143,16 +152,55 @@ func generateClientID() string {
 	return hex.EncodeToString(b)
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	userInfo := auth.ExtractUserFromRequest(r)
-	username := ""
-	userRole := ""
-	var userID int64
-	if userInfo != nil {
-		username = userInfo.Username
-		userRole = userInfo.Role
-		userID = userInfo.UserID
+// --- Join rate limiter (anti-enumeration) ---
+type rateLimiter struct {
+	mu      sync.Mutex
+	entries map[string][]time.Time
+}
+
+func newRateLimiter() *rateLimiter {
+	return &rateLimiter{entries: make(map[string][]time.Time)}
+}
+
+func (rl *rateLimiter) allow(key string, maxAttempts int, window time.Duration) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-window)
+	// Prune old entries
+	valid := rl.entries[key][:0]
+	for _, t := range rl.entries[key] {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
 	}
+	if len(valid) >= maxAttempts {
+		rl.entries[key] = valid
+		return false
+	}
+	rl.entries[key] = append(valid, now)
+	return true
+}
+
+var joinLimiter = newRateLimiter()
+
+func getClientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		return strings.Split(fwd, ",")[0]
+	}
+	return strings.Split(r.RemoteAddr, ":")[0]
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// --- Fix #1: Reject unauthenticated WebSocket connections ---
+	userInfo := auth.ExtractUserFromRequest(r)
+	if userInfo == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	username := userInfo.Username
+	userRole := userInfo.Role
+	userID := userInfo.UserID
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -164,11 +212,35 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := generateClientID()
 	var currentRoom *room.Room
 
+	// WebSocket ping/pong for dead connection detection
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		return nil
+	})
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		switch msg.Type {
 		case "create":
@@ -186,6 +258,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			sendJSON(conn, WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
 
 		case "join":
+			// Fix #3: Rate limit join attempts (5 per minute per IP)
+			if !joinLimiter.allow(getClientIP(r), 5, time.Minute) {
+				sendJSON(conn, WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
+				continue
+			}
 			currentRoom = manager.GetRoom(msg.RoomCode)
 			if currentRoom == nil {
 				sendJSON(conn, WSResponse{Type: "error", Error: "Room not found"})
@@ -245,7 +322,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			currentRoom.Play(msg.Position)
 			scheduledTime := syncpkg.GetServerTime() + 500
-			broadcast(currentRoom, WSResponse{Type: "play", Position: msg.Position, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime}, "")
+
+			// Include trackAudio so listeners who missed trackChange can load
+			currentRoom.Mu.RLock()
+			ta := currentRoom.TrackAudio
+			ti := currentRoom.CurrentTrack
+			currentRoom.Mu.RUnlock()
+
+			broadcast(currentRoom, WSResponse{
+				Type: "play", Position: msg.Position,
+				ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime,
+				TrackAudio: ta, TrackIndex: ti,
+			}, "")
 
 		case "pause":
 			if currentRoom == nil || !currentRoom.IsHost(clientID) {
