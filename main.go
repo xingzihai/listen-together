@@ -142,15 +142,18 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			for _, rm := range manager.GetRooms() {
-				state, pos, startT := rm.GetPlaybackState()
+				rm.Mu.RLock()
+				state := rm.State
+				pos := rm.Position
+				startT := rm.StartTime
 				if state != room.StatePlaying {
+					rm.Mu.RUnlock()
 					continue
 				}
 				elapsed := time.Since(startT).Seconds()
 				currentPos := pos + elapsed
-				rm.Mu.RLock()
 				for _, c := range rm.Clients {
-					c.Conn.WriteJSON(map[string]interface{}{
+					c.Send(map[string]interface{}{
 						"type":       "syncTick",
 						"position":   currentPos,
 						"serverTime": syncpkg.GetServerTime(),
@@ -236,6 +239,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	clientID := generateClientID()
 	var currentRoom *room.Room
+	var connMu sync.Mutex // protects all writes to this conn
+
+	// Safe write helper for this connection
+	safeWrite := func(v interface{}) {
+		connMu.Lock()
+		defer connMu.Unlock()
+		conn.WriteJSON(v)
+	}
+	safePing := func() error {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+	}
 
 	// WebSocket ping/pong for dead connection detection
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -253,7 +269,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			case <-pingDone:
 				return
 			case <-ticker.C:
-				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+				if err := safePing(); err != nil {
 					return
 				}
 			}
@@ -271,7 +287,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case "create":
 			// Permission check: only admin and owner can create rooms
 			if userRole != "admin" && userRole != "owner" {
-				sendJSON(conn, WSResponse{Type: "error", Error: "没有创建房间的权限"})
+				safeWrite(WSResponse{Type: "error", Error: "没有创建房间的权限"})
 				continue
 			}
 			code := generateCode()
@@ -280,17 +296,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			currentRoom.OwnerName = username
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
 			currentRoom.AddClient(client)
-			sendJSON(conn, WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
+			safeWrite(WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
 
 		case "join":
 			// Fix #3: Rate limit join attempts (5 per minute per IP)
 			if !joinLimiter.allow(getClientIP(r), 5, time.Minute) {
-				sendJSON(conn, WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
+				safeWrite(WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
 				continue
 			}
 			currentRoom = manager.GetRoom(msg.RoomCode)
 			if currentRoom == nil {
-				sendJSON(conn, WSResponse{Type: "error", Error: "Room not found"})
+				safeWrite(WSResponse{Type: "error", Error: "Room not found"})
 				continue
 			}
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
@@ -304,11 +320,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			state, pos, startT := currentRoom.State, currentRoom.Position, currentRoom.StartTime
 			currentRoom.Mu.RUnlock()
-			sendJSON(conn, resp)
+			safeWrite(resp)
 			// Send playlist data to joining client
 			if pl, err := globalDB.GetPlaylistByRoom(msg.RoomCode); err == nil && pl != nil {
 				items, _ := globalDB.GetPlaylistItems(pl.ID)
-				sendJSON(conn, WSResponse{Type: "playlistUpdate", PlaylistData: &PlaylistBroadcast{Playlist: pl, Items: items}})
+				safeWrite(WSResponse{Type: "playlistUpdate", PlaylistData: &PlaylistBroadcast{Playlist: pl, Items: items}})
 			}
 			broadcast(currentRoom, WSResponse{Type: "userJoined", ClientCount: currentRoom.ClientCount(), Username: username, Users: currentRoom.GetClientList()}, clientID)
 
@@ -319,7 +335,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			currentRoom.Mu.RUnlock()
 
 			if trackAudio != nil {
-				sendJSON(conn, WSResponse{
+				safeWrite(WSResponse{
 					Type:       "trackChange",
 					TrackIndex: trackIdx,
 					TrackAudio: trackAudio,
@@ -330,12 +346,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					elapsed := time.Since(startT).Seconds()
 					currentPos := pos + elapsed
 					scheduledTime := syncpkg.GetServerTime() + 500
-					sendJSON(conn, WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
+					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
 				}
 			}
 
 		case "ping":
-			sendJSON(conn, WSResponse{Type: "pong", ClientTime: msg.ClientTime, ServerTime: syncpkg.GetServerTime()})
+			safeWrite(WSResponse{Type: "pong", ClientTime: msg.ClientTime, ServerTime: syncpkg.GetServerTime()})
 
 		case "play":
 			if currentRoom == nil || !currentRoom.IsHost(clientID) {
@@ -386,19 +402,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if currentRoom.OwnerID != userID {
-				sendJSON(conn, WSResponse{Type: "error", Error: "只有房主可以踢人"})
+				safeWrite(WSResponse{Type: "error", Error: "只有房主可以踢人"})
 				continue
 			}
 			if msg.TargetClientID == clientID {
-				sendJSON(conn, WSResponse{Type: "error", Error: "不能踢出自己"})
+				safeWrite(WSResponse{Type: "error", Error: "不能踢出自己"})
 				continue
 			}
 			target := currentRoom.RemoveClientByID(msg.TargetClientID)
 			if target == nil {
-				sendJSON(conn, WSResponse{Type: "error", Error: "用户不存在"})
+				safeWrite(WSResponse{Type: "error", Error: "用户不存在"})
 				continue
 			}
-			sendJSON(target.Conn, WSResponse{Type: "kicked"})
+			target.Send(WSResponse{Type: "kicked"})
 			target.Conn.Close()
 			broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 
@@ -468,23 +484,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			users := currentRoom.GetClientList()
 			for _, c := range currentRoom.GetClients() {
 				if currentRoom.IsHost(c.ID) {
-					sendJSON(c.Conn, WSResponse{Type: "hostTransfer", IsHost: true, ClientCount: currentRoom.ClientCount(), Users: users})
+					c.Send(WSResponse{Type: "hostTransfer", IsHost: true, ClientCount: currentRoom.ClientCount(), Users: users})
 				} else {
-					sendJSON(c.Conn, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: users})
+					c.Send(WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: users})
 				}
 			}
 		}
 	}
 }
 
-func sendJSON(conn *websocket.Conn, v interface{}) {
-	conn.WriteJSON(v)
-}
+// sendJSON is deprecated — use safeWrite (per-conn) or Client.Send() instead
 
 func broadcast(rm *room.Room, msg WSResponse, excludeID string) {
 	for _, c := range rm.GetClients() {
 		if c.ID != excludeID {
-			c.Conn.WriteJSON(msg)
+			c.Send(msg)
 		}
 	}
 }

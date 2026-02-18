@@ -22,6 +22,14 @@ type Client struct {
 	IsHost   bool
 	JoinedAt time.Time
 	UID      int64
+	mu       sync.Mutex // protects Conn writes
+}
+
+// Send safely writes JSON to the client's WebSocket (gorilla doesn't support concurrent writes)
+func (c *Client) Send(v interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.WriteJSON(v)
 }
 
 type ClientInfo struct {
@@ -131,7 +139,7 @@ func (m *Manager) CloseRoomsByOwnerID(ownerID int64) []string {
 			// Notify all clients
 			rm.Mu.RLock()
 			for _, c := range rm.Clients {
-				c.Conn.WriteJSON(map[string]interface{}{
+				c.Send(map[string]interface{}{
 					"type":  "roomClosed",
 					"error": "房间已被关闭（房主权限变更）",
 				})
@@ -154,7 +162,7 @@ func (m *Manager) SendToUserByUsername(username string, msg interface{}) {
 		rm.Mu.RLock()
 		for _, c := range rm.Clients {
 			if c.Username == username {
-				c.Conn.WriteJSON(msg)
+				c.Send(msg)
 			}
 		}
 		rm.Mu.RUnlock()

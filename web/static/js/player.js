@@ -6,14 +6,19 @@ class AudioPlayer {
         this.serverPlayTime = 0; this.serverPlayPosition = 0;
         this.onBuffering = null;
         this._trackSegBase = null;
-        // Multi-quality: _quality = user preference, _actualQuality = currently loaded quality
         this._quality = localStorage.getItem('lt_quality') || 'medium';
         this._actualQuality = 'medium';
         this._upgrading = false;
         this._qualities = [];
         this._ownerID = null;
         this._audioID = null;
-        this.onQualityChange = null; // callback(actualQuality, upgrading)
+        this.onQualityChange = null;
+        // Lookahead scheduler state
+        this._lookaheadTimer = null;
+        this._nextSegIdx = 0;       // next segment to schedule
+        this._nextSegTime = 0;      // AudioContext time for next segment
+        this._driftOffset = 0;      // accumulated soft drift correction (seconds)
+        this._lastResync = 0;
     }
 
     init() {
@@ -37,10 +42,8 @@ class AudioPlayer {
         this._audioID = audioInfo.audioID || null;
         this._audioUUID = audioInfo.audioUUID || null;
         this._upgrading = false;
-
-        // Load user's preferred quality (remembered in localStorage), fallback to medium
         if (this._qualities.length > 0) {
-            const preferred = this._quality; // from localStorage or 'medium'
+            const preferred = this._quality;
             const initialQ = this._qualities.includes(preferred) ? preferred
                 : this._qualities.includes('medium') ? 'medium'
                 : this._qualities[this._qualities.length - 1];
@@ -50,7 +53,6 @@ class AudioPlayer {
             this._actualQuality = 'medium';
         }
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
-
         if (this.segments.length > 0) await this.preloadSegments(0, 1);
         if (this.segments.length > 1) this.preloadSegments(1, 4);
     }
@@ -73,10 +75,8 @@ class AudioPlayer {
         this._quality = quality;
         localStorage.setItem('lt_quality', quality);
         if (quality === this._actualQuality && this.segments.length > 0) return;
-        // Always use upgrade path — it handles both playing and paused states
         await this._upgradeQuality(quality);
     }
-
     getQuality() { return this._quality; }
     getActualQuality() { return this._actualQuality; }
     getQualities() { return this._qualities; }
@@ -95,8 +95,6 @@ class AudioPlayer {
             const newSegTime = data.segment_time || this.segmentTime;
             const newAudioUUID = data.audio_uuid || this._audioUUID;
             if (!newSegments.length) throw new Error('no segments for target quality');
-
-            // Preload all segment buffers in background
             const newBuffers = new Map();
             for (let i = 0; i < newSegments.length; i++) {
                 if (!this._upgrading) return;
@@ -109,31 +107,21 @@ class AudioPlayer {
                             if (!r.ok) throw new Error(`HTTP ${r.status}`);
                             arrayBuf = await r.arrayBuffer();
                             break;
-                        } catch (e) {
-                            if (attempt === 2) throw e;
-                            await new Promise(r => setTimeout(r, 300));
-                        }
+                        } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
                     }
                     window.audioCache.put(url, arrayBuf.slice(0));
                 }
                 const buffer = await this.ctx.decodeAudioData(arrayBuf);
                 newBuffers.set(i, buffer);
             }
-
             if (!this._upgrading) return;
-
-            // Fix #4: Wait for current segment boundary before swapping
             if (this.isPlaying) {
                 const curPos = this.getCurrentTime();
                 const curSegEnd = (Math.floor(curPos / this.segmentTime) + 1) * this.segmentTime;
                 const waitMs = Math.max(0, (curSegEnd - curPos) * 1000);
-                if (waitMs > 50) {
-                    await new Promise(r => setTimeout(r, waitMs));
-                }
+                if (waitMs > 50) await new Promise(r => setTimeout(r, waitMs));
                 if (!this._upgrading || !this.isPlaying) return;
             }
-
-            // Stop current playback, swap buffers, restart from current position
             const resumePos = this.isPlaying ? this.getCurrentTime() : this.lastPosition;
             const wasPlaying = this.isPlaying;
             this.stop();
@@ -143,26 +131,20 @@ class AudioPlayer {
             this.buffers = newBuffers;
             this._actualQuality = targetQuality;
             if (data.duration) this.duration = data.duration;
-
             if (wasPlaying) {
-                this._scheduleAbort = false;
                 this.isPlaying = true;
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
-                await this._scheduleFrom(resumePos);
+                this._driftOffset = 0;
+                this._startLookahead(resumePos, this.ctx.currentTime);
             }
-        } catch (e) {
-            console.error('_upgradeQuality failed:', e);
-        } finally {
-            this._upgrading = false;
-            if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
-        }
+        } catch (e) { console.error('_upgradeQuality failed:', e);
+        } finally { this._upgrading = false; if (this.onQualityChange) this.onQualityChange(this._actualQuality, false); }
     }
 
     _getSegmentURL(idx) {
-        if (this._ownerID && this._audioID) {
+        if (this._ownerID && this._audioID)
             return `/api/library/segments/${this._ownerID}/${this._audioUUID}/${this._actualQuality}/${this.segments[idx]}`;
-        }
         const base = this._trackSegBase || `/api/segments/${this.roomCode}/`;
         return base + this.segments[idx];
     }
@@ -170,9 +152,7 @@ class AudioPlayer {
     async preloadSegments(startIdx, count) {
         const end = Math.min(startIdx + count, this.segments.length);
         const promises = [];
-        for (let i = startIdx; i < end; i++) {
-            if (!this.buffers.has(i)) promises.push(this.loadSegment(i));
-        }
+        for (let i = startIdx; i < end; i++) { if (!this.buffers.has(i)) promises.push(this.loadSegment(i)); }
         await Promise.all(promises);
     }
 
@@ -185,12 +165,8 @@ class AudioPlayer {
                 try {
                     const res = await fetch(url, {credentials:'include'});
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    data = await res.arrayBuffer();
-                    break;
-                } catch (e) {
-                    if (attempt === 2) throw e;
-                    await new Promise(r => setTimeout(r, 300));
-                }
+                    data = await res.arrayBuffer(); break;
+                } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
             }
             window.audioCache.put(url, data.slice(0));
         }
@@ -199,10 +175,11 @@ class AudioPlayer {
         return buffer;
     }
 
+    // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
         this.init(); this.stop();
-        this._scheduleAbort = false;
         this.isPlaying = true;
+        this._driftOffset = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
@@ -212,104 +189,128 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
         if (!this.isPlaying) return;
-
-        // Always compute position from server truth, regardless of preload delay
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
-
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - Date.now();
             if (waitMs > 10 && waitMs < 3000) {
-                // Schedule into the future on AudioContext timeline
                 const ctxTarget = this.ctx.currentTime + waitMs / 1000;
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
-                await this._scheduleFrom(this.serverPlayPosition, ctxTarget);
+                this._startLookahead(this.serverPlayPosition, ctxTarget);
                 return;
             }
         }
-        // Fallback: play immediately at computed position
         this.startOffset = actualPos;
         this.startTime = this.ctx.currentTime;
-        await this._scheduleFrom(actualPos);
+        this._startLookahead(actualPos, this.ctx.currentTime);
     }
 
-    async _scheduleFrom(position, ctxStartTime) {
+    // === Lookahead Scheduler ===
+    // Instead of scheduling all segments at once, schedule 2-3 ahead
+    // and use setInterval to keep feeding the queue.
+    // Drift correction adjusts _nextSegTime for the NEXT segment — zero glitch.
+    _startLookahead(position, ctxStartTime) {
+        this._stopLookahead();
         const segIdx = Math.floor(position / this.segmentTime);
         const segOffset = position % this.segmentTime;
-        if (!this.buffers.has(segIdx)) {
-            if (this.onBuffering) this.onBuffering(true);
-            await this.preloadSegments(segIdx, 1);
-            if (this.onBuffering) this.onBuffering(false);
-        }
-        let t = ctxStartTime || this.ctx.currentTime;
-        const overlap = 0.005;
+        this._nextSegIdx = segIdx;
+        this._nextSegTime = ctxStartTime;
+        this._firstSegOffset = segOffset;
+        this._isFirstSeg = true;
+        // Schedule first 2 segments immediately
+        this._scheduleAhead();
+        // Then check every 200ms to keep the queue fed
+        this._lookaheadTimer = setInterval(() => this._scheduleAhead(), 200);
+    }
+
+    _stopLookahead() {
+        if (this._lookaheadTimer) { clearInterval(this._lookaheadTimer); this._lookaheadTimer = null; }
+    }
+
+    async _scheduleAhead() {
+        if (!this.isPlaying || this._scheduling) return;
+        this._scheduling = true;
+        try {
+        const LOOKAHEAD = 1.5; // schedule segments up to 1.5s into the future
         const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
-        for (let i = segIdx; i < this.segments.length; i++) {
-            if (!this.isPlaying || this._scheduleAbort) break;
+        while (this._nextSegIdx < this.segments.length &&
+               this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
+            const i = this._nextSegIdx;
             if (!this.buffers.has(i)) {
                 if (this.onBuffering) this.onBuffering(true);
                 await this.loadSegment(i);
                 if (this.onBuffering) this.onBuffering(false);
+                if (!this.isPlaying) return;
             }
             const buffer = this.buffers.get(i);
+            if (!buffer) break;
             const source = this.ctx.createBufferSource();
             source.buffer = buffer;
             const gain = this.ctx.createGain();
             source.connect(gain);
             gain.connect(this.gainNode);
-            const off = (i === segIdx) ? segOffset : 0;
+            const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
-            // Crossfade: fade in at start, fade out at end (overlap region)
-            if (i > segIdx) {
-                gain.gain.setValueAtTime(0, t - overlap);
+            const t = this._nextSegTime;
+            const overlap = 0.005;
+            // Crossfade envelope
+            if (!this._isFirstSeg) {
+                gain.gain.setValueAtTime(0, Math.max(0, t - overlap));
                 gain.gain.linearRampToValueAtTime(1, t);
             }
             const endTime = t + dur;
-            gain.gain.setValueAtTime(1, endTime - overlap);
+            gain.gain.setValueAtTime(1, Math.max(0, endTime - overlap));
             gain.gain.linearRampToValueAtTime(0, endTime);
-            source.start(t - (i > segIdx ? overlap : 0), off);
+            // Start: first seg at exact ctxStartTime, others overlap slightly
+            const startAt = this._isFirstSeg ? t : Math.max(0, t - overlap);
+            source.start(startAt, off);
             this.sources.push(source);
-            // Advance by exact segment duration — no overlap subtraction
-            // This eliminates cumulative drift (was 5ms/segment = 300ms over 60 segments)
-            t += dur;
+            this._nextSegTime = t + dur;
+            this._nextSegIdx = i + 1;
+            this._isFirstSeg = false;
+            // Preload upcoming segments
             if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
         }
+        } finally { this._scheduling = false; }
     }
 
+    // === Drift Correction ===
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime) return 0;
-        // Debounce hard resync: skip if last resync was <1s ago
         const now = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
         const drift = actualPos - expectedPos;
-
-        // Debug: show absolute timing info
+        // Debug display
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
             const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
             driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
         }
-
         const absDrift = Math.abs(drift);
-
-        // Soft correction for 10-80ms drift: nudge startTime to realign
-        // This is glitch-free — no stop/restart, just shifts the time reference
-        if (absDrift > 0.01 && absDrift <= 0.08) {
-            this.startTime += drift;
+        // Soft correction (<100ms): adjust _nextSegTime for the next segment
+        // Already-playing segments are untouched — zero glitch
+        if (absDrift > 0.01 && absDrift <= 0.1) {
+            this._nextSegTime -= drift;
+            this._driftOffset += drift;
+            this.startTime += drift; // keep getCurrentTime() aligned
             return Math.round(drift * 1000);
         }
-
-        // Hard resync for >80ms drift (with debounce)
-        if (absDrift > 0.08) {
+        // Hard resync (>100ms): stop and restart (with debounce)
+        if (absDrift > 0.1) {
             if (this._lastResync && Date.now() - this._lastResync < 1500) return 0;
             console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms`);
             this._lastResync = Date.now();
-            this.playAtPosition(this.serverPlayPosition, this.serverPlayTime);
+            // Fire-and-forget but prevent concurrent resyncs
+            if (!this._resyncing) {
+                this._resyncing = true;
+                this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
+                    .finally(() => { this._resyncing = false; });
+            }
             return Math.round(drift * 1000);
         }
         return Math.round(drift * 1000);
@@ -318,16 +319,15 @@ class AudioPlayer {
     stop() {
         if (this.isPlaying) this.lastPosition = this.getCurrentTime();
         this.isPlaying = false;
-        this._scheduleAbort = true;
-        this._upgrading = false; // cancel any in-progress quality upgrade
+        this._stopLookahead();
+        this._upgrading = false;
         this.sources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
         this.sources = [];
+        this._driftOffset = 0;
     }
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
-        // When using hardware-level scheduling, ctx.currentTime may be before startTime
-        // Return startOffset in that case (playback hasn't begun yet)
         const elapsed = this.ctx.currentTime - this.startTime;
         return this.startOffset + Math.max(0, elapsed);
     }

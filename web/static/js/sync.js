@@ -29,7 +29,12 @@ class ClockSync {
     stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } }
 
     ping() {
-        if (!this.ws || this.ws.readyState !== 1 || this._pending) return;
+        if (!this.ws || this.ws.readyState !== 1) return;
+        // Clear stale pending ping (pong lost/timeout)
+        if (this._pending && performance.now() - this._pending > 2000) {
+            this._pending = null;
+        }
+        if (this._pending) return;
         this._pending = performance.now();
         this._pendingWall = Date.now();
         this.ws.send(JSON.stringify({ type: 'ping', clientTime: this._pendingWall }));
