@@ -169,6 +169,13 @@ async function handleMessage(msg) {
             showScreen('home');
             break;
         case 'pong': window.clockSync.handlePong(msg); break;
+        case 'syncTick':
+            // Server-authoritative position sync — bypasses per-client offset differences
+            if (window.audioPlayer.isPlaying && msg.position != null) {
+                window.audioPlayer.serverPlayTime = msg.serverTime;
+                window.audioPlayer.serverPlayPosition = msg.position;
+            }
+            break;
         case 'deviceKick':
             deviceKicked = true;
             if (window.audioPlayer) window.audioPlayer.stop();

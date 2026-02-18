@@ -99,6 +99,16 @@ func (m *Manager) GetRoom(code string) *Room {
 	return m.rooms[code]
 }
 
+func (m *Manager) GetRooms() []*Room {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		rooms = append(rooms, r)
+	}
+	return rooms
+}
+
 func (m *Manager) DeleteRoom(code string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

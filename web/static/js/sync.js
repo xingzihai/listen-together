@@ -72,7 +72,13 @@ class ClockSync {
         const best = byRtt.slice(0, bestN);
         const offsets = best.map(x => x.offset).sort((a, b) => a - b);
         const mid = Math.floor(offsets.length / 2);
-        this.offset = offsets.length % 2 ? offsets[mid] : (offsets[mid - 1] + offsets[mid]) / 2;
+        const newOffset = offsets.length % 2 ? offsets[mid] : (offsets[mid - 1] + offsets[mid]) / 2;
+        // EMA smoothing: small changes (<20ms) blend gradually, large jumps apply immediately
+        if (this.synced && Math.abs(newOffset - this.offset) < 20) {
+            this.offset = 0.7 * this.offset + 0.3 * newOffset;
+        } else {
+            this.offset = newOffset;
+        }
         this.rtt = best[0].rtt;
         this.synced = true;
         this.updateUI();

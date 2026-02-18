@@ -211,22 +211,33 @@ class AudioPlayer {
             await this.preloadSegments(segIdx, 2);
             if (this.onBuffering) this.onBuffering(false);
         }
-        // Wait for scheduled time if in the future
-        if (scheduledAt) {
-            const localScheduled = scheduledAt - window.clockSync.offset;
-            const waitMs = localScheduled - Date.now();
-            if (waitMs > 0 && waitMs < 3000) await new Promise(r => setTimeout(r, waitMs));
-        }
         if (!this.isPlaying) return;
+
+        // Always compute position from server truth, regardless of preload delay
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
+
+        // Try hardware-level scheduling if scheduledAt is still in the future
+        if (scheduledAt) {
+            const localScheduled = scheduledAt - window.clockSync.offset;
+            const waitMs = localScheduled - Date.now();
+            if (waitMs > 10 && waitMs < 3000) {
+                // Schedule into the future on AudioContext timeline
+                const ctxTarget = this.ctx.currentTime + waitMs / 1000;
+                this.startOffset = this.serverPlayPosition;
+                this.startTime = ctxTarget;
+                await this._scheduleFrom(this.serverPlayPosition, ctxTarget);
+                return;
+            }
+        }
+        // Fallback: play immediately at computed position
         this.startOffset = actualPos;
         this.startTime = this.ctx.currentTime;
         await this._scheduleFrom(actualPos);
     }
 
-    async _scheduleFrom(position) {
+    async _scheduleFrom(position, ctxStartTime) {
         const segIdx = Math.floor(position / this.segmentTime);
         const segOffset = position % this.segmentTime;
         if (!this.buffers.has(segIdx)) {
@@ -234,7 +245,7 @@ class AudioPlayer {
             await this.preloadSegments(segIdx, 1);
             if (this.onBuffering) this.onBuffering(false);
         }
-        let t = this.ctx.currentTime;
+        let t = ctxStartTime || this.ctx.currentTime;
         const overlap = 0.005;
         const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
         for (let i = segIdx; i < this.segments.length; i++) {
@@ -252,16 +263,19 @@ class AudioPlayer {
             gain.connect(this.gainNode);
             const off = (i === segIdx) ? segOffset : 0;
             const dur = buffer.duration - off;
+            // Crossfade: fade in at start, fade out at end (overlap region)
             if (i > segIdx) {
-                gain.gain.setValueAtTime(0, t);
-                gain.gain.linearRampToValueAtTime(1, t + overlap);
+                gain.gain.setValueAtTime(0, t - overlap);
+                gain.gain.linearRampToValueAtTime(1, t);
             }
             const endTime = t + dur;
             gain.gain.setValueAtTime(1, endTime - overlap);
-            gain.gain.linearRampToValueAtTime(0, endTime + overlap);
-            source.start(t, off);
+            gain.gain.linearRampToValueAtTime(0, endTime);
+            source.start(t - (i > segIdx ? overlap : 0), off);
             this.sources.push(source);
-            t += dur - overlap;
+            // Advance by exact segment duration — no overlap subtraction
+            // This eliminates cumulative drift (was 5ms/segment = 300ms over 60 segments)
+            t += dur;
             if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
         }
     }
@@ -272,19 +286,21 @@ class AudioPlayer {
         const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
         const drift = actualPos - expectedPos;
-        if (Math.abs(drift) > 0.5) {
+
+        // Debug: show absolute timing info
+        const driftEl = document.getElementById('driftStatus');
+        if (driftEl) {
+            const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
+            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
+        }
+
+        // Hard resync when drift exceeds 100ms
+        if (Math.abs(drift) > 0.1) {
+            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms actual=${actualPos.toFixed(3)} expected=${expectedPos.toFixed(3)}`);
             this.playAtPosition(this.serverPlayPosition, this.serverPlayTime);
             return Math.round(drift * 1000);
-        } else if (Math.abs(drift) > 0.01) {
-            const correction = 1.0 - Math.max(-0.03, Math.min(0.03, drift * 0.5));
-            this.sources.forEach(s => { try { s.playbackRate.value = correction; } catch {} });
-            clearTimeout(this._rateTimer);
-            this._rateTimer = setTimeout(() => {
-                this.sources.forEach(s => { try { s.playbackRate.value = 1.0; } catch {} });
-            }, Math.min(2000, Math.abs(drift) * 8000));
-            return Math.round(drift * 1000);
         }
-        return 0;
+        return Math.round(drift * 1000);
     }
 
     stop() {
@@ -298,7 +314,10 @@ class AudioPlayer {
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
-        return this.startOffset + (this.ctx.currentTime - this.startTime);
+        // When using hardware-level scheduling, ctx.currentTime may be before startTime
+        // Return startOffset in that case (playback hasn't begun yet)
+        const elapsed = this.ctx.currentTime - this.startTime;
+        return this.startOffset + Math.max(0, elapsed);
     }
 
     setVolume(v) { if (this.gainNode) this.gainNode.gain.value = v; }

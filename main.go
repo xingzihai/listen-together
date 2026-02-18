@@ -136,6 +136,31 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
+	// SyncTick: broadcast current playback position to all playing rooms every 2s
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, rm := range manager.GetRooms() {
+				state, pos, startT := rm.GetPlaybackState()
+				if state != room.StatePlaying {
+					continue
+				}
+				elapsed := time.Since(startT).Seconds()
+				currentPos := pos + elapsed
+				rm.Mu.RLock()
+				for _, c := range rm.Clients {
+					c.Conn.WriteJSON(map[string]interface{}{
+						"type":       "syncTick",
+						"position":   currentPos,
+						"serverTime": syncpkg.GetServerTime(),
+					})
+				}
+				rm.Mu.RUnlock()
+			}
+		}
+	}()
+
 	log.Println("ListenTogether server starting on :8080")
 	log.Fatal(http.ListenAndServe(":8080", limitedMux))
 }
