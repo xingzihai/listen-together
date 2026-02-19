@@ -192,6 +192,12 @@ class AudioPlayer {
         this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
+
+        // Capture ctx↔wall clock relationship ONCE before any async work
+        // This avoids drift between the two clocks during preload
+        const ctxSnap = this.ctx.currentTime;
+        const wallSnap = performance.now();
+
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
             if (this.onBuffering) this.onBuffering(true);
@@ -199,24 +205,30 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
         if (!this.isPlaying) return;
-        const now = window.clockSync.getServerTime();
-        const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
-        const actualPos = this.serverPlayPosition + elapsed;
+
+        // Use the snapshot to convert wall time → ctx time accurately
+        const ctxNow = ctxSnap + (performance.now() - wallSnap) / 1000;
+
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - Date.now();
             if (waitMs > 2 && waitMs < 3000) {
-                const ctxTarget = this.ctx.currentTime + waitMs / 1000;
+                // Convert wait to ctx timeline using snapshot relationship
+                const ctxTarget = ctxNow + waitMs / 1000;
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
                 this._startLookahead(this.serverPlayPosition, ctxTarget);
                 return;
             }
         }
+        // Fallback: calculate how much time has passed since scheduledAt/serverTime
+        const now = window.clockSync.getServerTime();
+        const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
+        const actualPos = this.serverPlayPosition + elapsed;
         this.startOffset = actualPos;
-        this.startTime = this.ctx.currentTime;
-        this._startLookahead(actualPos, this.ctx.currentTime);
+        this.startTime = ctxNow;
+        this._startLookahead(actualPos, ctxNow);
     }
 
     // === Lookahead Scheduler ===
@@ -334,9 +346,9 @@ class AudioPlayer {
             console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
         }
 
-        // Debounce: don't correct more than twice per second
+        // Debounce: max 4 corrections per second
         const now = performance.now();
-        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 500) return 0;
+        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 250) return 0;
         this._lastCorrectionTime = now;
 
         const serverNow = window.clockSync.getServerTime();
@@ -352,8 +364,8 @@ class AudioPlayer {
         }
         const absDrift = Math.abs(drift);
 
-        // Tier 1: Soft correction (15-50ms) — adjust _nextSegTime only, don't touch startTime
-        if (absDrift > 0.015 && absDrift <= 0.05) {
+        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime only, don't touch startTime
+        if (absDrift > 0.005 && absDrift <= 0.05) {
             // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
             if (Math.abs(this._driftOffset + drift) > 0.5) {
                 console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
