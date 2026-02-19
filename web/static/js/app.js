@@ -179,20 +179,8 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
-                // Check cross-device drift using server time
-                if (window.audioPlayer.isPlaying) {
-                    const nowServer = window.clockSync.getServerTime();
-                    const expectedPos = msg.position + (nowServer - msg.serverTime) / 1000;
-                    const actualPos = window.audioPlayer.getCurrentTime();
-                    const crossDrift = (actualPos - expectedPos) * 1000;
-                    // If cross-device drift > 300ms, trigger hardSync (respect cooldown)
-                    if (Math.abs(crossDrift) > 300 && performance.now() - window.audioPlayer._lastHardSync > 3000) {
-                        console.log('syncTick cross-device drift:', crossDrift.toFixed(1), 'ms → hardSync');
-                        window.audioPlayer._hardSyncing = true;
-                        window.audioPlayer.playAtPosition(expectedPos, nowServer)
-                            .finally(() => { window.audioPlayer._hardSyncing = false; });
-                    }
-                }
+                // Drift loop handles cross-device sync via server time comparison
+                // Just update anchors here, no separate hardSync check needed
                 // Clear short-term buffer to avoid mixing old/new anchor samples
                 if (window.audioPlayer._miniBuffer) window.audioPlayer._miniBuffer.clear();
                 if (window.audioPlayer._shortBuffer) window.audioPlayer._shortBuffer.clear();

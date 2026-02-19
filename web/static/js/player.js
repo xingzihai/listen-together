@@ -365,15 +365,13 @@ class AudioPlayer {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
         if (performance.now() - this._playStartedAt < 3000) return;
 
-        // Local drift: compare consumed frames vs expected frames (both audio-clock based)
-        const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        const expectedFrames = (this.ctx.currentTime - this._ctxTimeAtPlay) * sr;
-        const actualFrames = this._workletConsumed;
-        const ageMs = (actualFrames - expectedFrames) / sr * 1000;
+        // Cross-device drift: compare local playback position vs server expected position
+        // Both use wall clock (server time), this is the ONLY drift that matters for sync
+        const serverNow = window.clockSync.getServerTime();
+        const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
+        const actualPos = this.getCurrentTime(); // ctx.currentTime based, real-time
+        const ageMs = (actualPos - expectedPos) * 1000;
         const ageUs = ageMs * 1000;
-
-        // Also track actual playback position for display
-        const actualPos = this.getCurrentTime();
 
         this._miniBuffer.add(ageUs); this._shortBuffer.add(ageUs); this._longBuffer.add(ageUs);
         const miniMedian = this._miniBuffer.median();

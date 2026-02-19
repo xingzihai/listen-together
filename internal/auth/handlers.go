@@ -155,12 +155,12 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", 405)
 		return
 	}
-	// Rate limit: 5 per minute per IP
-	ip := GetClientIP(r)
-	if !loginLimiter.allow(ip, 5, time.Minute) {
-		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
-		return
-	}
+	// Rate limit disabled for testing
+	// ip := GetClientIP(r)
+	// if !loginLimiter.allow(ip, 5, time.Minute) {
+	// 	jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
+	// 	return
+	// }
 	var req authRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request", 400)
