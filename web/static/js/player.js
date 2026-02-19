@@ -245,6 +245,19 @@ class AudioPlayer {
         if (!this.isPlaying || this._scheduling) return;
         this._scheduling = true;
         try {
+        // Check if rate correction period has ended (backup for setTimeout throttling)
+        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
+            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
+            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
+            this.startOffset += extraPlayed;
+            this._currentPlaybackRate = 1.0;
+            this._rateStartTime = 0;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = 1.0;
+            });
+            this._rateCorrectingUntil = 0;
+            console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
+        }
         const LOOKAHEAD = 1.5; // schedule segments up to 1.5s into the future
         const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
         while (this._nextSegIdx < this.segments.length &&
@@ -307,6 +320,19 @@ class AudioPlayer {
         if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
+        // Check if rate correction period has ended (backup recovery)
+        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
+            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
+            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
+            this.startOffset += extraPlayed;
+            this._currentPlaybackRate = 1.0;
+            this._rateStartTime = 0;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = 1.0;
+            });
+            this._rateCorrectingUntil = 0;
+            console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
+        }
 
         // Debounce: don't correct more than twice per second
         const now = performance.now();
@@ -331,17 +357,23 @@ class AudioPlayer {
             // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
             if (Math.abs(this._driftOffset + drift) > 0.5) {
                 console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
-                // Fall through to hard resync below
-            } else {
-                // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
-                // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
-                this._nextSegTime += drift;
-                this._driftOffset += drift;
-                // Don't update _softCorrectionTotal — correction affects future scheduling,
-                // not current position. getCurrentTime() stays pure measurement.
-                this._resyncBackoff = 1500;
+                // 直接执行硬重置，不依赖 fall-through
+                this._driftOffset = 0;
+                if (!this._resyncing) {
+                    this._resyncing = true;
+                    this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
+                        .finally(() => { this._resyncing = false; });
+                }
                 return Math.round(drift * 1000);
             }
+            // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
+            // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
+            this._nextSegTime += drift;
+            this._driftOffset += drift;
+            // Don't update _softCorrectionTotal — correction affects future scheduling,
+            // not current position. getCurrentTime() stays pure measurement.
+            this._resyncBackoff = 1500;
+            return Math.round(drift * 1000);
         }
 
         // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 2-3 seconds
@@ -369,26 +401,9 @@ class AudioPlayer {
             });
             this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
 
-            // Clear any existing timer
+            // Clear any existing timer (keep for cleanup, but recovery is via scheduler)
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
-            this._rateCorrectionTimer = setTimeout(() => {
-                // Compensate startOffset for the extra/less audio played during rate correction
-                const actualRateTime = this.ctx.currentTime - this._rateStartTime;
-                const extraPlayed = actualRateTime * (rate - 1.0); // rate>1: played more, rate<1: played less
-                this.startOffset += extraPlayed; // Adjust so getCurrentTime() stays accurate
-
-                // Clear rate start time
-                this._rateStartTime = 0;
-
-                // Restore playbackRate to 1.0 on all active sources
-                this._currentPlaybackRate = 1.0;
-                this.sources.forEach(source => {
-                    if (source.playbackRate) source.playbackRate.value = 1.0;
-                });
-                this._rateCorrectingUntil = 0;
-                this._rateCorrectionTimer = null;
-                console.log(`[sync] playbackRate restored to 1.0, offset compensated by ${(extraPlayed*1000).toFixed(1)}ms`);
-            }, adjustedDuration * 1000);
+            this._rateCorrectionTimer = null;
 
             this._resyncBackoff = 1500;
             return Math.round(drift * 1000);
@@ -416,6 +431,7 @@ class AudioPlayer {
         this.isPlaying = false;
         this._stopLookahead();
         this._upgrading = false;
+        this._scheduling = false;
         // Clear playbackRate correction
         if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
         this._rateCorrectingUntil = 0;

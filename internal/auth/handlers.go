@@ -94,8 +94,8 @@ func (rl *rateLimiter) cleanOldestEntries() {
 func getClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		parts := strings.Split(fwd, ",")
-		// Take the last IP (most recently added by trusted proxy)
-		return strings.TrimSpace(parts[len(parts)-1])
+		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
+		return strings.TrimSpace(parts[0])
 	}
 	if real := r.Header.Get("X-Real-IP"); real != "" {
 		return real

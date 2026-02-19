@@ -148,6 +148,13 @@ func main() {
 				pos := rm.Position
 				startT := rm.StartTime
 				clientCount := len(rm.Clients)
+				// Get duration for position clamping
+				duration := 0.0
+				if rm.TrackAudio != nil {
+					duration = rm.TrackAudio.Duration
+				} else if rm.Audio != nil {
+					duration = rm.Audio.Duration
+				}
 				var clients []*room.Client
 				// Only broadcast to multi-client rooms
 				if state == room.StatePlaying && clientCount > 1 {
@@ -162,6 +169,10 @@ func main() {
 				}
 				elapsed := time.Since(startT).Seconds()
 				currentPos := pos + elapsed
+				// Clamp position to duration
+				if duration > 0 && currentPos > duration {
+					currentPos = duration
+				}
 				msg := map[string]interface{}{
 					"type":       "syncTick",
 					"position":   currentPos,
@@ -319,8 +330,8 @@ var joinLimiter = newRateLimiter()
 func getClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		parts := strings.Split(fwd, ",")
-		// Take the last IP (most recently added by trusted proxy)
-		return strings.TrimSpace(parts[len(parts)-1])
+		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
+		return strings.TrimSpace(parts[0])
 	}
 	return strings.Split(r.RemoteAddr, ":")[0]
 }
