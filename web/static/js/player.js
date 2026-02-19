@@ -294,19 +294,21 @@ class AudioPlayer {
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            const overlap = 0.005;
+            const overlap = 0.02; // 20ms crossfade — eliminates clicks on mobile
             // Calculate effective duration considering playbackRate
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
             const effectiveDur = dur / effectiveRate;
             const effectiveOverlap = overlap / effectiveRate;
-            // Crossfade envelope (based on effective duration)
+            // Crossfade envelope: equal-power style to avoid volume dips at boundaries
             if (!this._isFirstSeg) {
-                gain.gain.setValueAtTime(0, Math.max(0, t - effectiveOverlap));
-                gain.gain.linearRampToValueAtTime(1, t);
+                // Fade in over overlap period
+                gain.gain.setValueAtTime(0.0001, Math.max(0, t - effectiveOverlap));
+                gain.gain.exponentialRampToValueAtTime(1, t);
             }
             const endTime = t + effectiveDur;
+            // Fade out over overlap period
             gain.gain.setValueAtTime(1, Math.max(0, endTime - effectiveOverlap));
-            gain.gain.linearRampToValueAtTime(0, endTime);
+            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
             // Start: first seg at exact ctxStartTime, others overlap slightly
             const startAt = this._isFirstSeg ? t : Math.max(0, t - effectiveOverlap);
             // Set playbackRate BEFORE start() for immediate effect
