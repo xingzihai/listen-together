@@ -53,9 +53,9 @@ type qualityDef struct {
 
 var allQualities = []qualityDef{
 	{Name: "lossless", DirSuffix: "segments_lossless", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
-	{Name: "high", DirSuffix: "segments_high", Codec: "aac", Bitrate: "256k", Ext: ".m4a", SegFormat: "mp4"},
-	{Name: "medium", DirSuffix: "segments_medium", Codec: "aac", Bitrate: "128k", Ext: ".m4a", SegFormat: "mp4"},
-	{Name: "low", DirSuffix: "segments_low", Codec: "aac", Bitrate: "64k", Ext: ".m4a", SegFormat: "mp4"},
+	{Name: "high", DirSuffix: "segments_high", Codec: "opus", Bitrate: "256k", Ext: ".webm", SegFormat: "webm"},
+	{Name: "medium", DirSuffix: "segments_medium", Codec: "opus", Bitrate: "128k", Ext: ".webm", SegFormat: "webm"},
+	{Name: "low", DirSuffix: "segments_low", Codec: "opus", Bitrate: "64k", Ext: ".webm", SegFormat: "webm"},
 }
 
 // ProbeResult holds ffprobe detection results.
@@ -144,6 +144,8 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	args := []string{"-i", inputPath, "-vn"}
 	if q.Codec == "flac" {
 		args = append(args, "-c:a", "flac")
+	} else if q.Codec == "opus" {
+		args = append(args, "-c:a", "libopus", "-b:a", q.Bitrate, "-vbr", "on", "-application", "audio")
 	} else {
 		args = append(args, "-c:a", "aac", "-b:a", q.Bitrate)
 	}

@@ -396,6 +396,8 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
 	if quality == "lossless" {
 		w.Header().Set("Content-Type", "audio/flac")
+	} else if strings.HasSuffix(filename, ".webm") {
+		w.Header().Set("Content-Type", "audio/webm")
 	} else {
 		w.Header().Set("Content-Type", "audio/mp4")
 	}
