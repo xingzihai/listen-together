@@ -265,16 +265,20 @@ class AudioPlayer {
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
             const overlap = 0.005;
-            // Crossfade envelope
+            // Calculate effective duration considering playbackRate
+            const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
+            const effectiveDur = dur / effectiveRate;
+            const effectiveOverlap = overlap / effectiveRate;
+            // Crossfade envelope (based on effective duration)
             if (!this._isFirstSeg) {
-                gain.gain.setValueAtTime(0, Math.max(0, t - overlap));
+                gain.gain.setValueAtTime(0, Math.max(0, t - effectiveOverlap));
                 gain.gain.linearRampToValueAtTime(1, t);
             }
-            const endTime = t + dur;
-            gain.gain.setValueAtTime(1, Math.max(0, endTime - overlap));
+            const endTime = t + effectiveDur;
+            gain.gain.setValueAtTime(1, Math.max(0, endTime - effectiveOverlap));
             gain.gain.linearRampToValueAtTime(0, endTime);
             // Start: first seg at exact ctxStartTime, others overlap slightly
-            const startAt = this._isFirstSeg ? t : Math.max(0, t - overlap);
+            const startAt = this._isFirstSeg ? t : Math.max(0, t - effectiveOverlap);
             // Set playbackRate BEFORE start() for immediate effect
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
@@ -286,7 +290,7 @@ class AudioPlayer {
                 if (idx > -1) this.sources.splice(idx, 1);
             };
             this.sources.push(source);
-            this._nextSegTime = t + dur;
+            this._nextSegTime = t + effectiveDur;
             this._nextSegIdx = i + 1;
             this._isFirstSeg = false;
             // Preload upcoming segments
@@ -348,6 +352,9 @@ class AudioPlayer {
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
+            // Record start time for offset compensation
+            const rateStartTime = this.ctx.currentTime;
+
             // Set playbackRate on all active AudioBufferSourceNodes
             this._currentPlaybackRate = rate;
             this.sources.forEach(source => {
@@ -358,6 +365,11 @@ class AudioPlayer {
             // Clear any existing timer
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = setTimeout(() => {
+                // Compensate startOffset for the extra/less audio played during rate correction
+                const actualRateTime = this.ctx.currentTime - rateStartTime;
+                const extraPlayed = actualRateTime * (rate - 1.0); // rate>1: played more, rate<1: played less
+                this.startOffset += extraPlayed; // Adjust so getCurrentTime() stays accurate
+
                 // Restore playbackRate to 1.0 on all active sources
                 this._currentPlaybackRate = 1.0;
                 this.sources.forEach(source => {
@@ -365,7 +377,7 @@ class AudioPlayer {
                 });
                 this._rateCorrectingUntil = 0;
                 this._rateCorrectionTimer = null;
-                console.log('[sync] playbackRate restored to 1.0');
+                console.log(`[sync] playbackRate restored to 1.0, offset compensated by ${(extraPlayed*1000).toFixed(1)}ms`);
             }, adjustedDuration * 1000);
 
             this._resyncBackoff = 1500;
