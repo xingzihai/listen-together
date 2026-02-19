@@ -35,6 +35,7 @@ class AudioPlayer {
         this._workletTotalPlayed = 0; this._workletConsumed = 0; this._workletSampleRate = 48000;
         this._feederTimer = null; this._feederNextSeg = 0;
         this._feederSegOffset = 0; this._feederGen = 0; this._feederStartPos = 0; this._feeding = false;
+        this._fedSinceLastStats = 0;
         this._miniBuffer = new MedianBuffer(20);
         this._shortBuffer = new MedianBuffer(100);
         this._longBuffer = new MedianBuffer(500);
@@ -92,6 +93,7 @@ class AudioPlayer {
                 this._workletTotalPlayed = msg.totalPlayedFrames;
                 this._workletConsumed = msg.totalConsumedFrames;
                 this._workletSampleRate = msg.sampleRate;
+                this._fedSinceLastStats = 0;
             } else if (msg.type === 'overflow') {
                 this._log('overflow', { dropped: msg.dropped });
             }
@@ -236,7 +238,7 @@ class AudioPlayer {
         this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
 
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
-        this._fedFrames = 0;
+        this._fedFrames = 0; this._fedSinceLastStats = 0;
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -265,7 +267,7 @@ class AudioPlayer {
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
 
-        await this._feedSegments(gen, 3);
+        await this._feedSegments(gen, 1);
         if (!this.isPlaying || gen !== this._feederGen) return;
 
         this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
@@ -277,8 +279,12 @@ class AudioPlayer {
         for (let i = 0; i < count; i++) {
             if (!this.isPlaying || gen !== this._feederGen) return;
             if (this._feederNextSeg >= this.segments.length) return;
-            const segFrames = Math.ceil(this.segmentTime * (this.ctx?.sampleRate || 48000));
-            if (this._workletCapacity > 0 && this._workletBuffered > this._workletCapacity - segFrames) return;
+            const sr = this.ctx?.sampleRate || 48000;
+            const segFrames = Math.ceil(this.segmentTime * sr);
+            // Use known capacity (5s * sampleRate) if worklet hasn't reported yet
+            const capacity = this._workletCapacity > 0 ? this._workletCapacity : Math.ceil(sr * 5);
+            const buffered = this._workletBuffered + this._fedSinceLastStats;
+            if (buffered > capacity - segFrames) return;
 
             if (!this.buffers.has(this._feederNextSeg)) {
                 if (this.onBuffering) this.onBuffering(true);
@@ -300,6 +306,7 @@ class AudioPlayer {
             const right = srcR.slice(offsetFrames).buffer;
             this.workletNode.port.postMessage({ type: 'pcm', left, right }, [left, right]);
             this._fedFrames += len;
+            this._fedSinceLastStats += len;
             this._feederNextSeg++;
             if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 3);
         }
@@ -398,7 +405,7 @@ class AudioPlayer {
         if (this._logUploadTimer) { clearInterval(this._logUploadTimer); this._logUploadTimer = null; }
         this.uploadLog();
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
-        this._fedFrames = 0;
+        this._fedFrames = 0; this._fedSinceLastStats = 0;
         this._miniBuffer.clear(); this._shortBuffer.clear(); this._longBuffer.clear();
     }
 
