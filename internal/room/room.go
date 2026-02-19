@@ -54,12 +54,13 @@ type AudioInfo struct {
 // TrackAudioInfo is the complete audio metadata broadcast via trackChange.
 // Clients use this directly without needing to fetch the file list API.
 type TrackAudioInfo struct {
-	AudioID   int64    `json:"audio_id"`
-	OwnerID   int64    `json:"owner_id"`
-	AudioUUID string   `json:"audio_uuid"`
-	Filename  string   `json:"filename"`
-	Duration  float64  `json:"duration"`
-	Qualities []string `json:"qualities"`
+	AudioID    int64    `json:"audio_id"`
+	OwnerID    int64    `json:"owner_id"`
+	AudioUUID  string   `json:"audio_uuid"`
+	Filename   string   `json:"filename"`
+	Duration   float64  `json:"duration"`
+	Qualities  []string `json:"qualities"`
+	SampleRate int      `json:"sampleRate"`
 }
 
 type Room struct {

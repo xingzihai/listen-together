@@ -76,6 +76,7 @@ class AudioPlayer {
         this._ownerID = audioInfo.ownerID || null;
         this._audioID = audioInfo.audioID || null;
         this._audioUUID = audioInfo.audioUUID || null;
+        this._sampleRate = audioInfo.sampleRate || 0;
         this._upgrading = false;
         if (this._qualities.length > 0) {
             const preferred = this._quality;
@@ -101,6 +102,7 @@ class AudioPlayer {
             this.segments = data.segments || [];
             this.segmentTime = data.segment_time || 5;
             this.duration = data.duration || this.duration;
+            if (data.sample_rate) this._sampleRate = data.sample_rate;
             if (data.owner_id) this._ownerID = data.owner_id;
             if (data.audio_uuid) this._audioUUID = data.audio_uuid;
         } catch (e) { console.error('loadQualitySegments:', e); }
@@ -212,7 +214,7 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.init(); this.stop();
+        this.init(this._sampleRate || undefined); this.stop();
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
@@ -231,19 +233,6 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
         if (!this.isPlaying) return;
-
-        // Reinit ctx to match audio sample rate (avoids resampling artifacts)
-        const firstBuf = this.buffers.get(segIdx);
-        if (firstBuf && firstBuf.sampleRate !== this.ctx.sampleRate) {
-            this._log('sampleRateMismatch', { ctx: this.ctx.sampleRate, audio: firstBuf.sampleRate });
-            // Re-decode all cached buffers with new ctx
-            const oldBuffers = new Map(this.buffers);
-            this.init(firstBuf.sampleRate);
-            this.isPlaying = true;
-            this.buffers.clear();
-            // Re-load segments (old decoded buffers are tied to old ctx)
-            await this.preloadSegments(segIdx, 2);
-        }
 
         // Re-snapshot AFTER async preload so elapsed calculation is accurate
         const ctxNow = this.ctx.currentTime;

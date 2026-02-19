@@ -38,6 +38,7 @@ type MultiQualityManifest struct {
 	mu          sync.Mutex              `json:"-"`
 	Duration    float64                 `json:"duration"`
 	SegmentTime int                     `json:"segment_time"`
+	SampleRate  int                     `json:"sample_rate"`
 	Qualities   map[string]*QualityInfo `json:"qualities"`
 }
 
@@ -60,9 +61,10 @@ var allQualities = []qualityDef{
 
 // ProbeResult holds ffprobe detection results.
 type ProbeResult struct {
-	Bitrate       int    // in kbps
-	Format        string // codec name e.g. "flac", "aac", "mp3"
-	IsLossless    bool
+	Bitrate    int    // in kbps
+	Format     string // codec name e.g. "flac", "aac", "mp3"
+	IsLossless bool
+	SampleRate int // e.g. 44100, 48000
 }
 
 // sanitizeInputPath ensures path doesn't start with - to prevent ffmpeg argument injection
@@ -105,7 +107,19 @@ func ProbeAudio(inputPath string) (*ProbeResult, error) {
 		isLossless = true
 	}
 
-	return &ProbeResult{Bitrate: bitrate, Format: codec, IsLossless: isLossless}, nil
+	// Get sample rate
+	cmdSr := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=sample_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		inputPath)
+	srOut, _ := cmdSr.Output()
+	sampleRate := 0
+	if s := strings.TrimSpace(string(srOut)); s != "" && s != "N/A" {
+		sampleRate, _ = strconv.Atoi(s)
+	}
+
+	return &ProbeResult{Bitrate: bitrate, Format: codec, IsLossless: isLossless, SampleRate: sampleRate}, nil
 }
 
 // determineQualities decides which quality tiers to generate.
@@ -199,6 +213,7 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 	manifest := &MultiQualityManifest{
 		Duration:    duration,
 		SegmentTime: SegmentDuration,
+		SampleRate:  probe.SampleRate,
 		Qualities:   make(map[string]*QualityInfo),
 	}
 
