@@ -28,39 +28,11 @@ class AudioPlayer {
         this._rateStartTime = 0;      // ctx.currentTime when rate correction started
     }
 
-    async init() {
+    init() {
         if (!this.ctx) {
             this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-
-            // Smoother worklet: detects PCM discontinuities, applies micro-fade
-            try {
-                await this.ctx.audioWorklet.addModule('js/smoother-processor.js');
-                this._smootherNode = new AudioWorkletNode(this.ctx, 'smoother-processor');
-            } catch (e) {
-                console.warn('[audio] smoother worklet failed, skipping:', e);
-                this._smootherNode = null;
-            }
-
-            // Compressor: catches remaining peaks/clicks
-            this._compressor = this.ctx.createDynamicsCompressor();
-            this._compressor.threshold.value = -6;
-            this._compressor.knee.value = 12;
-            this._compressor.ratio.value = 8;
-            this._compressor.attack.value = 0.001;
-            this._compressor.release.value = 0.05;
-
-            // Master gain
             this.gainNode = this.ctx.createGain();
-
-            // Chain: [input] → smoother → compressor → gain → destination
-            if (this._smootherNode) {
-                this._smootherNode.connect(this._compressor);
-            }
-            this._compressor.connect(this.gainNode);
             this.gainNode.connect(this.ctx.destination);
-
-            // _connectTarget: where sources plug into
-            this._connectTarget = this._smootherNode || this._compressor;
         }
         if (this.ctx.state === 'suspended') this.ctx.resume();
         // Cache hardware output latency for future use (not yet applied to scheduling)
@@ -214,7 +186,7 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        await this.init(); this.stop();
+        this.init(); this.stop();
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
@@ -318,7 +290,7 @@ class AudioPlayer {
             source.buffer = buffer;
             const gain = this.ctx.createGain();
             source.connect(gain);
-            gain.connect(this._connectTarget || this.gainNode);
+            gain.connect(this.gainNode);
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
