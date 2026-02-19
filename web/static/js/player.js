@@ -258,34 +258,31 @@ class AudioPlayer {
     }
 
     // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
-    // Trims Opus pre-skip (~312 samples @ 48kHz) and trailing padding from each segment
+    // Only trims Opus pre-skip for non-lossless formats
     _mergeBuffers(bufferList, startOffset) {
         if (!bufferList.length) return null;
         const sampleRate = bufferList[0].sampleRate;
         const numChannels = bufferList[0].numberOfChannels;
-        // Opus pre-skip: 312 samples @ 48kHz, scale for other sample rates
-        const OPUS_PRESKIP = Math.round(312 * sampleRate / 48000);
-        // Detect trailing padding: count near-zero samples from end
-        const _trimEnd = (buf, ch) => {
-            const data = buf.getChannelData(ch);
-            let end = data.length;
-            while (end > 0 && Math.abs(data[end - 1]) < 1e-6) end--;
-            return end;
-        };
+        // Only trim Opus pre-skip for non-lossless (Opus/WebM) formats
+        const isLossless = this._actualQuality === 'lossless';
+        const OPUS_PRESKIP = isLossless ? 0 : Math.round(312 * sampleRate / 48000);
         // Calculate per-buffer ranges [skipStart, usableEnd]
         const ranges = bufferList.map((buf, i) => {
             let skipStart = 0;
             if (i === 0) {
                 skipStart = Math.round(startOffset * sampleRate);
-            } else {
-                // Trim Opus pre-skip for non-first segments
+            } else if (OPUS_PRESKIP > 0) {
                 skipStart = Math.min(OPUS_PRESKIP, buf.length);
             }
-            // Trim trailing silence/padding (check channel 0)
-            let usableEnd = _trimEnd(buf, 0);
-            // Don't trim more than OPUS_PRESKIP from end to be safe
-            usableEnd = Math.max(usableEnd, buf.length - OPUS_PRESKIP);
-            if (usableEnd <= skipStart) usableEnd = buf.length; // fallback: don't trim
+            let usableEnd = buf.length;
+            // Only trim trailing silence for non-lossless
+            if (!isLossless && OPUS_PRESKIP > 0) {
+                const data = buf.getChannelData(0);
+                let end = data.length;
+                while (end > 0 && Math.abs(data[end - 1]) < 1e-6) end--;
+                usableEnd = Math.max(end, buf.length - OPUS_PRESKIP);
+            }
+            if (usableEnd <= skipStart) usableEnd = buf.length;
             return { skipStart, usableEnd };
         });
         let totalSamples = 0;
