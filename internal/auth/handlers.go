@@ -36,6 +36,7 @@ type rateLimiter struct {
 }
 
 var regLimiter = &rateLimiter{records: make(map[string][]time.Time)}
+var loginLimiter = &rateLimiter{records: make(map[string][]time.Time)}
 
 func (rl *rateLimiter) allow(ip string, maxCount int, window time.Duration) bool {
 	rl.mu.Lock()
@@ -150,6 +151,12 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", 405)
+		return
+	}
+	// Rate limit: 5 per minute per IP
+	ip := getClientIP(r)
+	if !loginLimiter.allow(ip, 5, time.Minute) {
+		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
 		return
 	}
 	var req authRequest

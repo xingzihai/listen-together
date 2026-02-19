@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,20 +181,39 @@ func main() {
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return true
+		return true // No Origin header (same-origin request)
 	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname() // Without port
+
 	allowedStr := os.Getenv("ALLOWED_ORIGINS")
-	var allowed []string
+	var allowedOrigins []string
 	if allowedStr != "" {
-		allowed = strings.Split(allowedStr, ",")
+		allowedOrigins = strings.Split(allowedStr, ",")
 	} else {
-		allowed = []string{"localhost", "127.0.0.1", "frp-bar.com"}
+		allowedOrigins = []string{"https://frp-bar.com", "http://localhost", "http://127.0.0.1"}
 	}
-	for _, a := range allowed {
-		a = strings.TrimSpace(a)
-		if strings.Contains(origin, a) {
+
+	for _, allowed := range allowedOrigins {
+		allowed = strings.TrimSpace(allowed)
+		au, err := url.Parse(allowed)
+		if err != nil {
+			// Fallback: direct comparison
+			if origin == allowed {
+				return true
+			}
+			continue
+		}
+		if host == au.Hostname() {
 			return true
 		}
+	}
+	// Also allow localhost and 127.0.0.1 (exact match)
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
 	}
 	return false
 }

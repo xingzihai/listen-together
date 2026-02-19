@@ -25,6 +25,7 @@ class AudioPlayer {
         this._rateCorrectingUntil = 0; // ctx.currentTime when rate correction ends
         this._rateCorrectionTimer = null;
         this._currentPlaybackRate = 1.0; // current playbackRate for new sources
+        this._rateStartTime = 0;      // ctx.currentTime when rate correction started
     }
 
     init() {
@@ -188,6 +189,7 @@ class AudioPlayer {
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
         this._resyncGen++;
+        this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
@@ -306,8 +308,13 @@ class AudioPlayer {
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
 
-        const now = window.clockSync.getServerTime();
-        const expectedPos = this.serverPlayPosition + (now - this.serverPlayTime) / 1000;
+        // Debounce: don't correct more than twice per second
+        const now = performance.now();
+        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 500) return 0;
+        this._lastCorrectionTime = now;
+
+        const serverNow = window.clockSync.getServerTime();
+        const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
         const actualPos = this.getCurrentTime();
         const drift = actualPos - expectedPos;
         // Debug display
@@ -353,7 +360,7 @@ class AudioPlayer {
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
             // Record start time for offset compensation
-            const rateStartTime = this.ctx.currentTime;
+            this._rateStartTime = this.ctx.currentTime;
 
             // Set playbackRate on all active AudioBufferSourceNodes
             this._currentPlaybackRate = rate;
@@ -366,9 +373,12 @@ class AudioPlayer {
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = setTimeout(() => {
                 // Compensate startOffset for the extra/less audio played during rate correction
-                const actualRateTime = this.ctx.currentTime - rateStartTime;
+                const actualRateTime = this.ctx.currentTime - this._rateStartTime;
                 const extraPlayed = actualRateTime * (rate - 1.0); // rate>1: played more, rate<1: played less
                 this.startOffset += extraPlayed; // Adjust so getCurrentTime() stays accurate
+
+                // Clear rate start time
+                this._rateStartTime = 0;
 
                 // Restore playbackRate to 1.0 on all active sources
                 this._currentPlaybackRate = 1.0;
@@ -410,6 +420,7 @@ class AudioPlayer {
         if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
         this._rateCorrectingUntil = 0;
         this._currentPlaybackRate = 1.0;
+        this._rateStartTime = 0;
         this.sources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
         this.sources = [];
         this._driftOffset = 0;
@@ -419,8 +430,13 @@ class AudioPlayer {
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
-        // Pure measurement: startOffset + elapsed, no correction compensation
-        return this.startOffset + Math.max(0, elapsed);
+        let pos = this.startOffset + Math.max(0, elapsed);
+        // Compensate for playbackRate during Tier 2 correction
+        if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
+            const rateElapsed = this.ctx.currentTime - this._rateStartTime;
+            pos += rateElapsed * (this._currentPlaybackRate - 1.0);
+        }
+        return pos;
     }
 
     setVolume(v) { if (this.gainNode) this.gainNode.gain.value = v; }
