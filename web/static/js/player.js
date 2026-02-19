@@ -44,6 +44,8 @@ class AudioPlayer {
         this._ctxTimeAtPlay = 0; // AudioContext.currentTime when play started (same clock as worklet)
         this._prevTailL = null; this._prevTailR = null;
         this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
+        this._lastStatsTime = 0;
+        this._loadingPromises = new Map();
     }
 
     _log(event, data) {
@@ -98,6 +100,7 @@ class AudioPlayer {
                 this._workletConsumed = msg.totalConsumedFrames;
                 this._workletSampleRate = msg.sampleRate;
                 this._fedSinceLastStats = 0;
+                this._lastStatsTime = performance.now();
             } else if (msg.type === 'overflow') {
                 this._log('overflow', { dropped: msg.dropped });
             }
@@ -215,6 +218,14 @@ class AudioPlayer {
 
     async loadSegment(idx) {
         if (this.buffers.has(idx)) return this.buffers.get(idx);
+        if (this._loadingPromises.has(idx)) return this._loadingPromises.get(idx);
+        const promise = this._doLoadSegment(idx);
+        this._loadingPromises.set(idx, promise);
+        try { return await promise; }
+        finally { this._loadingPromises.delete(idx); }
+    }
+
+    async _doLoadSegment(idx) {
         const url = this._getSegmentURL(idx);
         let data = await window.audioCache.get(url);
         if (!data) {
@@ -269,7 +280,7 @@ class AudioPlayer {
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
 
-        await this._feedSegments(gen, 1);
+        await this._feedSegments(gen, 2);
         if (!this.isPlaying || gen !== this._feederGen) return;
 
         this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
@@ -283,9 +294,11 @@ class AudioPlayer {
             if (this._feederNextSeg >= this.segments.length) return;
             const sr = this.ctx?.sampleRate || 48000;
             const segFrames = Math.ceil(this.segmentTime * sr);
-            // Use known capacity (5s * sampleRate) if worklet hasn't reported yet
             const capacity = this._workletCapacity > 0 ? this._workletCapacity : Math.ceil(sr * 5);
-            const buffered = this._workletBuffered + this._fedSinceLastStats;
+            // Time-decay compensation: estimate how much worklet consumed since last stats
+            const statAge = this._lastStatsTime > 0 ? (performance.now() - this._lastStatsTime) / 1000 : 0;
+            const estimatedConsumed = Math.floor(statAge * sr);
+            const buffered = Math.max(0, this._workletBuffered - estimatedConsumed) + this._fedSinceLastStats;
             if (buffered > capacity - segFrames) return;
 
             if (!this.buffers.has(this._feederNextSeg)) {
@@ -337,7 +350,7 @@ class AudioPlayer {
             this._fedFrames += len;
             this._fedSinceLastStats += len;
             this._feederNextSeg++;
-            if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 3);
+            if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 5);
         }
     }
 
@@ -352,11 +365,14 @@ class AudioPlayer {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
         if (performance.now() - this._playStartedAt < 3000) return;
 
-        // Use same clock source for both expected and actual position
-        // expectedPos: based on AudioContext.currentTime elapsed since play start
-        // actualPos: based on workletConsumed (also AudioContext clock)
-        const ctxElapsed = this.ctx.currentTime - this._ctxTimeAtPlay;
-        const expectedPos = this._feederStartPos + ctxElapsed;
+        // Local drift: compare consumed frames vs expected frames (both audio-clock based)
+        const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
+        const expectedFrames = (this.ctx.currentTime - this._ctxTimeAtPlay) * sr;
+        const actualFrames = this._workletConsumed;
+        const ageMs = (actualFrames - expectedFrames) / sr * 1000;
+        const ageUs = ageMs * 1000;
+
+        // Also track actual playback position for display
         const actualPos = this.getCurrentTime();
         const ageMs = (actualPos - expectedPos) * 1000;
         const ageUs = ageMs * 1000;
@@ -366,7 +382,7 @@ class AudioPlayer {
         const shortMedian = this._shortBuffer.median();
         const longMedian = this._longBuffer.median();
 
-        this._updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian);
+        this._updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian, actualPos);
         this._log('drift', { d: +ageMs.toFixed(1), mini: +(miniMedian/1000).toFixed(1), short: +(shortMedian/1000).toFixed(1), long: +(longMedian/1000).toFixed(1) });
 
         // Hard sync thresholds (Snapcast, all in microseconds)
@@ -408,7 +424,7 @@ class AudioPlayer {
         }
     }
 
-    _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian) {
+    _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian, actualPos) {
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
             const bufMs = Math.round(this._workletBuffered / (this.ctx?.sampleRate || 48000) * 1000);
@@ -446,8 +462,8 @@ class AudioPlayer {
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
-        const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        const pos = this._feederStartPos + this._workletConsumed / sr;
+        // Primary: use AudioContext clock (real-time, no async delay)
+        const pos = this._feederStartPos + (this.ctx.currentTime - this._ctxTimeAtPlay);
         return this.duration > 0 ? Math.min(pos, this.duration) : pos;
     }
 

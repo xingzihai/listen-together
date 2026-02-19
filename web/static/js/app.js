@@ -185,10 +185,9 @@ async function handleMessage(msg) {
                     const expectedPos = msg.position + (nowServer - msg.serverTime) / 1000;
                     const actualPos = window.audioPlayer.getCurrentTime();
                     const crossDrift = (actualPos - expectedPos) * 1000;
-                    // If cross-device drift > 100ms, force hardSync
-                    if (Math.abs(crossDrift) > 100) {
+                    // If cross-device drift > 300ms, trigger hardSync (respect cooldown)
+                    if (Math.abs(crossDrift) > 300 && performance.now() - window.audioPlayer._lastHardSync > 3000) {
                         console.log('syncTick cross-device drift:', crossDrift.toFixed(1), 'ms → hardSync');
-                        window.audioPlayer._lastHardSync = 0; // bypass cooldown
                         window.audioPlayer._hardSyncing = true;
                         window.audioPlayer.playAtPosition(expectedPos, nowServer)
                             .finally(() => { window.audioPlayer._hardSyncing = false; });
