@@ -278,12 +278,19 @@ class AudioPlayer {
         actualPos = this.serverPlayPosition + elapsed;
 
         this._feederStartPos = actualPos;
-        this._ctxTimeAtPlay = this.ctx.currentTime; // anchor for drift calc (same clock as worklet)
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
 
         await this._feedSegments(gen, 2);
         if (!this.isPlaying || gen !== this._feederGen) return;
+
+        // Re-anchor AFTER feed: data is now in worklet, minimize lag between anchor and first output
+        const elapsedAfterFeed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
+        this._feederStartPos = this.serverPlayPosition + elapsedAfterFeed;
+        this._workletConsumed = 0;
+        this._lastStatsConsumed = 0;
+        this._lastStatsTime = performance.now();
+        this._playStartedAt = performance.now();
 
         this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
         this._driftTimer = setInterval(() => this._driftLoop(), 250);
@@ -365,7 +372,7 @@ class AudioPlayer {
 
     _driftLoop() {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
-        if (performance.now() - this._playStartedAt < 3000) return;
+        if (performance.now() - this._playStartedAt < 5000) return;
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
@@ -400,24 +407,9 @@ class AudioPlayer {
             return;
         }
 
-        // Soft correction (Snapcast setRealSampleRate)
-        if (this._shortBuffer.full()) {
-            const CORRECTION_BEGIN = 100; // 100us
-            const sr = this.ctx.sampleRate;
-            let correctAfterXFrames = 0;
-            // age>0 = playing too fast → insert frames (negative correctAfterXFrames)
-            // age<0 = playing too slow → drop frames (positive correctAfterXFrames)
-            if (shortMedian > CORRECTION_BEGIN && miniMedian > 50 && ageUs > 50) {
-                // Too fast: slow down by inserting frames
-                let rateAdj = Math.min((shortMedian / 100) * 0.00005, 0.005);
-                correctAfterXFrames = -Math.round(1 / rateAdj); // negative = insert
-            } else if (shortMedian < -CORRECTION_BEGIN && miniMedian < -50 && ageUs < -50) {
-                // Too slow: speed up by dropping frames
-                let rateAdj = Math.min((-shortMedian / 100) * 0.00005, 0.005);
-                correctAfterXFrames = Math.round(1 / rateAdj); // positive = drop
-            }
-            if (this.workletNode) this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames });
-        }
+        // Soft correction DISABLED — stabilize base playback first
+        // Will re-enable after confirming no underrun/overflow/stutter
+        // if (this._shortBuffer.full()) { ... }
     }
 
     _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian, actualPos) {
@@ -459,13 +451,7 @@ class AudioPlayer {
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
         const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        // Interpolate consumed frames between stats updates to eliminate async lag
-        let consumed = this._workletConsumed;
-        if (this._lastStatsTime > 0 && this._workletBuffered > 0) {
-            const elapsed = (performance.now() - this._lastStatsTime) / 1000;
-            consumed = this._lastStatsConsumed + elapsed * sr;
-        }
-        const pos = this._feederStartPos + consumed / sr;
+        const pos = this._feederStartPos + this._workletConsumed / sr;
         return this.duration > 0 ? Math.min(pos, this.duration) : pos;
     }
 
