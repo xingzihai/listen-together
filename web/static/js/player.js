@@ -71,7 +71,7 @@ class AudioPlayer {
         // Bridge AudioContext to ClockSync for high-precision timing
         if (window.clockSync?.setAudioContext) window.clockSync.setAudioContext(this.ctx);
         if (!this._workletReady) {
-            try { await this.ctx.audioWorklet.addModule('/static/js/worklet-processor.js'); }
+            try { await this.ctx.audioWorklet.addModule('/js/worklet-processor.js'); }
             catch (e) { console.warn('[audio] worklet addModule:', e.message); }
             this._createWorkletNode();
             this._workletReady = true;
