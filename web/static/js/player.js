@@ -356,16 +356,11 @@ class AudioPlayer {
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
-        // Use RAW position for drift measurement (without _driftOffset compensation)
-        // This ensures we measure actual audio timeline drift, not the "already corrected" view
-        const elapsed = this.ctx.currentTime - this.startTime;
-        let rawPos = this.startOffset + Math.max(0, elapsed);
-        // Include Tier 2 playbackRate compensation (this reflects real audio position)
-        if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
-            const rateElapsed = this.ctx.currentTime - this._rateStartTime;
-            rawPos += rateElapsed * (this._currentPlaybackRate - 1.0);
-        }
-        const drift = rawPos - expectedPos;
+        // Use getCurrentTime() which includes _driftOffset compensation
+        // This way, once a soft correction is applied and takes effect at the next segment,
+        // the drift measurement will reflect the correction
+        const actualPos = this.getCurrentTime();
+        const drift = actualPos - expectedPos;
         // Debug display
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
@@ -377,7 +372,8 @@ class AudioPlayer {
             if (dbg) {
                 const ctxEl = (this.ctx.currentTime - this.startTime).toFixed(3);
                 const svrEl = ((serverNow - this.serverPlayTime) / 1000).toFixed(3);
-                const rawP = rawPos.toFixed(3);
+                const elapsed_ = this.ctx.currentTime - this.startTime;
+                const rawP = (this.startOffset + Math.max(0, elapsed_)).toFixed(3);
                 const expP = expectedPos.toFixed(3);
                 const curP = this.getCurrentTime().toFixed(3);
                 const segI = this._nextSegIdx;
