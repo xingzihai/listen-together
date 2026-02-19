@@ -3,6 +3,9 @@ class AudioPlayer {
         this.ctx = null; this.gainNode = null; this.segments = []; this.buffers = new Map();
         this.sources = []; this.isPlaying = false; this.startTime = 0; this.startOffset = 0;
         this.lastPosition = 0; this.duration = 0; this.segmentTime = 5; this.roomCode = '';
+        // Debug log ring buffer — stores last 200 events, accessible via window.audioPlayer.dumpLog()
+        this._logBuffer = [];
+        this._logMax = 200;
         this.serverPlayTime = 0; this.serverPlayPosition = 0;
         this.onBuffering = null;
         this._trackSegBase = null;
@@ -27,6 +30,16 @@ class AudioPlayer {
         this._currentPlaybackRate = 1.0; // current playbackRate for new sources
         this._rateStartTime = 0;      // ctx.currentTime when rate correction started
     }
+
+    // Structured debug log — ring buffer, call dumpLog() in console to retrieve
+    _log(event, data) {
+        const entry = { t: Date.now(), ct: this.ctx?.currentTime || 0, event, ...data };
+        this._logBuffer.push(entry);
+        if (this._logBuffer.length > this._logMax) this._logBuffer.shift();
+        console.log(`[audio] ${event}`, data || '');
+    }
+    dumpLog() { return JSON.stringify(this._logBuffer, null, 2); }
+    copyLog() { navigator.clipboard?.writeText(this.dumpLog()); console.log('Log copied to clipboard'); }
 
     init() {
         if (!this.ctx) {
@@ -195,6 +208,7 @@ class AudioPlayer {
         this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
+        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
 
         // Capture ctx↔wall clock relationship ONCE before any async work
         // This avoids drift between the two clocks during preload
@@ -222,7 +236,7 @@ class AudioPlayer {
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
                 this._startLookahead(this.serverPlayPosition, ctxTarget);
-                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${((this._outputLatency||0)*1000).toFixed(1)}ms`);
+                this._log('scheduledPlay', { waitMs: +waitMs.toFixed(0), lat: +((this._outputLatency||0)*1000).toFixed(1) });
                 return;
             }
         }
@@ -317,7 +331,7 @@ class AudioPlayer {
                 if (source.playbackRate) source.playbackRate.value = 1.0;
             });
             this._rateCorrectingUntil = 0;
-            console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
+            this._log('rateRestored', { via: 'scheduler' });
         }
         const LOOKAHEAD = 2.0;
         const MERGE_COUNT = this._isFirstSeg ? 1 : 3; // first segment plays immediately, then merge 3
@@ -357,6 +371,7 @@ class AudioPlayer {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
             source.start(t);
+            this._log('chunkScheduled', { segs: `${startIdx}-${startIdx+bufferList.length-1}`, t: +t.toFixed(3), dur: +effectiveDur.toFixed(3), merged: +(merged.duration).toFixed(3), rate: effectiveRate, first: this._isFirstSeg });
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
                 if (idx > -1) this.sources.splice(idx, 1);
@@ -390,7 +405,7 @@ class AudioPlayer {
                 if (source.playbackRate) source.playbackRate.value = 1.0;
             });
             this._rateCorrectingUntil = 0;
-            console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
+            this._log('rateRestored', { via: 'correctDrift' });
         }
 
         // Debounce: max 4 corrections per second
@@ -436,11 +451,13 @@ class AudioPlayer {
             }
         }
         const absDrift = Math.abs(drift);
+        // Log every drift measurement for diagnostics
+        this._log('drift', { d: +(drift*1000).toFixed(1), exp: +expectedPos.toFixed(3), act: +actualPos.toFixed(3), acc: +(this._driftOffset*1000).toFixed(1), sources: this.sources.length });
 
         // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime for next merged chunk
         if (absDrift > 0.005 && absDrift <= 0.05) {
             if (Math.abs(this._driftOffset + drift) > 0.5) {
-                console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
+                this._log('softCorrectionCapped', { accum: +(this._driftOffset*1000).toFixed(0) });
                 this._driftOffset = 0;
                 if (!this._resyncing) {
                     this._resyncing = true;
@@ -464,7 +481,7 @@ class AudioPlayer {
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const adjustedDuration = Math.min(3, absDrift / rateOffset);
 
-            console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
+            this._log('tier2Rate', { drift: +(drift*1000).toFixed(0), rate, dur: +adjustedDuration.toFixed(1) });
             this._rateStartTime = this.ctx.currentTime;
             this._currentPlaybackRate = rate;
             this.sources.forEach(source => {
@@ -481,7 +498,7 @@ class AudioPlayer {
         if (absDrift > 0.15) {
             const backoff = this._resyncBackoff || 1500;
             if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
-            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
+            this._log('hardResync', { drift: +(drift*1000).toFixed(0), backoff });
             this._lastResync = Date.now();
             this._resyncBackoff = Math.min(backoff * 2, 10000);
             if (!this._resyncing) {
