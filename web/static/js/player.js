@@ -348,24 +348,10 @@ class AudioPlayer {
 
             const source = this.ctx.createBufferSource();
             source.buffer = merged;
-            // Add short fade-in/out between merged chunks to smooth boundaries
-            const gain = this.ctx.createGain();
-            source.connect(gain);
-            gain.connect(this.gainNode);
+            source.connect(this.gainNode);
             const t = this._nextSegTime;
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
             const effectiveDur = merged.duration / effectiveRate;
-            const XFADE = 0.005; // 5ms micro-crossfade between merged chunks only
-            if (this._mergeChunkCount > 0) {
-                // Not the very first chunk — fade in
-                gain.gain.setValueAtTime(0.0001, Math.max(0, t));
-                gain.gain.exponentialRampToValueAtTime(1, t + XFADE);
-            }
-            // Fade out at end
-            const endTime = t + effectiveDur;
-            gain.gain.setValueAtTime(1, Math.max(0, endTime - XFADE));
-            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
-            this._mergeChunkCount = (this._mergeChunkCount || 0) + 1;
 
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
