@@ -371,7 +371,29 @@ class AudioPlayer {
         if (driftEl) {
             const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
             const driftAcc = (this._driftOffset * 1000).toFixed(1);
-            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | accum: ${driftAcc}ms | latency: ${((this._outputLatency||0)*1000).toFixed(0)}ms | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
+            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | accum: ${driftAcc}ms`;
+            // Detailed debug panel
+            const dbg = document.getElementById('syncDebug');
+            if (dbg) {
+                const ctxEl = (this.ctx.currentTime - this.startTime).toFixed(3);
+                const svrEl = ((serverNow - this.serverPlayTime) / 1000).toFixed(3);
+                const rawP = rawPos.toFixed(3);
+                const expP = expectedPos.toFixed(3);
+                const curP = this.getCurrentTime().toFixed(3);
+                const segI = this._nextSegIdx;
+                const nst = (this._nextSegTime - this.ctx.currentTime).toFixed(3);
+                const rate = this._currentPlaybackRate || 1.0;
+                const lat = ((this._outputLatency||0)*1000).toFixed(0);
+                const off = window.clockSync.offset.toFixed(1);
+                const rtt = window.clockSync.rtt.toFixed(0);
+                const sam = window.clockSync.samples.length;
+                const syn = window.clockSync.synced ? 'Y' : 'N';
+                dbg.innerHTML = [
+                    `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
+                    `POS raw:${rawP} exp:${expP} cur:${curP} svrElapsed:${svrEl}s ctxElapsed:${ctxEl}s`,
+                    `SEG idx:${segI} nextIn:${nst}s rate:${rate} driftOff:${driftAcc}ms lat:${lat}ms`,
+                ].join('<br>');
+            }
         }
         const absDrift = Math.abs(drift);
 
