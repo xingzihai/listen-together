@@ -190,6 +190,7 @@ class AudioPlayer {
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
+        this._mergeChunkCount = 0;
         this._resyncGen++;
         this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
@@ -322,7 +323,7 @@ class AudioPlayer {
             console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
         }
         const LOOKAHEAD = 2.0;
-        const MERGE_COUNT = 3; // merge 3 segments (~15s) into one buffer
+        const MERGE_COUNT = this._isFirstSeg ? 1 : 3; // first segment plays immediately, then merge 3
         const preloadCount = this._actualQuality === 'lossless' ? 2 : 4;
 
         while (this._nextSegIdx < this.segments.length &&
@@ -350,10 +351,24 @@ class AudioPlayer {
 
             const source = this.ctx.createBufferSource();
             source.buffer = merged;
-            source.connect(this.gainNode);
+            // Add short fade-in/out between merged chunks to smooth boundaries
+            const gain = this.ctx.createGain();
+            source.connect(gain);
+            gain.connect(this.gainNode);
             const t = this._nextSegTime;
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
             const effectiveDur = merged.duration / effectiveRate;
+            const XFADE = 0.005; // 5ms micro-crossfade between merged chunks only
+            if (this._mergeChunkCount > 0) {
+                // Not the very first chunk — fade in
+                gain.gain.setValueAtTime(0.0001, Math.max(0, t));
+                gain.gain.exponentialRampToValueAtTime(1, t + XFADE);
+            }
+            // Fade out at end
+            const endTime = t + effectiveDur;
+            gain.gain.setValueAtTime(1, Math.max(0, endTime - XFADE));
+            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
+            this._mergeChunkCount = (this._mergeChunkCount || 0) + 1;
 
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
@@ -439,12 +454,10 @@ class AudioPlayer {
         }
         const absDrift = Math.abs(drift);
 
-        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime only, don't touch startTime
+        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime for next merged chunk
         if (absDrift > 0.005 && absDrift <= 0.05) {
-            // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
             if (Math.abs(this._driftOffset + drift) > 0.5) {
                 console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
-                // 直接执行硬重置，不依赖 fall-through
                 this._driftOffset = 0;
                 if (!this._resyncing) {
                     this._resyncing = true;
@@ -453,50 +466,36 @@ class AudioPlayer {
                 }
                 return Math.round(drift * 1000);
             }
-            // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
-            // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
             this._nextSegTime += drift;
             this._driftOffset += drift;
-            // Don't update _softCorrectionTotal — correction affects future scheduling,
-            // not current position. getCurrentTime() stays pure measurement.
             this._resyncBackoff = 1500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up
-        if (absDrift > 0.05 && absDrift <= 0.3) {
-            // Capped at ±1% to minimize audible pitch shift
+        // Tier 2: playbackRate correction (50-150ms) — immediate effect on playing sources
+        if (absDrift > 0.05 && absDrift <= 0.15) {
             let rateOffset;
-            if (absDrift <= 0.1) rateOffset = 0.005;
-            else if (absDrift <= 0.2) rateOffset = 0.008;
+            if (absDrift <= 0.08) rateOffset = 0.005;
+            else if (absDrift <= 0.12) rateOffset = 0.008;
             else rateOffset = 0.01;
-            // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
-            const neededCatchUp = absDrift;
-            const adjustedDuration = Math.min(3, neededCatchUp / rateOffset);
+            const adjustedDuration = Math.min(3, absDrift / rateOffset);
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
-
-            // Record start time for offset compensation
             this._rateStartTime = this.ctx.currentTime;
-
-            // Set playbackRate on all active AudioBufferSourceNodes
             this._currentPlaybackRate = rate;
             this.sources.forEach(source => {
                 if (source.playbackRate) source.playbackRate.value = rate;
             });
             this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
-
-            // Clear any existing timer (keep for cleanup, but recovery is via scheduler)
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = null;
-
             this._resyncBackoff = 1500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 3: Hard resync (>300ms) — stop and restart with exponential backoff
-        if (absDrift > 0.3) {
+        // Tier 3: Hard resync (>150ms) — lowered threshold since merged chunks reduce soft correction opportunities
+        if (absDrift > 0.15) {
             const backoff = this._resyncBackoff || 1500;
             if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
             console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
