@@ -181,6 +181,7 @@ async function handleMessage(msg) {
                 window.audioPlayer.serverPlayPosition = msg.position;
                 // Clear short-term buffer to avoid mixing old/new anchor samples
                 if (window.audioPlayer._miniBuffer) window.audioPlayer._miniBuffer.clear();
+                if (window.audioPlayer._shortBuffer) window.audioPlayer._shortBuffer.clear();
                 // Immediate drift check after anchor update
                 const drift = window.audioPlayer.correctDrift();
                 if (drift) console.log('syncTick drift corrected:', drift, 'ms');

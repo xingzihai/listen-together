@@ -36,11 +36,13 @@ class AudioPlayer {
         this._feederTimer = null; this._feederNextSeg = 0;
         this._feederSegOffset = 0; this._feederGen = 0; this._feederStartPos = 0; this._feeding = false;
         this._fedSinceLastStats = 0;
-        this._miniBuffer = new MedianBuffer(20);
+        this._miniBuffer = new MedianBuffer(40);
         this._shortBuffer = new MedianBuffer(100);
         this._longBuffer = new MedianBuffer(500);
         this._driftTimer = null; this._hardSyncing = false; this._lastHardSync = 0;
         this._playStartedAt = 0; this._fedFrames = 0; this._sampleRate = 0;
+        this._prevTailL = null; this._prevTailR = null;
+        this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
     }
 
     _log(event, data) {
@@ -69,6 +71,7 @@ class AudioPlayer {
         }
         if (this.ctx.state === 'suspended') await this.ctx.resume();
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
+        this._CROSSFADE_FRAMES = Math.ceil(this.ctx.sampleRate * 0.003); // 3ms
         // Bridge AudioContext to ClockSync for high-precision timing
         if (window.clockSync?.setAudioContext) window.clockSync.setAudioContext(this.ctx);
         if (!this._workletReady) {
@@ -254,14 +257,11 @@ class AudioPlayer {
             if (waitMs > 2 && waitMs < 3000) {
                 await new Promise(r => setTimeout(r, waitMs));
                 if (!this.isPlaying || gen !== this._feederGen) return;
-            } else {
-                const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
-                actualPos = this.serverPlayPosition + elapsed;
             }
-        } else {
-            const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
-            actualPos = this.serverPlayPosition + elapsed;
         }
+        // Always recalculate elapsed after any wait
+        const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
+        actualPos = this.serverPlayPosition + elapsed;
 
         this._feederStartPos = actualPos;
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
@@ -299,12 +299,40 @@ class AudioPlayer {
             const srcR = audioBuf.numberOfChannels > 1 ? audioBuf.getChannelData(1) : srcL;
             const offsetFrames = Math.round(this._feederSegOffset * audioBuf.sampleRate);
             this._feederSegOffset = 0;
-            const len = srcL.length - offsetFrames;
+
+            // Crossfade with previous segment tail to eliminate Opus pre-skip gaps
+            let sliceL = srcL.slice(offsetFrames);
+            let sliceR = srcR.slice(offsetFrames);
+            if (this._prevTailL && sliceL.length > 0) {
+                const cfLen = Math.min(this._CROSSFADE_FRAMES, this._prevTailL.length, sliceL.length);
+                for (let j = 0; j < cfLen; j++) {
+                    const t = (j + 1) / (cfLen + 1);
+                    sliceL[j] = this._prevTailL[this._prevTailL.length - cfLen + j] * (1 - t) + sliceL[j] * t;
+                    sliceR[j] = this._prevTailR[this._prevTailR.length - cfLen + j] * (1 - t) + sliceR[j] * t;
+                }
+                this._prevTailL = null; this._prevTailR = null;
+            }
+            // Save tail for next segment crossfade (only if segment long enough)
+            let sendL, sendR;
+            if (sliceL.length > this._CROSSFADE_FRAMES * 2) {
+                const tailLen = this._CROSSFADE_FRAMES;
+                this._prevTailL = sliceL.slice(sliceL.length - tailLen);
+                this._prevTailR = sliceR.slice(sliceR.length - tailLen);
+                sendL = sliceL.slice(0, sliceL.length - tailLen);
+                sendR = sliceR.slice(0, sliceR.length - tailLen);
+            } else {
+                // Segment too short for tail trimming, send all data
+                sendL = sliceL;
+                sendR = sliceR;
+                // Don't save tail — next segment will just not crossfade
+                this._prevTailL = null; this._prevTailR = null;
+            }
+            const len = sendL.length;
             if (len <= 0) { this._feederNextSeg++; continue; }
 
-            const left = srcL.slice(offsetFrames).buffer;
-            const right = srcR.slice(offsetFrames).buffer;
-            this.workletNode.port.postMessage({ type: 'pcm', left, right }, [left, right]);
+            const leftBuf = sendL.buffer;
+            const rightBuf = sendR.buffer;
+            this.workletNode.port.postMessage({ type: 'pcm', left: leftBuf, right: rightBuf }, [leftBuf, rightBuf]);
             this._fedFrames += len;
             this._fedSinceLastStats += len;
             this._feederNextSeg++;
@@ -321,7 +349,7 @@ class AudioPlayer {
 
     _driftLoop() {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
-        if (performance.now() - this._playStartedAt < 1500) return;
+        if (performance.now() - this._playStartedAt < 3000) return;
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
@@ -341,7 +369,7 @@ class AudioPlayer {
         // longMedian > 2ms(2000us), shortMedian > 5ms(5000us), miniMedian > 50ms(50000us), age > 500ms
         if ((this._longBuffer.full() && Math.abs(longMedian) > 2000 && Math.abs(ageMs) > 5) ||
             (this._shortBuffer.full() && Math.abs(shortMedian) > 5000 && Math.abs(ageMs) > 5) ||
-            (this._miniBuffer.full() && Math.abs(miniMedian) > 50000) ||
+            (this._miniBuffer.full() && Math.abs(miniMedian) > 50000 && Math.abs(ageMs) > 20) ||
             (Math.abs(ageMs) > 500)) {
             this._log('hardSync', { age: +ageMs.toFixed(1) });
             // Cooldown: no hard sync within 3 seconds
