@@ -356,8 +356,16 @@ class AudioPlayer {
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
-        const actualPos = this.getCurrentTime();
-        const drift = actualPos - expectedPos;
+        // Use RAW position for drift measurement (without _driftOffset compensation)
+        // This ensures we measure actual audio timeline drift, not the "already corrected" view
+        const elapsed = this.ctx.currentTime - this.startTime;
+        let rawPos = this.startOffset + Math.max(0, elapsed);
+        // Include Tier 2 playbackRate compensation (this reflects real audio position)
+        if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
+            const rateElapsed = this.ctx.currentTime - this._rateStartTime;
+            rawPos += rateElapsed * (this._currentPlaybackRate - 1.0);
+        }
+        const drift = rawPos - expectedPos;
         // Debug display
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
