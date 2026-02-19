@@ -53,9 +53,9 @@ type qualityDef struct {
 
 var allQualities = []qualityDef{
 	{Name: "lossless", DirSuffix: "segments_lossless", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
-	{Name: "high", DirSuffix: "segments_high", Codec: "libopus", Bitrate: "256k", Ext: ".webm", SegFormat: "webm"},
-	{Name: "medium", DirSuffix: "segments_medium", Codec: "libopus", Bitrate: "128k", Ext: ".webm", SegFormat: "webm"},
-	{Name: "low", DirSuffix: "segments_low", Codec: "libopus", Bitrate: "64k", Ext: ".webm", SegFormat: "webm"},
+	{Name: "high", DirSuffix: "segments_high", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
+	{Name: "medium", DirSuffix: "segments_medium", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
+	{Name: "low", DirSuffix: "segments_low", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
 }
 
 // ProbeResult holds ffprobe detection results.
@@ -141,16 +141,9 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	}
 	pattern := filepath.Join(dir, "seg_%03d"+q.Ext)
 
-	args := []string{"-i", inputPath, "-vn"}
-	if q.Codec == "flac" {
-		args = append(args, "-c:a", "flac")
-	} else {
-		args = append(args, "-c:a", q.Codec, "-b:a", q.Bitrate)
-	}
+	args := []string{"-i", inputPath, "-vn", "-c:a", "flac"}
 	args = append(args, "-f", "segment", "-segment_time", strconv.Itoa(SegmentDuration))
-	if q.SegFormat != "" {
-		args = append(args, "-segment_format", q.SegFormat)
-	}
+	args = append(args, "-segment_format", "flac")
 	args = append(args, "-y", pattern)
 
 	cmd := exec.Command("ffmpeg", args...)
@@ -159,7 +152,6 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 		return nil, fmt.Errorf("ffmpeg (%s) failed: %w, output: %s", q.Name, err, string(out))
 	}
 
-	// List generated segments
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err

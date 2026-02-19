@@ -180,6 +180,17 @@ class AudioPlayer {
             window.audioCache.put(url, data.slice(0));
         }
         const buffer = await this.ctx.decodeAudioData(data);
+        // Trim FLAC block-alignment padding: ensure each segment is exactly segmentTime
+        const isLast = (idx === this.segments.length - 1);
+        const expectedSamples = Math.round(this.segmentTime * buffer.sampleRate);
+        if (!isLast && buffer.length > expectedSamples) {
+            const trimmed = this.ctx.createBuffer(buffer.numberOfChannels, expectedSamples, buffer.sampleRate);
+            for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+                trimmed.getChannelData(ch).set(buffer.getChannelData(ch).subarray(0, expectedSamples));
+            }
+            this.buffers.set(idx, trimmed);
+            return trimmed;
+        }
         this.buffers.set(idx, buffer);
         return buffer;
     }
@@ -288,34 +299,16 @@ class AudioPlayer {
             if (!buffer) break;
             const source = this.ctx.createBufferSource();
             source.buffer = buffer;
-            const gain = this.ctx.createGain();
-            source.connect(gain);
-            gain.connect(this.gainNode);
+            source.connect(this.gainNode);
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            const overlap = 0.02; // 20ms crossfade — eliminates clicks on mobile
-            // Calculate effective duration considering playbackRate
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
             const effectiveDur = dur / effectiveRate;
-            const effectiveOverlap = overlap / effectiveRate;
-            // Crossfade envelope: equal-power style to avoid volume dips at boundaries
-            if (!this._isFirstSeg) {
-                // Fade in over overlap period
-                gain.gain.setValueAtTime(0.0001, Math.max(0, t - effectiveOverlap));
-                gain.gain.exponentialRampToValueAtTime(1, t);
-            }
-            const endTime = t + effectiveDur;
-            // Fade out over overlap period
-            gain.gain.setValueAtTime(1, Math.max(0, endTime - effectiveOverlap));
-            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
-            // Start: first seg at exact ctxStartTime, others overlap slightly
-            const startAt = this._isFirstSeg ? t : Math.max(0, t - effectiveOverlap);
-            // Set playbackRate BEFORE start() for immediate effect
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
-            source.start(startAt, off);
+            source.start(t, off);
             // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
