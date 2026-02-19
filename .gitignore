@@ -4,3 +4,4 @@ listen-together
 *.db
 *.crt
 *.key
+*.pem

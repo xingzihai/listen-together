@@ -23,7 +23,7 @@ import (
 
 var (
 	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: checkOrigin,
 	}
 	manager  = room.NewManager()
 	dataDir  = "./data/rooms"
@@ -175,8 +175,29 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", limitedMux))
 }
 
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	allowedStr := os.Getenv("ALLOWED_ORIGINS")
+	var allowed []string
+	if allowedStr != "" {
+		allowed = strings.Split(allowedStr, ",")
+	} else {
+		allowed = []string{"localhost", "127.0.0.1", "frp-bar.com"}
+	}
+	for _, a := range allowed {
+		a = strings.TrimSpace(a)
+		if strings.Contains(origin, a) {
+			return true
+		}
+	}
+	return false
+}
+
 func generateCode() string {
-	b := make([]byte, 3)
+	b := make([]byte, 4)
 	rand.Read(b)
 	return strings.ToUpper(hex.EncodeToString(b))
 }
@@ -192,6 +213,8 @@ type rateLimiter struct {
 	mu      sync.Mutex
 	entries map[string][]time.Time
 }
+
+const maxRateLimitEntries = 10000
 
 func newRateLimiter() *rateLimiter {
 	rl := &rateLimiter{entries: make(map[string][]time.Time)}
@@ -234,15 +257,48 @@ func (rl *rateLimiter) allow(key string, maxAttempts int, window time.Duration) 
 		rl.entries[key] = valid
 		return false
 	}
+	// Enforce max entries limit
+	if len(rl.entries) >= maxRateLimitEntries {
+		rl.cleanOldestEntries()
+	}
 	rl.entries[key] = append(valid, now)
 	return true
+}
+
+func (rl *rateLimiter) cleanOldestEntries() {
+	toRemove := len(rl.entries) / 10
+	if toRemove < 1 {
+		toRemove = 1
+	}
+	type entry struct {
+		key  string
+		last time.Time
+	}
+	entries := make([]entry, 0, len(rl.entries))
+	for k, times := range rl.entries {
+		if len(times) > 0 {
+			entries = append(entries, entry{k, times[len(times)-1]})
+		}
+	}
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].last.Before(entries[i].last) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	for i := 0; i < toRemove && i < len(entries); i++ {
+		delete(rl.entries, entries[i].key)
+	}
 }
 
 var joinLimiter = newRateLimiter()
 
 func getClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.Split(fwd, ",")[0]
+		parts := strings.Split(fwd, ",")
+		// Take the last IP (most recently added by trusted proxy)
+		return strings.TrimSpace(parts[len(parts)-1])
 	}
 	return strings.Split(r.RemoteAddr, ":")[0]
 }

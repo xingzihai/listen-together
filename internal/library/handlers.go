@@ -370,10 +370,12 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	userID := parts[0]
-	audioID := parts[1]
-	quality := parts[2]
-	filename := parts[3]
+	
+	// Sanitize all path components
+	userID := filepath.Base(parts[0])
+	audioID := filepath.Base(parts[1])
+	quality := filepath.Base(parts[2])
+	filename := filepath.Base(parts[3])
 
 	// Validate quality name
 	validQ := map[string]bool{"lossless": true, "high": true, "medium": true, "low": true}
@@ -382,10 +384,12 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Prevent path traversal
-	if strings.Contains(filename, "..") || strings.Contains(audioID, "..") {
-		http.NotFound(w, r)
-		return
+	// Prevent path traversal - reject any component with .. or /
+	for _, comp := range []string{userID, audioID, quality, filename} {
+		if strings.Contains(comp, "..") || strings.Contains(comp, "/") || strings.Contains(comp, "\\") {
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	filePath := filepath.Join(h.DataDir, "library", userID, audioID, "segments_"+quality, filename)

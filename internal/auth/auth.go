@@ -169,14 +169,30 @@ func CheckPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
+// isSecureRequest determines if cookie should have Secure flag
+func isSecureRequest(r *http.Request) bool {
+	if os.Getenv("SECURE_COOKIE") == "true" {
+		return true
+	}
+	if r != nil && r.Header.Get("X-Forwarded-Proto") == "https" {
+		return true
+	}
+	return false
+}
+
 // setTokenCookie sets a secure auth cookie
 func setTokenCookie(w http.ResponseWriter, token string) {
+	setTokenCookieWithRequest(w, nil, token)
+}
+
+// setTokenCookieWithRequest sets cookie with request context for Secure flag
+func setTokenCookieWithRequest(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "token",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   false,
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400,
 	})
@@ -222,6 +238,39 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// RequireAuth middleware - returns 401 if not authenticated
+func RequireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var tokenStr string
+		if cookie, err := r.Cookie("token"); err == nil {
+			tokenStr = cookie.Value
+		}
+		if tokenStr == "" {
+			if auth := r.Header.Get("Authorization"); len(auth) > 7 && auth[:7] == "Bearer " {
+				tokenStr = auth[7:]
+			}
+		}
+		if tokenStr == "" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := ValidateToken(tokenStr)
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if _, err := validateClaimsAgainstDB(claims); err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		tryAutoRenew(w, claims)
+		ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
+			UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
+		})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

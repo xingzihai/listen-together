@@ -5,13 +5,19 @@ let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'seq
 let trackLoading = false, pendingPlay = null;
 let deviceKicked = false;
 
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 function renderAudiencePanel() {
     const list = $('audienceList');
     if (!list) return;
     list.innerHTML = roomUsers.map(u => {
         const hostBadge = u.isHost ? '<span class="host-badge">👑</span>' : '';
-        const kickBtn = (isHost && !u.isHost) ? `<button class="btn-kick" data-cid="${u.clientID}">踢出</button>` : '';
-        return `<div class="audience-row"><span class="audience-info">${hostBadge}${u.username} <span class="audience-uid">(UID:${String(u.uid).padStart(5,'0')})</span></span>${kickBtn}</div>`;
+        const kickBtn = (isHost && !u.isHost) ? `<button class="btn-kick" data-cid="${escapeHtml(u.clientID)}">踢出</button>` : '';
+        return `<div class="audience-row"><span class="audience-info">${hostBadge}${escapeHtml(u.username)} <span class="audience-uid">(UID:${String(u.uid).padStart(5,'0')})</span></span>${kickBtn}</div>`;
     }).join('');
     list.querySelectorAll('.btn-kick').forEach(btn => {
         btn.onclick = () => {
@@ -30,7 +36,7 @@ function renderAvatarBar() {
     bar.innerHTML = show.map(u => {
         const initial = (u.username || '?')[0].toUpperCase();
         const cls = u.isHost ? 'avatar-bubble owner' : 'avatar-bubble';
-        return `<div class="${cls}"><span>${initial}</span><span class="avatar-tooltip">${u.isHost ? '👑 ' : ''}${u.username}</span></div>`;
+        return `<div class="${cls}"><span>${escapeHtml(initial)}</span><span class="avatar-tooltip">${u.isHost ? '👑 ' : ''}${escapeHtml(u.username)}</span></div>`;
     }).join('');
     if (overflow > 0) bar.innerHTML += `<div class="avatar-bubble overflow">+${overflow}</div>`;
     bar.onclick = () => { $('audiencePanel').classList.toggle('hidden'); renderAudiencePanel(); };
@@ -280,7 +286,7 @@ function updatePlayButton(playing) {
 // Auto-connect on page load for single-device enforcement
 window.addEventListener('load', () => {
     const hash = location.hash.replace('#', '').trim();
-    if (hash.length === 6) {
+    if (hash.length === 8) {
         const checkAuth = setInterval(() => {
             if (window.Auth && window.Auth.user) {
                 clearInterval(checkAuth);
@@ -308,7 +314,7 @@ function ensureWS(cb) {
 $('createBtn').onclick = () => ensureWS(() => ws.send(JSON.stringify({ type: 'create' })));
 $('joinBtn').onclick = () => {
     const code = $('roomCodeInput').value.trim().toUpperCase();
-    if (code.length !== 6) return alert('请输入6位房间码');
+    if (code.length !== 8) return alert('请输入8位房间码');
     ensureWS(() => ws.send(JSON.stringify({ type: 'join', roomCode: code })));
 };
 $('roomCodeInput').onkeypress = e => { if (e.key === 'Enter') $('joinBtn').click(); };
@@ -389,7 +395,7 @@ function renderPlaylist() {
     container.innerHTML = playlistItems.map((item, i) => {
         const active = i === currentTrackIndex ? ' active' : '';
         const delBtn = isHost ? `<button class="pi-del" data-id="${item.id}">✕</button>` : '';
-        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-info"><div class="pi-title">${item.title || item.original_name}</div><div class="pi-meta">${item.artist || ''} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
+        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-info"><div class="pi-title">${escapeHtml(item.title || item.original_name)}</div><div class="pi-meta">${escapeHtml(item.artist || '')} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
     }).join('');
     container.querySelectorAll('.pi-del').forEach(btn => {
         btn.onclick = async (e) => {
@@ -551,7 +557,7 @@ $('addFromLibBtn').onclick = async () => {
         const res = await fetch('/api/library/files?accessible=true', {credentials:'include'});
         const files = await res.json();
         if (!files || !files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
-        list.innerHTML = files.map(f => `<div class="library-item"><div class="li-info"><div class="li-title">${f.title}</div><div class="li-meta">${f.artist || ''} · ${formatTime(f.duration)}${f.owner_name ? ' · ' + f.owner_name : ''}</div></div><button class="btn-add" data-id="${f.id}">添加</button></div>`).join('');
+        list.innerHTML = files.map(f => `<div class="library-item"><div class="li-info"><div class="li-title">${escapeHtml(f.title)}</div><div class="li-meta">${escapeHtml(f.artist || '')} · ${formatTime(f.duration)}${f.owner_name ? ' · ' + escapeHtml(f.owner_name) : ''}</div></div><button class="btn-add" data-id="${f.id}">添加</button></div>`).join('');
         list.querySelectorAll('.btn-add').forEach(btn => {
             btn.onclick = async () => {
                 btn.disabled = true; btn.textContent = '...';

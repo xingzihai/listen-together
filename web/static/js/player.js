@@ -270,6 +270,11 @@ class AudioPlayer {
             // Start: first seg at exact ctxStartTime, others overlap slightly
             const startAt = this._isFirstSeg ? t : Math.max(0, t - overlap);
             source.start(startAt, off);
+            // Clean up ended sources
+            source.onended = () => {
+                const idx = this.sources.indexOf(source);
+                if (idx > -1) this.sources.splice(idx, 1);
+            };
             this.sources.push(source);
             this._nextSegTime = t + dur;
             this._nextSegIdx = i + 1;

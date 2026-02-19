@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -34,6 +35,7 @@ type QualityInfo struct {
 
 // MultiQualityManifest is written as manifest.json inside the audio directory.
 type MultiQualityManifest struct {
+	mu          sync.Mutex              `json:"-"`
 	Duration    float64                 `json:"duration"`
 	SegmentTime int                     `json:"segment_time"`
 	Qualities   map[string]*QualityInfo `json:"qualities"`
@@ -63,8 +65,17 @@ type ProbeResult struct {
 	IsLossless    bool
 }
 
+// sanitizeInputPath ensures path doesn't start with - to prevent ffmpeg argument injection
+func sanitizeInputPath(path string) string {
+	if strings.HasPrefix(path, "-") {
+		return "./" + path
+	}
+	return path
+}
+
 // ProbeAudio detects bitrate and format of an audio file.
 func ProbeAudio(inputPath string) (*ProbeResult, error) {
+	inputPath = sanitizeInputPath(inputPath)
 	// Get bitrate
 	cmdBr := exec.Command("ffprobe", "-v", "error",
 		"-select_streams", "a:0",
@@ -123,6 +134,7 @@ func QualityNames(probe *ProbeResult) []string {
 
 // segmentOneQuality runs ffmpeg to segment into one quality tier.
 func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, error) {
+	inputPath = sanitizeInputPath(inputPath)
 	dir := filepath.Join(outputDir, q.DirSuffix)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
@@ -226,11 +238,13 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 					log.Printf("background segment %s failed: %v", q.Name, err)
 					continue
 				}
+				manifest.mu.Lock()
 				manifest.Qualities[q.Name] = &QualityInfo{
 					Format:   q.Codec,
 					Bitrate:  parseBitrateInt(q.Bitrate),
 					Segments: s,
 				}
+				manifest.mu.Unlock()
 				writeManifest(outputDir, manifest)
 				log.Printf("background segment %s done: %d segments", q.Name, len(s))
 			}
@@ -247,6 +261,8 @@ func parseBitrateInt(s string) int {
 }
 
 func writeManifest(outputDir string, m *MultiQualityManifest) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	data, _ := json.MarshalIndent(m, "", "  ")
 	os.WriteFile(filepath.Join(outputDir, "manifest.json"), data, 0644)
 }
@@ -307,6 +323,7 @@ func ProcessAudio(inputPath, outputDir, filename string) (*Manifest, error) {
 }
 
 func getAudioDuration(filePath string) (float64, error) {
+	filePath = sanitizeInputPath(filePath)
 	cmd := exec.Command("ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",

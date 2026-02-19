@@ -83,7 +83,7 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
-	conn, err := sql.Open("sqlite3", path+"?_journal_mode=WAL")
+	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +314,7 @@ func (d *DB) init() error {
 			if err != nil {
 				return fmt.Errorf("seed owner: %w", err)
 			}
-			log.Printf("Default owner account created (%s/%s) uid=1 suid=1", ownerUsername, ownerPassword)
+			log.Printf("Default owner account created (%s) uid=1 suid=1 - 请尽快修改默认密码", ownerUsername)
 		}
 	}
 	return nil

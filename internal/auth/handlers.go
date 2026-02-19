@@ -27,6 +27,8 @@ type authRequest struct {
 	NewPassword string `json:"new_password"`
 }
 
+const maxRateLimitEntries = 10000
+
 // --- Rate limiter ---
 type rateLimiter struct {
 	mu      sync.Mutex
@@ -51,13 +53,48 @@ func (rl *rateLimiter) allow(ip string, maxCount int, window time.Duration) bool
 		rl.records[ip] = valid
 		return false
 	}
+	// Enforce max entries limit
+	if len(rl.records) >= maxRateLimitEntries {
+		rl.cleanOldestEntries()
+	}
 	rl.records[ip] = append(valid, now)
 	return true
 }
 
+func (rl *rateLimiter) cleanOldestEntries() {
+	// Remove 10% of entries (oldest by last access)
+	toRemove := len(rl.records) / 10
+	if toRemove < 1 {
+		toRemove = 1
+	}
+	type entry struct {
+		ip   string
+		last time.Time
+	}
+	entries := make([]entry, 0, len(rl.records))
+	for ip, times := range rl.records {
+		if len(times) > 0 {
+			entries = append(entries, entry{ip, times[len(times)-1]})
+		}
+	}
+	// Sort by oldest last access
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].last.Before(entries[i].last) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	for i := 0; i < toRemove && i < len(entries); i++ {
+		delete(rl.records, entries[i].ip)
+	}
+}
+
 func getClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.Split(fwd, ",")[0]
+		parts := strings.Split(fwd, ",")
+		// Take the last IP (most recently added by trusted proxy)
+		return strings.TrimSpace(parts[len(parts)-1])
 	}
 	if real := r.Header.Get("X-Real-IP"); real != "" {
 		return real
@@ -106,7 +143,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, user.SessionVersion)
-	setTokenCookie(w, token)
+	setTokenCookieWithRequest(w, r, token)
 	jsonOK(w, map[string]interface{}{"user": user, "token": token})
 }
 
@@ -130,7 +167,7 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	sessVer := user.SessionVersion
 	GlobalRoleCache.Invalidate(user.ID)
 	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, sessVer)
-	setTokenCookie(w, token)
+	setTokenCookieWithRequest(w, r, token)
 	// Check if owner with default password
 	needChangePassword := user.Role == "owner" && CheckPassword(user.PasswordHash, "admin123")
 	jsonOK(w, map[string]interface{}{"user": user, "token": token, "needChangePassword": needChangePassword})
@@ -139,7 +176,7 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandlers) Logout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: "token", Value: "", Path: "/",
-		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteLaxMode,
 		MaxAge: -1, Expires: time.Unix(0, 0),
 	})
 	jsonOK(w, map[string]string{"message": "ok"})
@@ -201,7 +238,7 @@ func (h *AuthHandlers) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, _ := GenerateToken(user.UserID, user.Username, user.Role, updatedUser.PasswordVersion, updatedUser.SessionVersion)
-	setTokenCookie(w, token)
+	setTokenCookieWithRequest(w, r, token)
 	jsonOK(w, map[string]string{"message": "ok"})
 }
 
@@ -243,7 +280,7 @@ func (h *AuthHandlers) ChangeUsername(w http.ResponseWriter, r *http.Request) {
 	}
 	GlobalRoleCache.Invalidate(user.UserID)
 	token, _ := GenerateToken(user.UserID, req.NewUsername, user.Role, dbUser.PasswordVersion, dbUser.SessionVersion)
-	setTokenCookie(w, token)
+	setTokenCookieWithRequest(w, r, token)
 	jsonOK(w, map[string]interface{}{"message": "ok", "username": req.NewUsername})
 }
 
