@@ -214,7 +214,8 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.init(this._sampleRate || undefined); this.stop();
+        this.stop(); // stop FIRST to clean all old sources
+        this.init(this._sampleRate || undefined);
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
@@ -234,25 +235,9 @@ class AudioPlayer {
         }
         if (!this.isPlaying) return;
 
-        // Re-snapshot AFTER async preload so elapsed calculation is accurate
+        // Always use fallback path: calculate elapsed from server time
+        // This avoids the scheduledPlay race condition where old sources overlap
         const ctxNow = this.ctx.currentTime;
-        const wallNow = performance.now();
-
-        // Try hardware-level scheduling if scheduledAt is still in the future
-        if (scheduledAt) {
-            const localScheduled = scheduledAt - window.clockSync.offset;
-            const waitMs = localScheduled - Date.now();
-            if (waitMs > 2 && waitMs < 3000) {
-                // Convert wait to ctx timeline
-                const ctxTarget = ctxNow + waitMs / 1000;
-                this.startOffset = this.serverPlayPosition;
-                this.startTime = ctxTarget;
-                this._startLookahead(this.serverPlayPosition, ctxTarget);
-                this._log('scheduledPlay', { waitMs: +waitMs.toFixed(0), lat: +((this._outputLatency||0)*1000).toFixed(1) });
-                return;
-            }
-        }
-        // Fallback: calculate how much time has passed since scheduledAt/serverTime
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
@@ -408,7 +393,7 @@ class AudioPlayer {
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
         // Cooldown: skip drift correction for 3s after playAtPosition
-        if (this._playStartedAt && performance.now() - this._playStartedAt < 3000) return 0;
+        if (this._playStartedAt && performance.now() - this._playStartedAt < 1500) return 0;
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
         // Check if rate correction period has ended (backup recovery)
