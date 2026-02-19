@@ -35,6 +35,7 @@ class AudioPlayer {
         this._workletTotalPlayed = 0; this._workletConsumed = 0; this._workletSampleRate = 48000;
         this._feederTimer = null; this._feederNextSeg = 0;
         this._feederSegOffset = 0; this._feederGen = 0; this._feederStartPos = 0; this._feeding = false;
+        this._consumedBaseline = 0;
         this._fedSinceLastStats = 0;
         this._miniBuffer = new MedianBuffer(40);
         this._shortBuffer = new MedianBuffer(100);
@@ -256,6 +257,8 @@ class AudioPlayer {
 
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
         this._fedFrames = 0; this._fedSinceLastStats = 0;
+        this._workletConsumed = 0; this._workletBuffered = 0; this._workletTotalPlayed = 0;
+        this._consumedBaseline = 0;
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -265,6 +268,7 @@ class AudioPlayer {
         }
         if (!this.isPlaying || gen !== this._feederGen) return;
 
+        // Calculate position for segment selection (before feed)
         let actualPos = this.serverPlayPosition;
         if (scheduledAt) {
             const waitMs = (scheduledAt - window.clockSync.offset) - Date.now();
@@ -273,10 +277,11 @@ class AudioPlayer {
                 if (!this.isPlaying || gen !== this._feederGen) return;
             }
         }
-        // Always recalculate elapsed after any wait
         const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
         actualPos = this.serverPlayPosition + elapsed;
 
+        // Anchor = data start position. consumed starts from 0.
+        // Feed delay causes fixed negative drift (~200-500ms) but soft correction is disabled.
         this._feederStartPos = actualPos;
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
@@ -284,12 +289,6 @@ class AudioPlayer {
         await this._feedSegments(gen, 2);
         if (!this.isPlaying || gen !== this._feederGen) return;
 
-        // Re-anchor AFTER feed: data is now in worklet, minimize lag between anchor and first output
-        const elapsedAfterFeed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
-        this._feederStartPos = this.serverPlayPosition + elapsedAfterFeed;
-        this._workletConsumed = 0;
-        this._lastStatsConsumed = 0;
-        this._lastStatsTime = performance.now();
         this._playStartedAt = performance.now();
 
         this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
@@ -393,7 +392,7 @@ class AudioPlayer {
         if ((this._longBuffer.full() && Math.abs(longMedian) > 2000 && Math.abs(ageMs) > 5) ||
             (this._shortBuffer.full() && Math.abs(shortMedian) > 5000 && Math.abs(ageMs) > 5) ||
             (this._miniBuffer.full() && Math.abs(miniMedian) > 50000 && Math.abs(ageMs) > 20) ||
-            (Math.abs(ageMs) > 500)) {
+            (Math.abs(ageMs) > 1000)) {
             this._log('hardSync', { age: +ageMs.toFixed(1) });
             // Cooldown: no hard sync within 3 seconds
             if (performance.now() - this._lastHardSync < 3000) return;
@@ -445,13 +444,15 @@ class AudioPlayer {
         this.uploadLog();
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
         this._fedFrames = 0; this._fedSinceLastStats = 0;
+        this._workletConsumed = 0; this._workletBuffered = 0; this._workletTotalPlayed = 0;
+        this._consumedBaseline = 0;
         this._miniBuffer.clear(); this._shortBuffer.clear(); this._longBuffer.clear();
     }
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
         const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        const pos = this._feederStartPos + this._workletConsumed / sr;
+        const pos = this._feederStartPos + (this._workletConsumed - (this._consumedBaseline || 0)) / sr;
         return this.duration > 0 ? Math.min(pos, this.duration) : pos;
     }
 
