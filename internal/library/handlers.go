@@ -349,7 +349,6 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 		"segments":     qi.Segments,
 		"duration":     manifest.Duration,
 		"segment_time": manifest.SegmentTime,
-		"sample_rate":  manifest.SampleRate,
 		"owner_id":     af.OwnerID,
 		"audio_uuid":   af.Filename,
 	})
@@ -397,8 +396,6 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
 	if quality == "lossless" {
 		w.Header().Set("Content-Type", "audio/flac")
-	} else if strings.HasSuffix(filename, ".webm") {
-		w.Header().Set("Content-Type", "audio/webm")
 	} else {
 		w.Header().Set("Content-Type", "audio/mp4")
 	}

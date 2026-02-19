@@ -3,9 +3,6 @@ class AudioPlayer {
         this.ctx = null; this.gainNode = null; this.segments = []; this.buffers = new Map();
         this.sources = []; this.isPlaying = false; this.startTime = 0; this.startOffset = 0;
         this.lastPosition = 0; this.duration = 0; this.segmentTime = 5; this.roomCode = '';
-        // Debug log ring buffer — stores last 200 events, accessible via window.audioPlayer.dumpLog()
-        this._logBuffer = [];
-        this._logMax = 200;
         this.serverPlayTime = 0; this.serverPlayPosition = 0;
         this.onBuffering = null;
         this._trackSegBase = null;
@@ -31,32 +28,9 @@ class AudioPlayer {
         this._rateStartTime = 0;      // ctx.currentTime when rate correction started
     }
 
-    // Structured debug log — ring buffer, call dumpLog() in console to retrieve
-    _log(event, data) {
-        const entry = { t: Date.now(), ct: this.ctx?.currentTime || 0, event, ...data };
-        this._logBuffer.push(entry);
-        if (this._logBuffer.length > this._logMax) this._logBuffer.shift();
-        console.log(`[audio] ${event}`, data || '');
-    }
-    dumpLog() { return JSON.stringify(this._logBuffer, null, 2); }
-    copyLog() { navigator.clipboard?.writeText(this.dumpLog()); console.log('Log copied to clipboard'); }
-    // Auto-upload log to server
-    uploadLog() {
-        if (!this._logBuffer.length) return;
-        fetch('/api/debug-log', { method: 'POST', headers: {'Content-Type':'application/json'}, body: this.dumpLog() }).catch(() => {});
-    }
-
-    init(sampleRate) {
-        if (this.ctx && sampleRate && this.ctx.sampleRate !== sampleRate) {
-            // Sample rate mismatch — recreate context to avoid resampling artifacts
-            this.stop();
-            this.ctx.close().catch(() => {});
-            this.ctx = null;
-            this.gainNode = null;
-        }
+    init() {
         if (!this.ctx) {
-            const opts = sampleRate ? { sampleRate } : {};
-            this.ctx = new (window.AudioContext || window.webkitAudioContext)(opts);
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
             this.gainNode = this.ctx.createGain();
             this.gainNode.connect(this.ctx.destination);
         }
@@ -76,7 +50,6 @@ class AudioPlayer {
         this._ownerID = audioInfo.ownerID || null;
         this._audioID = audioInfo.audioID || null;
         this._audioUUID = audioInfo.audioUUID || null;
-        this._sampleRate = audioInfo.sampleRate || 0;
         this._upgrading = false;
         if (this._qualities.length > 0) {
             const preferred = this._quality;
@@ -102,7 +75,6 @@ class AudioPlayer {
             this.segments = data.segments || [];
             this.segmentTime = data.segment_time || 5;
             this.duration = data.duration || this.duration;
-            if (data.sample_rate) this._sampleRate = data.sample_rate;
             if (data.owner_id) this._ownerID = data.owner_id;
             if (data.audio_uuid) this._audioUUID = data.audio_uuid;
         } catch (e) { console.error('loadQualitySegments:', e); }
@@ -214,18 +186,19 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.init(this._sampleRate || undefined);
-        this.stop();
+        this.init(); this.stop();
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
-        this._mergeChunkCount = 0;
         this._resyncGen++;
         this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
-        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality, ctxSR: this.ctx.sampleRate, targetSR: this._sampleRate || 'none' });
-        this._playStartedAt = performance.now();
+
+        // Capture ctx↔wall clock relationship ONCE before any async work
+        // This avoids drift between the two clocks during preload
+        const ctxSnap = this.ctx.currentTime;
+        const wallSnap = performance.now();
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -235,22 +208,24 @@ class AudioPlayer {
         }
         if (!this.isPlaying) return;
 
-        const ctxNow = this.ctx.currentTime;
+        // Use the snapshot to convert wall time → ctx time accurately
+        const ctxNow = ctxSnap + (performance.now() - wallSnap) / 1000;
 
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - Date.now();
             if (waitMs > 2 && waitMs < 3000) {
+                // Convert wait to ctx timeline
                 const ctxTarget = ctxNow + waitMs / 1000;
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
                 this._startLookahead(this.serverPlayPosition, ctxTarget);
-                this._log('scheduledPlay', { waitMs: +waitMs.toFixed(0), lat: +((this._outputLatency||0)*1000).toFixed(1) });
+                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${((this._outputLatency||0)*1000).toFixed(1)}ms`);
                 return;
             }
         }
-        // Fallback: calculate elapsed from server time
+        // Fallback: calculate how much time has passed since scheduledAt/serverTime
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
@@ -265,8 +240,6 @@ class AudioPlayer {
     // Drift correction adjusts _nextSegTime for the NEXT segment — zero glitch.
     _startLookahead(position, ctxStartTime) {
         this._stopLookahead();
-        // Auto-upload log every 30s during playback
-        this._logUploadTimer = setInterval(() => this.uploadLog(), 30000);
         const segIdx = Math.floor(position / this.segmentTime);
         const segOffset = position % this.segmentTime;
         this._nextSegIdx = segIdx;
@@ -281,59 +254,13 @@ class AudioPlayer {
 
     _stopLookahead() {
         if (this._lookaheadTimer) { clearInterval(this._lookaheadTimer); this._lookaheadTimer = null; }
-        if (this._logUploadTimer) { clearInterval(this._logUploadTimer); this._logUploadTimer = null; }
-    }
-
-    // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
-    // Only trims Opus pre-skip for non-lossless formats
-    _mergeBuffers(bufferList, startOffset) {
-        if (!bufferList.length) return null;
-        const sampleRate = bufferList[0].sampleRate;
-        const numChannels = bufferList[0].numberOfChannels;
-        // Only trim Opus pre-skip for non-lossless (Opus/WebM) formats
-        const isLossless = this._actualQuality === 'lossless';
-        const OPUS_PRESKIP = isLossless ? 0 : Math.round(312 * sampleRate / 48000);
-        // Calculate per-buffer ranges [skipStart, usableEnd]
-        const ranges = bufferList.map((buf, i) => {
-            let skipStart = 0;
-            if (i === 0) {
-                skipStart = Math.round(startOffset * sampleRate);
-            } else if (OPUS_PRESKIP > 0) {
-                skipStart = Math.min(OPUS_PRESKIP, buf.length);
-            }
-            let usableEnd = buf.length;
-            // Only trim trailing silence for non-lossless
-            if (!isLossless && OPUS_PRESKIP > 0) {
-                const data = buf.getChannelData(0);
-                let end = data.length;
-                while (end > 0 && Math.abs(data[end - 1]) < 1e-6) end--;
-                usableEnd = Math.max(end, buf.length - OPUS_PRESKIP);
-            }
-            if (usableEnd <= skipStart) usableEnd = buf.length;
-            return { skipStart, usableEnd };
-        });
-        let totalSamples = 0;
-        for (const r of ranges) totalSamples += (r.usableEnd - r.skipStart);
-        if (totalSamples <= 0) return null;
-        const merged = this.ctx.createBuffer(numChannels, totalSamples, sampleRate);
-        for (let ch = 0; ch < numChannels; ch++) {
-            const out = merged.getChannelData(ch);
-            let pos = 0;
-            for (let i = 0; i < bufferList.length; i++) {
-                const src = bufferList[i].getChannelData(ch);
-                const { skipStart, usableEnd } = ranges[i];
-                out.set(src.subarray(skipStart, usableEnd), pos);
-                pos += usableEnd - skipStart;
-            }
-        }
-        return merged;
     }
 
     async _scheduleAhead() {
         if (!this.isPlaying || this._scheduling) return;
         this._scheduling = true;
         try {
-        // Check if rate correction period has ended
+        // Check if rate correction period has ended (backup for setTimeout throttling)
         if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
             const actualRateTime = this.ctx.currentTime - this._rateStartTime;
             const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
@@ -344,59 +271,62 @@ class AudioPlayer {
                 if (source.playbackRate) source.playbackRate.value = 1.0;
             });
             this._rateCorrectingUntil = 0;
-            this._log('rateRestored', { via: 'scheduler' });
+            console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
         }
-        const LOOKAHEAD = 2.0;
-        const MERGE_COUNT = this._isFirstSeg ? 1 : 3; // first segment plays immediately, then merge 3
-        const preloadCount = this._actualQuality === 'lossless' ? 2 : 4;
-
+        const LOOKAHEAD = 1.5; // schedule segments up to 1.5s into the future
+        const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
-            // Collect up to MERGE_COUNT consecutive segments to merge
-            const startIdx = this._nextSegIdx;
-            const endIdx = Math.min(startIdx + MERGE_COUNT, this.segments.length);
-            const bufferList = [];
-            for (let i = startIdx; i < endIdx; i++) {
-                if (!this.buffers.has(i)) {
-                    if (this.onBuffering) this.onBuffering(true);
-                    await this.loadSegment(i);
-                    if (this.onBuffering) this.onBuffering(false);
-                    if (!this.isPlaying) return;
-                }
-                const buf = this.buffers.get(i);
-                if (!buf) break;
-                bufferList.push(buf);
+            const i = this._nextSegIdx;
+            if (!this.buffers.has(i)) {
+                if (this.onBuffering) this.onBuffering(true);
+                await this.loadSegment(i);
+                if (this.onBuffering) this.onBuffering(false);
+                if (!this.isPlaying) return;
             }
-            if (!bufferList.length) break;
-
-            const off = this._isFirstSeg ? this._firstSegOffset : 0;
-            const merged = this._mergeBuffers(bufferList, off);
-            if (!merged) break;
-
+            const buffer = this.buffers.get(i);
+            if (!buffer) break;
             const source = this.ctx.createBufferSource();
-            source.buffer = merged;
-            source.connect(this.gainNode);
+            source.buffer = buffer;
+            const gain = this.ctx.createGain();
+            source.connect(gain);
+            gain.connect(this.gainNode);
+            const off = this._isFirstSeg ? this._firstSegOffset : 0;
+            const dur = buffer.duration - off;
             const t = this._nextSegTime;
+            const overlap = 0.02; // 20ms crossfade — eliminates clicks on mobile
+            // Calculate effective duration considering playbackRate
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
-            const effectiveDur = merged.duration / effectiveRate;
-
+            const effectiveDur = dur / effectiveRate;
+            const effectiveOverlap = overlap / effectiveRate;
+            // Crossfade envelope: equal-power style to avoid volume dips at boundaries
+            if (!this._isFirstSeg) {
+                // Fade in over overlap period
+                gain.gain.setValueAtTime(0.0001, Math.max(0, t - effectiveOverlap));
+                gain.gain.exponentialRampToValueAtTime(1, t);
+            }
+            const endTime = t + effectiveDur;
+            // Fade out over overlap period
+            gain.gain.setValueAtTime(1, Math.max(0, endTime - effectiveOverlap));
+            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
+            // Start: first seg at exact ctxStartTime, others overlap slightly
+            const startAt = this._isFirstSeg ? t : Math.max(0, t - effectiveOverlap);
+            // Set playbackRate BEFORE start() for immediate effect
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
-            source.start(t);
-            this._log('chunkScheduled', { segs: `${startIdx}-${startIdx+bufferList.length-1}`, t: +t.toFixed(3), dur: +effectiveDur.toFixed(3), merged: +(merged.duration).toFixed(3), rate: effectiveRate, first: this._isFirstSeg });
+            source.start(startAt, off);
+            // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
                 if (idx > -1) this.sources.splice(idx, 1);
             };
             this.sources.push(source);
             this._nextSegTime = t + effectiveDur;
-            this._nextSegIdx = startIdx + bufferList.length;
+            this._nextSegIdx = i + 1;
             this._isFirstSeg = false;
             // Preload upcoming segments
-            if (this._nextSegIdx < this.segments.length) {
-                this.preloadSegments(this._nextSegIdx, preloadCount);
-            }
+            if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
         }
         } finally { this._scheduling = false; }
     }
@@ -405,8 +335,6 @@ class AudioPlayer {
     // Three-tier correction: soft (15-50ms), playbackRate (50-300ms), hard (>300ms)
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
-        // Cooldown: skip drift correction for 3s after playAtPosition
-        if (this._playStartedAt && performance.now() - this._playStartedAt < 1500) return 0;
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
         // Check if rate correction period has ended (backup recovery)
@@ -420,7 +348,7 @@ class AudioPlayer {
                 if (source.playbackRate) source.playbackRate.value = 1.0;
             });
             this._rateCorrectingUntil = 0;
-            this._log('rateRestored', { via: 'correctDrift' });
+            console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
         }
 
         // Debounce: max 4 corrections per second
@@ -466,13 +394,13 @@ class AudioPlayer {
             }
         }
         const absDrift = Math.abs(drift);
-        // Log every drift measurement for diagnostics
-        this._log('drift', { d: +(drift*1000).toFixed(1), exp: +expectedPos.toFixed(3), act: +actualPos.toFixed(3), acc: +(this._driftOffset*1000).toFixed(1), sources: this.sources.length });
 
-        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime for next merged chunk
+        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime only, don't touch startTime
         if (absDrift > 0.005 && absDrift <= 0.05) {
+            // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
             if (Math.abs(this._driftOffset + drift) > 0.5) {
-                this._log('softCorrectionCapped', { accum: +(this._driftOffset*1000).toFixed(0) });
+                console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
+                // 直接执行硬重置，不依赖 fall-through
                 this._driftOffset = 0;
                 if (!this._resyncing) {
                     this._resyncing = true;
@@ -481,39 +409,54 @@ class AudioPlayer {
                 }
                 return Math.round(drift * 1000);
             }
+            // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
+            // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
             this._nextSegTime += drift;
             this._driftOffset += drift;
+            // Don't update _softCorrectionTotal — correction affects future scheduling,
+            // not current position. getCurrentTime() stays pure measurement.
             this._resyncBackoff = 1500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 2: playbackRate correction (50-150ms) — immediate effect on playing sources
-        if (absDrift > 0.05 && absDrift <= 0.15) {
+        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 2-3 seconds
+        if (absDrift > 0.05 && absDrift <= 0.3) {
+            // Dynamic rate based on drift magnitude:
+            // 50-100ms: ±2%, 100-200ms: ±3%, 200-300ms: ±5%
             let rateOffset;
-            if (absDrift <= 0.08) rateOffset = 0.005;
-            else if (absDrift <= 0.12) rateOffset = 0.008;
-            else rateOffset = 0.01;
+            if (absDrift <= 0.1) rateOffset = 0.02;
+            else if (absDrift <= 0.2) rateOffset = 0.03;
+            else rateOffset = 0.05;
+            // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
-            const adjustedDuration = Math.min(3, absDrift / rateOffset);
+            const neededCatchUp = absDrift;
+            const adjustedDuration = Math.min(3, neededCatchUp / rateOffset);
 
-            this._log('tier2Rate', { drift: +(drift*1000).toFixed(0), rate, dur: +adjustedDuration.toFixed(1) });
+            console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
+
+            // Record start time for offset compensation
             this._rateStartTime = this.ctx.currentTime;
+
+            // Set playbackRate on all active AudioBufferSourceNodes
             this._currentPlaybackRate = rate;
             this.sources.forEach(source => {
                 if (source.playbackRate) source.playbackRate.value = rate;
             });
             this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
+
+            // Clear any existing timer (keep for cleanup, but recovery is via scheduler)
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = null;
+
             this._resyncBackoff = 1500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 3: Hard resync (>150ms) — lowered threshold since merged chunks reduce soft correction opportunities
-        if (absDrift > 0.15) {
+        // Tier 3: Hard resync (>300ms) — stop and restart with exponential backoff
+        if (absDrift > 0.3) {
             const backoff = this._resyncBackoff || 1500;
             if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
-            this._log('hardResync', { drift: +(drift*1000).toFixed(0), backoff });
+            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
             this._lastResync = Date.now();
             this._resyncBackoff = Math.min(backoff * 2, 10000);
             if (!this._resyncing) {
@@ -530,7 +473,6 @@ class AudioPlayer {
         if (this.isPlaying) this.lastPosition = this.getCurrentTime();
         this.isPlaying = false;
         this._stopLookahead();
-        this.uploadLog(); // auto-upload debug log on stop
         this._upgrading = false;
         this._scheduling = false;
         // Clear playbackRate correction
