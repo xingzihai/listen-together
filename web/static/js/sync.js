@@ -73,20 +73,20 @@ class ClockSync {
             this._lastNetType = net;
         }
 
-        // Detect offset jump > 10ms: accelerate sync frequency
-        if (this.synced && this.samples.length > 0) {
-            const lastOffset = this.samples[this.samples.length - 1].offset;
-            if (Math.abs(offset - lastOffset) > 10) {
-                this._scheduleNext(); // Reset to faster interval
-            }
-        }
-
         if (rtt > 1000) return;
         if (this.rtt < Infinity && rtt > this.rtt * 2.5) return;
 
         const offset = msg.serverTime - (this._pendingWall + rtt / 2);
         this.samples.push({ offset, rtt, ts: performance.now() });
         if (this.samples.length > this.maxSamples) this.samples.shift();
+
+        // Detect offset jump > 10ms: accelerate sync frequency
+        if (this.synced && this.samples.length > 1) {
+            const lastOffset = this.samples[this.samples.length - 2].offset;
+            if (Math.abs(offset - lastOffset) > 10) {
+                this._scheduleNext(); // Reset to faster interval
+            }
+        }
 
         // Expire old samples (10s — only keep very fresh data)
         const cutoff = performance.now() - 10000;

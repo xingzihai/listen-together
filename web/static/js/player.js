@@ -24,6 +24,7 @@ class AudioPlayer {
         // playbackRate correction state
         this._rateCorrectingUntil = 0; // ctx.currentTime when rate correction ends
         this._rateCorrectionTimer = null;
+        this._currentPlaybackRate = 1.0; // current playbackRate for new sources
     }
 
     init() {
@@ -275,6 +276,10 @@ class AudioPlayer {
             // Start: first seg at exact ctxStartTime, others overlap slightly
             const startAt = this._isFirstSeg ? t : Math.max(0, t - overlap);
             source.start(startAt, off);
+            // Inherit current playbackRate if rate correction is active
+            if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
+                source.playbackRate.value = this._currentPlaybackRate;
+            }
             // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
@@ -329,27 +334,27 @@ class AudioPlayer {
         if (absDrift > 0.05 && absDrift <= 0.3) {
             // Calculate rate: need to cover 'drift' over ~2.5 seconds
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
-            const catchUpDuration = 2.5; // seconds
             const rate = drift < 0 ? 1.02 : 0.98; // ±2% adjustment
-            const actualCatchUp = Math.abs(rate - 1.0) * catchUpDuration; // how much we'll catch up
             const neededCatchUp = absDrift;
             const adjustedDuration = Math.min(3, neededCatchUp / Math.abs(rate - 1.0));
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
-            // Set playbackRate on AudioContext destination (affects all sources)
-            if (this.ctx.destination && this.ctx.destination.playbackRate) {
-                this.ctx.destination.playbackRate.value = rate;
-            }
-            // For Web Audio, playbackRate is on source nodes; we need to track and restore
+            // Set playbackRate on all active AudioBufferSourceNodes
+            this._currentPlaybackRate = rate;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = rate;
+            });
             this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
 
             // Clear any existing timer
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = setTimeout(() => {
-                if (this.ctx.destination && this.ctx.destination.playbackRate) {
-                    this.ctx.destination.playbackRate.value = 1.0;
-                }
+                // Restore playbackRate to 1.0 on all active sources
+                this._currentPlaybackRate = 1.0;
+                this.sources.forEach(source => {
+                    if (source.playbackRate) source.playbackRate.value = 1.0;
+                });
                 this._rateCorrectingUntil = 0;
                 this._rateCorrectionTimer = null;
                 console.log('[sync] playbackRate restored to 1.0');
@@ -384,6 +389,7 @@ class AudioPlayer {
         // Clear playbackRate correction
         if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
         this._rateCorrectingUntil = 0;
+        this._currentPlaybackRate = 1.0;
         this.sources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
         this.sources = [];
         this._driftOffset = 0;
@@ -393,7 +399,7 @@ class AudioPlayer {
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
-        return this.startOffset + Math.max(0, elapsed);
+        return this.startOffset + Math.max(0, elapsed) + (this._softCorrectionTotal || 0);
     }
 
     setVolume(v) { if (this.gainNode) this.gainNode.gain.value = v; }

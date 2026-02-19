@@ -56,6 +56,10 @@
         </div>
     </div>
     <script>
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
     (function() {
         function pad(n, len) { return String(n).padStart(len, '0'); }
         function fmtTime(t) { return new Date(t).toLocaleString('zh-CN'); }
@@ -79,16 +83,16 @@
                 const rl = u.role==='owner' ? '👑 站长' : '⭐ 管理员';
                 const rc = u.role==='owner' ? 'role-owner' : 'role-admin';
                 let acts = '';
-                if (u.role !== 'owner') acts = `<button class="btn-sm" onclick="doRole(${u.uid},'user')">降级</button> <button class="btn-sm btn-danger" onclick="doDel(${u.uid},'${u.username}')">删除</button>`;
-                aT.innerHTML += `<tr><td class="suid-cell">${pad(u.suid,3)}</td><td class="uid-cell">${pad(u.uid,5)}</td><td>${u.username}</td><td><span class="role-badge ${rc}">${rl}</span></td><td>${fmtTime(u.created_at)}</td><td class="admin-actions">${acts}</td></tr>`;
+                if (u.role !== 'owner') acts = `<button class="btn-sm" onclick="doRole(${u.uid},'user')">降级</button> <button class="btn-sm btn-danger" data-uid="${u.uid}" data-username="${escapeHtml(u.username)}" onclick="doDel(this)">删除</button>`;
+                aT.innerHTML += `<tr><td class="suid-cell">${pad(u.suid,3)}</td><td class="uid-cell">${pad(u.uid,5)}</td><td>${escapeHtml(u.username)}</td><td><span class="role-badge ${rc}">${rl}</span></td><td>${fmtTime(u.created_at)}</td><td class="admin-actions">${acts}</td></tr>`;
             });
             if (!users.length) uT.innerHTML = '<tr><td colspan="4" class="admin-empty">暂无</td></tr>';
             users.forEach(u => {
-                uT.innerHTML += `<tr><td class="uid-cell">${pad(u.uid,5)}</td><td>${u.username}</td><td>${fmtTime(u.created_at)}</td><td class="admin-actions"><button class="btn-sm" onclick="doRole(${u.uid},'admin')">升为管理员</button> <button class="btn-sm btn-danger" onclick="doDel(${u.uid},'${u.username}')">删除</button></td></tr>`;
+                uT.innerHTML += `<tr><td class="uid-cell">${pad(u.uid,5)}</td><td>${escapeHtml(u.username)}</td><td>${fmtTime(u.created_at)}</td><td class="admin-actions"><button class="btn-sm" onclick="doRole(${u.uid},'admin')">升为管理员</button> <button class="btn-sm btn-danger" data-uid="${u.uid}" data-username="${escapeHtml(u.username)}" onclick="doDel(this)">删除</button></td></tr>`;
             });
         }
         window.doRole = async (uid, role) => { const r = await api(`/api/admin/users/${uid}/role`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({role})}); if(!r.ok){const d=await r.json();alert(d.error||'失败');return;} load(); };
-        window.doDel = async (uid, name) => { if(!confirm(`确定删除 ${name}？`))return; const r=await api(`/api/admin/users/${uid}`,{method:'DELETE'}); if(!r.ok){const d=await r.json();alert(d.error||'失败');return;} load(); };
+        window.doDel = async (btn) => { const uid=btn.dataset.uid; const name=btn.dataset.username; if(!confirm(`确定删除 ${name}？`))return; const r=await api(`/api/admin/users/${uid}`,{method:'DELETE'}); if(!r.ok){const d=await r.json();alert(d.error||'失败');return;} load(); };
         document.getElementById('logoutBtn').onclick = async()=>{await fetch('/api/auth/logout',{method:'POST'});window.location.href='/';};
         (async()=>{
             const r=await api('/api/auth/me'); if(!r.ok){window.location.href='/';return;}

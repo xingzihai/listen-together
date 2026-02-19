@@ -60,6 +60,10 @@
         </div>
     </div>
 <script>
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 const fmt = s => { if(!s||isNaN(s))return'0:00'; const m=Math.floor(s/60); return m+':'+String(Math.floor(s%60)).padStart(2,'0'); };
 const fmtSize = b => b>1048576?(b/1048576).toFixed(1)+'MB':(b/1024).toFixed(0)+'KB';
 const fmtDate = d => new Date(d).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
@@ -69,7 +73,7 @@ async function loadFiles(){
     const tb=document.getElementById('myFiles'); const empty=document.getElementById('myFilesEmpty');
     if(!files||!files.length){tb.innerHTML='';empty.style.display='block';return;}
     empty.style.display='none';
-    tb.innerHTML=files.map(f=>`<tr><td>${f.title}</td><td>${f.artist||'-'}</td><td>${fmt(f.duration)}</td><td>${fmtSize(f.size)}</td><td>${fmtDate(f.created_at)}</td><td><button class="btn-del" onclick="delFile(${f.id})">🗑</button></td></tr>`).join('');
+    tb.innerHTML=files.map(f=>`<tr><td>${escapeHtml(f.title)}</td><td>${escapeHtml(f.artist||'-')}</td><td>${fmt(f.duration)}</td><td>${fmtSize(f.size)}</td><td>${fmtDate(f.created_at)}</td><td><button class="btn-del" onclick="delFile(${f.id})">🗑</button></td></tr>`).join('');
 }
 async function delFile(id){
     if(!confirm('确定删除？'))return;
