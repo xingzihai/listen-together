@@ -15,12 +15,14 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
         this._playedFrames = 0;
         this._totalPlayedFrames = 0;
         this._totalConsumedFrames = 0;
+        this._totalDroppedFrames = 0;
         this._reportCounter = 0;
         this._reportInterval = Math.ceil(sampleRate / 10); // 100ms reporting
         // Fade-out state for underrun smoothing
         this._lastSampleL = 0;
         this._lastSampleR = 0;
         this._fadeOutRemaining = 0;
+        this._fadeInRemaining = 0; // fade-in counter for underrun recovery
         this._FADE_OUT_LEN = 64; // ~1.3ms at 48kHz
         this.port.onmessage = (e) => this._onMessage(e.data);
     }
@@ -44,7 +46,7 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
                 const need = frames - space;
                 this._readPos = (this._readPos + need) % this._capacity;
                 this._buffered -= need;
-                this._totalConsumedFrames += need; // account for skipped frames
+                this._totalDroppedFrames += need; // don't count in consumed (position tracking)
                 for (let i = 0; i < frames; i++) {
                     this._bufL[this._writePos] = left[i];
                     this._bufR[this._writePos] = right[i];
@@ -63,9 +65,11 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
             this._playedFrames = 0;
             this._totalPlayedFrames = 0;
             this._totalConsumedFrames = 0;
+            this._totalDroppedFrames = 0;
             this._lastSampleL = 0;
             this._lastSampleR = 0;
             this._fadeOutRemaining = 0;
+            this._fadeInRemaining = 0;
         } else if (msg.type === 'query') {
             this._doReport();
         }
@@ -94,12 +98,13 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
             } else {
                 outL.fill(0); outR.fill(0);
             }
+            this._fadeInRemaining = this._FADE_OUT_LEN; // next data block needs fade-in
             this._reportCounter += frames;
             this._maybeReport();
             return true;
         }
 
-        // Reset fade state when we have data
+        // Reset fade-out state when we have data
         this._fadeOutRemaining = this._FADE_OUT_LEN;
 
         const corrX = this._correctAfterXFrames;
@@ -145,6 +150,13 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
                 this._lastSampleL = sL; this._lastSampleR = sR;
                 outIdx++;
             }
+            // Apply fade-in gain if recovering from underrun
+            if (this._fadeInRemaining > 0) {
+                const gi = outIdx - 1;
+                const gain = 1 - (this._fadeInRemaining / this._FADE_OUT_LEN);
+                outL[gi] *= gain; outR[gi] *= gain;
+                this._fadeInRemaining--;
+            }
         }
 
         this._readPos = (this._readPos + consumed) % this._capacity;
@@ -168,6 +180,7 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
             type: 'stats', buffered: this._buffered, capacity: this._capacity,
             totalPlayedFrames: this._totalPlayedFrames,
             totalConsumedFrames: this._totalConsumedFrames,
+            totalDroppedFrames: this._totalDroppedFrames,
             sampleRate: sampleRate
         });
     }
