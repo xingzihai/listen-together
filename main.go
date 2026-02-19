@@ -327,15 +327,6 @@ func (rl *rateLimiter) cleanOldestEntries() {
 
 var joinLimiter = newRateLimiter()
 
-func getClientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.Split(fwd, ",")
-		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
-		return strings.TrimSpace(parts[0])
-	}
-	return strings.Split(r.RemoteAddr, ":")[0]
-}
-
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// --- Fix #1: Reject unauthenticated WebSocket connections ---
 	userInfo := auth.ExtractUserFromRequest(r)
@@ -353,6 +344,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	conn.SetReadLimit(65536) // 64KB, enough for all legitimate messages
 
 	clientID := generateClientID()
 	var currentRoom *room.Room
@@ -428,7 +421,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		case "join":
 			// Fix #3: Rate limit join attempts (5 per minute per IP)
-			if !joinLimiter.allow(getClientIP(r), 5, time.Minute) {
+			if !joinLimiter.allow(auth.GetClientIP(r), 5, time.Minute) {
 				safeWrite(WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
 				continue
 			}

@@ -452,6 +452,8 @@ class AudioPlayer {
             const rateElapsed = this.ctx.currentTime - this._rateStartTime;
             pos += rateElapsed * (this._currentPlaybackRate - 1.0);
         }
+        // Clamp to duration
+        if (this.duration > 0 && pos > this.duration) pos = this.duration;
         return pos;
     }
 

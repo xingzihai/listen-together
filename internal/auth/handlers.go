@@ -91,7 +91,9 @@ func (rl *rateLimiter) cleanOldestEntries() {
 	}
 }
 
-func getClientIP(r *http.Request) string {
+// GetClientIP extracts the client IP from the request.
+// Priority: X-Forwarded-For (first IP) > X-Real-IP > RemoteAddr
+func GetClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		parts := strings.Split(fwd, ",")
 		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
@@ -120,7 +122,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Rate limit: 5 per hour per IP
-	ip := getClientIP(r)
+	ip := GetClientIP(r)
 	if !regLimiter.allow(ip, 5, time.Hour) {
 		jsonError(w, "注册过于频繁，请稍后再试", 429)
 		return
@@ -154,7 +156,7 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Rate limit: 5 per minute per IP
-	ip := getClientIP(r)
+	ip := GetClientIP(r)
 	if !loginLimiter.allow(ip, 5, time.Minute) {
 		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
 		return
