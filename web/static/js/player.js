@@ -374,8 +374,6 @@ class AudioPlayer {
 
         // Also track actual playback position for display
         const actualPos = this.getCurrentTime();
-        const ageMs = (actualPos - expectedPos) * 1000;
-        const ageUs = ageMs * 1000;
 
         this._miniBuffer.add(ageUs); this._shortBuffer.add(ageUs); this._longBuffer.add(ageUs);
         const miniMedian = this._miniBuffer.median();
