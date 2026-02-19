@@ -41,6 +41,7 @@ class AudioPlayer {
         this._longBuffer = new MedianBuffer(500);
         this._driftTimer = null; this._hardSyncing = false; this._lastHardSync = 0;
         this._playStartedAt = 0; this._fedFrames = 0; this._sampleRate = 0;
+        this._ctxTimeAtPlay = 0; // AudioContext.currentTime when play started (same clock as worklet)
         this._prevTailL = null; this._prevTailR = null;
         this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
     }
@@ -264,6 +265,7 @@ class AudioPlayer {
         actualPos = this.serverPlayPosition + elapsed;
 
         this._feederStartPos = actualPos;
+        this._ctxTimeAtPlay = this.ctx.currentTime; // anchor for drift calc (same clock as worklet)
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
 
@@ -350,8 +352,11 @@ class AudioPlayer {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
         if (performance.now() - this._playStartedAt < 3000) return;
 
-        const serverNow = window.clockSync.getServerTime();
-        const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
+        // Use same clock source for both expected and actual position
+        // expectedPos: based on AudioContext.currentTime elapsed since play start
+        // actualPos: based on workletConsumed (also AudioContext clock)
+        const ctxElapsed = this.ctx.currentTime - this._ctxTimeAtPlay;
+        const expectedPos = this._feederStartPos + ctxElapsed;
         const actualPos = this.getCurrentTime();
         const ageMs = (actualPos - expectedPos) * 1000;
         const ageUs = ageMs * 1000;
@@ -375,7 +380,10 @@ class AudioPlayer {
             if (performance.now() - this._lastHardSync < 3000) return;
             this._lastHardSync = performance.now();
             this._hardSyncing = true;
-            this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
+            // Use server time for cross-device sync accuracy
+            const serverNow = window.clockSync.getServerTime();
+            const serverPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
+            this.playAtPosition(serverPos, serverNow)
                 .finally(() => { this._hardSyncing = false; });
             return;
         }
@@ -389,11 +397,11 @@ class AudioPlayer {
             // age<0 = playing too slow → drop frames (positive correctAfterXFrames)
             if (shortMedian > CORRECTION_BEGIN && miniMedian > 50 && ageUs > 50) {
                 // Too fast: slow down by inserting frames
-                let rateAdj = Math.min((shortMedian / 100) * 0.00005, 0.0005);
+                let rateAdj = Math.min((shortMedian / 100) * 0.00005, 0.005);
                 correctAfterXFrames = -Math.round(1 / rateAdj); // negative = insert
             } else if (shortMedian < -CORRECTION_BEGIN && miniMedian < -50 && ageUs < -50) {
                 // Too slow: speed up by dropping frames
-                let rateAdj = Math.min((-shortMedian / 100) * 0.00005, 0.0005);
+                let rateAdj = Math.min((-shortMedian / 100) * 0.00005, 0.005);
                 correctAfterXFrames = Math.round(1 / rateAdj); // positive = drop
             }
             if (this.workletNode) this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames });
