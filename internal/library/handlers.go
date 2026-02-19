@@ -331,27 +331,7 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var manifest audio.MultiQualityManifest
-	if err := json.Unmarshal(data, &manifest); err != nil || manifest.Qualities == nil {
-		// Try legacy single-quality manifest format
-		var legacy audio.Manifest
-		if err2 := json.Unmarshal(data, &legacy); err2 == nil && len(legacy.Segments) > 0 {
-			segInfos := make([]audio.SegmentInfo, len(legacy.Segments))
-			for i, s := range legacy.Segments {
-				segInfos[i] = audio.SegmentInfo{Filename: s}
-			}
-			jsonOK(w, map[string]interface{}{
-				"quality":      quality,
-				"format":       "",
-				"bitrate":      0,
-				"segments":     segInfos,
-				"duration":     legacy.Duration,
-				"segment_time": legacy.SegmentTime,
-				"sample_rate":  0,
-				"owner_id":     af.OwnerID,
-				"audio_uuid":   af.Filename,
-			})
-			return
-		}
+	if err := json.Unmarshal(data, &manifest); err != nil {
 		jsonError(w, "invalid manifest", 500)
 		return
 	}

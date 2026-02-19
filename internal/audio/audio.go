@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,17 +26,11 @@ type Manifest struct {
 	Segments     []string `json:"segments"`
 }
 
-// SegmentInfo describes one segment with sample count for precise sync.
-type SegmentInfo struct {
-	Filename    string `json:"filename"`
-	SampleCount int64  `json:"sample_count"`
-}
-
 // QualityInfo describes one quality tier in the multi-quality manifest.
 type QualityInfo struct {
-	Format   string        `json:"format"`
-	Bitrate  int           `json:"bitrate"`
-	Segments []SegmentInfo `json:"segments"`
+	Format   string   `json:"format"`
+	Bitrate  int      `json:"bitrate"`
+	Segments []string `json:"segments"`
 }
 
 // MultiQualityManifest is written as manifest.json inside the audio directory.
@@ -51,18 +44,19 @@ type MultiQualityManifest struct {
 
 // qualityDef defines how to encode one quality tier.
 type qualityDef struct {
-	Name      string
-	DirSuffix string // e.g. "segments_high"
-	Codec     string // "flac" or "opus"
-	Bitrate   string // e.g. "256k", "" for flac
-	Ext       string // file extension including dot
+	Name       string
+	DirSuffix  string // e.g. "segments_high"
+	Codec      string // "flac" or "aac"
+	Bitrate    string // e.g. "256k", "" for flac
+	Ext        string // file extension including dot
+	SegFormat  string // segment_format value
 }
 
 var allQualities = []qualityDef{
-	{Name: "lossless", DirSuffix: "segments_lossless", Codec: "flac", Bitrate: "", Ext: ".flac"},
-	{Name: "high", DirSuffix: "segments_high", Codec: "opus", Bitrate: "256k", Ext: ".webm"},
-	{Name: "medium", DirSuffix: "segments_medium", Codec: "opus", Bitrate: "128k", Ext: ".webm"},
-	{Name: "low", DirSuffix: "segments_low", Codec: "opus", Bitrate: "64k", Ext: ".webm"},
+	{Name: "lossless", DirSuffix: "segments_lossless", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
+	{Name: "high", DirSuffix: "segments_high", Codec: "opus", Bitrate: "256k", Ext: ".webm", SegFormat: "webm"},
+	{Name: "medium", DirSuffix: "segments_medium", Codec: "opus", Bitrate: "128k", Ext: ".webm", SegFormat: "webm"},
+	{Name: "low", DirSuffix: "segments_low", Codec: "opus", Bitrate: "64k", Ext: ".webm", SegFormat: "webm"},
 }
 
 // ProbeResult holds ffprobe detection results.
@@ -152,98 +146,48 @@ func QualityNames(probe *ProbeResult) []string {
 	return names
 }
 
-// getSampleCount uses ffprobe to get exact sample count, falls back to duration*sampleRate
-func getSampleCount(filePath string, sampleRate int) int64 {
-	cmd := exec.Command("ffprobe", "-v", "quiet",
-		"-show_entries", "stream=nb_samples",
-		"-of", "csv=p=0",
-		filePath)
-	out, err := cmd.Output()
-	if err == nil {
-		if s := strings.TrimSpace(string(out)); s != "" && s != "N/A" {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-				return v
-			}
-		}
-	}
-	// Fallback: get duration and estimate
-	cmdDur := exec.Command("ffprobe", "-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		filePath)
-	durOut, err := cmdDur.Output()
-	if err == nil {
-		if dur, err := strconv.ParseFloat(strings.TrimSpace(string(durOut)), 64); err == nil {
-			return int64(math.Round(dur * float64(sampleRate)))
-		}
-	}
-	return 0
-}
-
-// encodeOneSegment encodes a single segment using -ss/-t for precise seeking
-func encodeOneSegment(inputPath, outputPath string, startSec float64, duration float64, q qualityDef) error {
-	// Use input seeking (-ss before -i) for speed, with output -ss for sample-accurate trim
-	args := []string{"-ss", fmt.Sprintf("%.6f", startSec),
-		"-i", inputPath, "-vn",
-		"-t", fmt.Sprintf("%.6f", duration)}
-
-	if q.Codec == "flac" {
-		args = append(args, "-c:a", "flac")
-	} else if q.Codec == "opus" {
-		args = append(args, "-c:a", "libopus", "-b:a", q.Bitrate, "-vbr", "on", "-application", "audio", "-ar", "48000")
-	} else {
-		args = append(args, "-c:a", "aac", "-b:a", q.Bitrate)
-	}
-	args = append(args, "-y", outputPath)
-
-	cmd := exec.Command("ffmpeg", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg encode failed: %w, output: %s", err, string(out))
-	}
-	return nil
-}
-
-// segmentOneQuality encodes segments one by one using precise -ss/-t seeking
-func segmentOneQuality(inputPath, outputDir string, q qualityDef, totalDuration float64, sampleRate int) ([]SegmentInfo, error) {
+// segmentOneQuality runs ffmpeg to segment into one quality tier.
+func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, error) {
 	inputPath = sanitizeInputPath(inputPath)
 	dir := filepath.Join(outputDir, q.DirSuffix)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
+	pattern := filepath.Join(dir, "seg_%03d"+q.Ext)
 
-	segCount := int(math.Ceil(totalDuration / float64(SegmentDuration)))
-	segments := make([]SegmentInfo, 0, segCount)
+	args := []string{"-i", inputPath, "-vn"}
+	if q.Codec == "flac" {
+		args = append(args, "-c:a", "flac")
+	} else if q.Codec == "opus" {
+		args = append(args, "-c:a", "libopus", "-b:a", q.Bitrate, "-vbr", "on", "-application", "audio")
+	} else {
+		args = append(args, "-c:a", "aac", "-b:a", q.Bitrate)
+	}
+	args = append(args, "-f", "segment", "-segment_time", strconv.Itoa(SegmentDuration), "-reset_timestamps", "1")
+	if q.SegFormat != "" {
+		args = append(args, "-segment_format", q.SegFormat)
+	}
+	args = append(args, "-y", pattern)
 
-	for i := 0; i < segCount; i++ {
-		startSec := float64(i * SegmentDuration)
-		segDur := float64(SegmentDuration)
-		if startSec+segDur > totalDuration {
-			segDur = totalDuration - startSec
-		}
-
-		filename := fmt.Sprintf("seg_%03d%s", i, q.Ext)
-		outputPath := filepath.Join(dir, filename)
-
-		if err := encodeOneSegment(inputPath, outputPath, startSec, segDur, q); err != nil {
-			return nil, fmt.Errorf("segment %d: %w", i, err)
-		}
-
-		// Get actual sample count from encoded file
-		// For opus, use 48000 as it's always resampled
-		probeSampleRate := sampleRate
-		if q.Codec == "opus" {
-			probeSampleRate = 48000
-		}
-		sampleCount := getSampleCount(outputPath, probeSampleRate)
-
-		segments = append(segments, SegmentInfo{
-			Filename:    filename,
-			SampleCount: sampleCount,
-		})
+	cmd := exec.Command("ffmpeg", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg (%s) failed: %w, output: %s", q.Name, err, string(out))
 	}
 
-	return segments, nil
+	// List generated segments
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	pat := regexp.MustCompile(`^seg_\d{3}` + regexp.QuoteMeta(q.Ext) + `$`)
+	var segs []string
+	for _, e := range entries {
+		if !e.IsDir() && pat.MatchString(e.Name()) {
+			segs = append(segs, e.Name())
+		}
+	}
+	return segs, nil
 }
 
 // ProcessAudioMultiQuality generates multi-quality segments.
@@ -283,7 +227,7 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 	}
 
 	// Process the sync tier first
-	segs, err := segmentOneQuality(inputPath, outputDir, defs[syncIdx], duration, probe.SampleRate)
+	segs, err := segmentOneQuality(inputPath, outputDir, defs[syncIdx])
 	if err != nil {
 		return nil, nil, fmt.Errorf("segment %s: %w", defs[syncIdx].Name, err)
 	}
@@ -306,7 +250,7 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 	if len(remaining) > 0 {
 		go func() {
 			for _, q := range remaining {
-				s, err := segmentOneQuality(inputPath, outputDir, q, duration, probe.SampleRate)
+				s, err := segmentOneQuality(inputPath, outputDir, q)
 				if err != nil {
 					log.Printf("background segment %s failed: %v", q.Name, err)
 					continue
