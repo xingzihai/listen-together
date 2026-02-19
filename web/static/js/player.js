@@ -301,6 +301,7 @@ class AudioPlayer {
             this._feederSegOffset = 0;
 
             // Crossfade with previous segment tail to eliminate Opus pre-skip gaps
+            // Instead of trimming tail, we overlap-blend: prev tail fades out, new head fades in
             let sliceL = srcL.slice(offsetFrames);
             let sliceR = srcR.slice(offsetFrames);
             if (this._prevTailL && sliceL.length > 0) {
@@ -312,24 +313,22 @@ class AudioPlayer {
                 }
                 this._prevTailL = null; this._prevTailR = null;
             }
-            // Save tail for next segment crossfade (only if segment long enough)
-            let sendL, sendR;
-            if (sliceL.length > this._CROSSFADE_FRAMES * 2) {
-                const tailLen = this._CROSSFADE_FRAMES;
-                this._prevTailL = sliceL.slice(sliceL.length - tailLen);
-                this._prevTailR = sliceR.slice(sliceR.length - tailLen);
-                sendL = sliceL.slice(0, sliceL.length - tailLen);
-                sendR = sliceR.slice(0, sliceR.length - tailLen);
+            // Save tail reference for next segment crossfade (no trimming — send full data)
+            if (sliceL.length > this._CROSSFADE_FRAMES) {
+                this._prevTailL = sliceL.slice(sliceL.length - this._CROSSFADE_FRAMES);
+                this._prevTailR = sliceR.slice(sliceR.length - this._CROSSFADE_FRAMES);
             } else {
-                // Segment too short for tail trimming, send all data
-                sendL = sliceL;
-                sendR = sliceR;
-                // Don't save tail — next segment will just not crossfade
                 this._prevTailL = null; this._prevTailR = null;
             }
+            // Send ALL frames (no tail trimming — eliminates cumulative position drift)
+            const sendL = sliceL;
+            const sendR = sliceR;
             const len = sendL.length;
             if (len <= 0) { this._feederNextSeg++; continue; }
 
+            // sliceL/sliceR are from Float32Array.slice() — independent ArrayBuffers
+            // prevTail was saved via .slice() before this point — also independent
+            // Safe to transfer sendL/sendR buffers directly
             const leftBuf = sendL.buffer;
             const rightBuf = sendR.buffer;
             this.workletNode.port.postMessage({ type: 'pcm', left: leftBuf, right: rightBuf }, [leftBuf, rightBuf]);

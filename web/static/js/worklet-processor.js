@@ -122,7 +122,8 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
                     outIdx++;
                 }
                 while (outIdx < frames) { outL[outIdx] = 0; outR[outIdx] = 0; outIdx++; }
-                this._fadeOutRemaining = 0; // already faded
+                this._fadeOutRemaining = 0;
+                this._fadeInRemaining = this._FADE_OUT_LEN; // need fade-in on recovery
                 break;
             }
             const rp = (this._readPos + consumed) % this._capacity;
