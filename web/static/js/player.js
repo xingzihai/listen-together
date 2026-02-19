@@ -275,11 +275,11 @@ class AudioPlayer {
             gain.gain.linearRampToValueAtTime(0, endTime);
             // Start: first seg at exact ctxStartTime, others overlap slightly
             const startAt = this._isFirstSeg ? t : Math.max(0, t - overlap);
-            source.start(startAt, off);
-            // Inherit current playbackRate if rate correction is active
+            // Set playbackRate BEFORE start() for immediate effect
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
+            source.start(startAt, off);
             // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
@@ -310,8 +310,8 @@ class AudioPlayer {
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
             const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
-            const softCorr = (this._softCorrectionTotal * 1000).toFixed(1);
-            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | softCorr: ${softCorr}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
+            const driftAcc = (this._driftOffset * 1000).toFixed(1);
+            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | accum: ${driftAcc}ms | ctxElapsed: ${ctxElapsed}s | offset: ${window.clockSync.offset.toFixed(0)}ms | rtt: ${window.clockSync.rtt.toFixed(0)}ms`;
         }
         const absDrift = Math.abs(drift);
 
@@ -322,9 +322,12 @@ class AudioPlayer {
                 console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
                 // Fall through to hard resync below
             } else {
-                this._nextSegTime -= drift;
+                // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
+                // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
+                this._nextSegTime += drift;
                 this._driftOffset += drift;
-                this._softCorrectionTotal += drift;
+                // Don't update _softCorrectionTotal — correction affects future scheduling,
+                // not current position. getCurrentTime() stays pure measurement.
                 this._resyncBackoff = 1500;
                 return Math.round(drift * 1000);
             }
@@ -332,11 +335,16 @@ class AudioPlayer {
 
         // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 2-3 seconds
         if (absDrift > 0.05 && absDrift <= 0.3) {
-            // Calculate rate: need to cover 'drift' over ~2.5 seconds
+            // Dynamic rate based on drift magnitude:
+            // 50-100ms: ±2%, 100-200ms: ±3%, 200-300ms: ±5%
+            let rateOffset;
+            if (absDrift <= 0.1) rateOffset = 0.02;
+            else if (absDrift <= 0.2) rateOffset = 0.03;
+            else rateOffset = 0.05;
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
-            const rate = drift < 0 ? 1.02 : 0.98; // ±2% adjustment
+            const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const neededCatchUp = absDrift;
-            const adjustedDuration = Math.min(3, neededCatchUp / Math.abs(rate - 1.0));
+            const adjustedDuration = Math.min(3, neededCatchUp / rateOffset);
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
@@ -399,7 +407,8 @@ class AudioPlayer {
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
-        return this.startOffset + Math.max(0, elapsed) + (this._softCorrectionTotal || 0);
+        // Pure measurement: startOffset + elapsed, no correction compensation
+        return this.startOffset + Math.max(0, elapsed);
     }
 
     setVolume(v) { if (this.gainNode) this.gainNode.gain.value = v; }
