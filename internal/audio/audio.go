@@ -149,7 +149,7 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	} else {
 		args = append(args, "-c:a", "aac", "-b:a", q.Bitrate)
 	}
-	args = append(args, "-f", "segment", "-segment_time", strconv.Itoa(SegmentDuration))
+	args = append(args, "-f", "segment", "-segment_time", strconv.Itoa(SegmentDuration), "-reset_timestamps", "1")
 	if q.SegFormat != "" {
 		args = append(args, "-segment_format", q.SegFormat)
 	}

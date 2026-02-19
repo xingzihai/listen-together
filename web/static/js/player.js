@@ -257,23 +257,48 @@ class AudioPlayer {
     }
 
     // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
+    // Trims Opus pre-skip (~312 samples @ 48kHz) and trailing padding from each segment
     _mergeBuffers(bufferList, startOffset) {
         if (!bufferList.length) return null;
         const sampleRate = bufferList[0].sampleRate;
         const numChannels = bufferList[0].numberOfChannels;
-        // Calculate total length, accounting for startOffset on first buffer
-        const firstSkipSamples = Math.round(startOffset * sampleRate);
-        let totalSamples = bufferList[0].length - firstSkipSamples;
-        for (let i = 1; i < bufferList.length; i++) totalSamples += bufferList[i].length;
+        // Opus pre-skip: 312 samples @ 48kHz, scale for other sample rates
+        const OPUS_PRESKIP = Math.round(312 * sampleRate / 48000);
+        // Detect trailing padding: count near-zero samples from end
+        const _trimEnd = (buf, ch) => {
+            const data = buf.getChannelData(ch);
+            let end = data.length;
+            while (end > 0 && Math.abs(data[end - 1]) < 1e-6) end--;
+            return end;
+        };
+        // Calculate per-buffer ranges [skipStart, usableEnd]
+        const ranges = bufferList.map((buf, i) => {
+            let skipStart = 0;
+            if (i === 0) {
+                skipStart = Math.round(startOffset * sampleRate);
+            } else {
+                // Trim Opus pre-skip for non-first segments
+                skipStart = Math.min(OPUS_PRESKIP, buf.length);
+            }
+            // Trim trailing silence/padding (check channel 0)
+            let usableEnd = _trimEnd(buf, 0);
+            // Don't trim more than OPUS_PRESKIP from end to be safe
+            usableEnd = Math.max(usableEnd, buf.length - OPUS_PRESKIP);
+            if (usableEnd <= skipStart) usableEnd = buf.length; // fallback: don't trim
+            return { skipStart, usableEnd };
+        });
+        let totalSamples = 0;
+        for (const r of ranges) totalSamples += (r.usableEnd - r.skipStart);
+        if (totalSamples <= 0) return null;
         const merged = this.ctx.createBuffer(numChannels, totalSamples, sampleRate);
         for (let ch = 0; ch < numChannels; ch++) {
             const out = merged.getChannelData(ch);
             let pos = 0;
             for (let i = 0; i < bufferList.length; i++) {
                 const src = bufferList[i].getChannelData(ch);
-                const skip = (i === 0) ? firstSkipSamples : 0;
-                out.set(src.subarray(skip), pos);
-                pos += src.length - skip;
+                const { skipStart, usableEnd } = ranges[i];
+                out.set(src.subarray(skipStart, usableEnd), pos);
+                pos += usableEnd - skipStart;
             }
         }
         return merged;
@@ -438,14 +463,13 @@ class AudioPlayer {
             return Math.round(drift * 1000);
         }
 
-        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 2-3 seconds
+        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up
         if (absDrift > 0.05 && absDrift <= 0.3) {
-            // Dynamic rate based on drift magnitude:
-            // 50-100ms: ±2%, 100-200ms: ±3%, 200-300ms: ±5%
+            // Capped at ±1% to minimize audible pitch shift
             let rateOffset;
-            if (absDrift <= 0.1) rateOffset = 0.02;
-            else if (absDrift <= 0.2) rateOffset = 0.03;
-            else rateOffset = 0.05;
+            if (absDrift <= 0.1) rateOffset = 0.005;
+            else if (absDrift <= 0.2) rateOffset = 0.008;
+            else rateOffset = 0.01;
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const neededCatchUp = absDrift;
