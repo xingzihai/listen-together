@@ -40,6 +40,11 @@ class AudioPlayer {
     }
     dumpLog() { return JSON.stringify(this._logBuffer, null, 2); }
     copyLog() { navigator.clipboard?.writeText(this.dumpLog()); console.log('Log copied to clipboard'); }
+    // Auto-upload log to server
+    uploadLog() {
+        if (!this._logBuffer.length) return;
+        fetch('/api/debug-log', { method: 'POST', headers: {'Content-Type':'application/json'}, body: this.dumpLog() }).catch(() => {});
+    }
 
     init() {
         if (!this.ctx) {
@@ -255,6 +260,8 @@ class AudioPlayer {
     // Drift correction adjusts _nextSegTime for the NEXT segment — zero glitch.
     _startLookahead(position, ctxStartTime) {
         this._stopLookahead();
+        // Auto-upload log every 30s during playback
+        this._logUploadTimer = setInterval(() => this.uploadLog(), 30000);
         const segIdx = Math.floor(position / this.segmentTime);
         const segOffset = position % this.segmentTime;
         this._nextSegIdx = segIdx;
@@ -269,6 +276,7 @@ class AudioPlayer {
 
     _stopLookahead() {
         if (this._lookaheadTimer) { clearInterval(this._lookaheadTimer); this._lookaheadTimer = null; }
+        if (this._logUploadTimer) { clearInterval(this._logUploadTimer); this._logUploadTimer = null; }
     }
 
     // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
@@ -515,6 +523,7 @@ class AudioPlayer {
         if (this.isPlaying) this.lastPosition = this.getCurrentTime();
         this.isPlaying = false;
         this._stopLookahead();
+        this.uploadLog(); // auto-upload debug log on stop
         this._upgrading = false;
         this._scheduling = false;
         // Clear playbackRate correction

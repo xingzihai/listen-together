@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -116,6 +118,33 @@ func main() {
 	plHandlers.RegisterRoutes(mux)
 
 	mux.HandleFunc("/ws", handleWebSocket)
+
+	// Client debug log endpoint — saves to data/debug-logs/
+	mux.HandleFunc("/api/debug-log", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 256*1024))
+		if err != nil {
+			http.Error(w, "read error", 400)
+			return
+		}
+		logDir := filepath.Join("data", "debug-logs")
+		os.MkdirAll(logDir, 0755)
+		ts := time.Now().Format("2006-01-02_15-04-05")
+		ua := r.Header.Get("User-Agent")
+		device := "unknown"
+		if strings.Contains(ua, "Mobile") || strings.Contains(ua, "Android") || strings.Contains(ua, "iPhone") {
+			device = "mobile"
+		} else {
+			device = "desktop"
+		}
+		fname := fmt.Sprintf("%s_%s.json", ts, device)
+		os.WriteFile(filepath.Join(logDir, fname), body, 0644)
+		w.WriteHeader(200)
+		w.Write([]byte(`{"ok":true}`))
+	})
 
 	// Admin page (owner only)
 	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
