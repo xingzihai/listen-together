@@ -145,6 +145,7 @@ async function handleMessage(msg) {
             } else {
                 pausedPosition = msg.position;
                 window.audioPlayer.lastPosition = msg.position;
+                window.audioPlayer.startOffset = msg.position;
                 $('currentTime').textContent = formatTime(msg.position);
                 $('progressBar').value = msg.position;
             }
@@ -179,9 +180,6 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
-                // Clear short-term buffer to avoid mixing old/new anchor samples
-                if (window.audioPlayer._miniBuffer) window.audioPlayer._miniBuffer.clear();
-                if (window.audioPlayer._shortBuffer) window.audioPlayer._shortBuffer.clear();
                 // Immediate drift check after anchor update
                 const drift = window.audioPlayer.correctDrift();
                 if (drift) console.log('syncTick drift corrected:', drift, 'ms');
@@ -229,7 +227,7 @@ async function setupAudio() {
     $('currentTime').textContent = '0:00';
     $('playPauseBtn').disabled = true;
     $('syncStatus').textContent = 'Loading audio...';
-    await window.audioPlayer.init();
+    window.audioPlayer.init();
     window.audioPlayer.onBuffering = (buffering) => {
         $('syncStatus').textContent = buffering ? 'Buffering...' : (window.clockSync.synced ? `RTT: ${Math.round(window.clockSync.rtt)}ms | Offset: ${window.clockSync.offset >= 0 ? '+' : ''}${Math.round(window.clockSync.offset)}ms` : 'Ready');
     };
@@ -248,7 +246,7 @@ async function doPlay(position, serverTime, scheduledAt) {
     pendingPlay = null;
     updatePlayButton(true);
     startUIUpdate();
-    await window.audioPlayer.init();
+    window.audioPlayer.init();
     await window.audioPlayer.playAtPosition(position || 0, serverTime, scheduledAt);
 }
 
@@ -259,7 +257,7 @@ function doPause() {
     stopUIUpdate();
 }
 
-let uiInterval = null;
+let uiInterval = null, driftInterval = null;
 function startUIUpdate() {
     stopUIUpdate();
     uiInterval = setInterval(() => {
@@ -269,10 +267,15 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
-    // Drift correction handled internally by player._driftLoop (250ms)
+    driftInterval = setInterval(() => { // every 1s
+        if (!window.audioPlayer.isPlaying) return;
+        const drift = window.audioPlayer.correctDrift();
+        if (drift) console.log('Drift corrected:', drift, 'ms');
+    }, 1000);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+    if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
 }
 
 function updatePlayButton(playing) {

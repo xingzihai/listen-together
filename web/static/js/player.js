@@ -1,50 +1,37 @@
-/**
- * ListenTogether AudioPlayer — AudioWorklet + Ring Buffer engine
- * Drift correction ported from Snapcast's sample-level algorithm
- */
-
-class MedianBuffer {
-    constructor(size) { this._size = size; this._buf = []; }
-    add(v) { this._buf.push(v); if (this._buf.length > this._size) this._buf.shift(); }
-    clear() { this._buf.length = 0; }
-    full() { return this._buf.length >= this._size; }
-    size() { return this._buf.length; }
-    median() {
-        if (!this._buf.length) return 0;
-        const s = [...this._buf].sort((a, b) => a - b);
-        const m = Math.floor(s.length / 2);
-        return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-    }
-}
-
 class AudioPlayer {
     constructor() {
-        this.ctx = null; this.gainNode = null; this.workletNode = null;
-        this.segments = []; this.buffers = new Map();
-        this.isPlaying = false; this.lastPosition = 0; this.duration = 0;
-        this.segmentTime = 5; this.roomCode = '';
-        this._logBuffer = []; this._logMax = 200;
+        this.ctx = null; this.gainNode = null; this.segments = []; this.buffers = new Map();
+        this.sources = []; this.isPlaying = false; this.startTime = 0; this.startOffset = 0;
+        this.lastPosition = 0; this.duration = 0; this.segmentTime = 5; this.roomCode = '';
+        // Debug log ring buffer — stores last 200 events, accessible via window.audioPlayer.dumpLog()
+        this._logBuffer = [];
+        this._logMax = 200;
         this.serverPlayTime = 0; this.serverPlayPosition = 0;
-        this.onBuffering = null; this._trackSegBase = null;
+        this.onBuffering = null;
+        this._trackSegBase = null;
         this._quality = localStorage.getItem('lt_quality') || 'medium';
-        this._actualQuality = 'medium'; this._upgrading = false;
-        this._qualities = []; this._ownerID = null; this._audioID = null;
+        this._actualQuality = 'medium';
+        this._upgrading = false;
+        this._qualities = [];
+        this._ownerID = null;
+        this._audioID = null;
         this.onQualityChange = null;
-        this._workletReady = false;
-        this._workletBuffered = 0; this._workletCapacity = 0;
-        this._workletTotalPlayed = 0; this._workletConsumed = 0; this._workletSampleRate = 48000;
-        this._feederTimer = null; this._feederNextSeg = 0;
-        this._feederSegOffset = 0; this._feederGen = 0; this._feederStartPos = 0; this._feeding = false;
-        this._fedSinceLastStats = 0;
-        this._miniBuffer = new MedianBuffer(40);
-        this._shortBuffer = new MedianBuffer(100);
-        this._longBuffer = new MedianBuffer(500);
-        this._driftTimer = null; this._hardSyncing = false; this._lastHardSync = 0;
-        this._playStartedAt = 0; this._fedFrames = 0; this._sampleRate = 0;
-        this._prevTailL = null; this._prevTailR = null;
-        this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
+        // Lookahead scheduler state
+        this._lookaheadTimer = null;
+        this._nextSegIdx = 0;       // next segment to schedule
+        this._nextSegTime = 0;      // AudioContext time for next segment
+        this._driftOffset = 0;      // accumulated soft drift correction (seconds)
+        this._softCorrectionTotal = 0; // total soft correction for UI display (seconds)
+        this._lastResync = 0;
+        this._resyncGen = 0;        // generation counter: incremented on each playAtPosition
+        // playbackRate correction state
+        this._rateCorrectingUntil = 0; // ctx.currentTime when rate correction ends
+        this._rateCorrectionTimer = null;
+        this._currentPlaybackRate = 1.0; // current playbackRate for new sources
+        this._rateStartTime = 0;      // ctx.currentTime when rate correction started
     }
 
+    // Structured debug log — ring buffer, call dumpLog() in console to retrieve
     _log(event, data) {
         const entry = { t: Date.now(), ct: this.ctx?.currentTime || 0, event, ...data };
         this._logBuffer.push(entry);
@@ -52,16 +39,20 @@ class AudioPlayer {
         console.log(`[audio] ${event}`, data || '');
     }
     dumpLog() { return JSON.stringify(this._logBuffer, null, 2); }
-    copyLog() { navigator.clipboard?.writeText(this.dumpLog()); console.log('Log copied'); }
+    copyLog() { navigator.clipboard?.writeText(this.dumpLog()); console.log('Log copied to clipboard'); }
+    // Auto-upload log to server
     uploadLog() {
         if (!this._logBuffer.length) return;
         fetch('/api/debug-log', { method: 'POST', headers: {'Content-Type':'application/json'}, body: this.dumpLog() }).catch(() => {});
     }
 
-    async init(sampleRate) {
+    init(sampleRate) {
         if (this.ctx && sampleRate && this.ctx.sampleRate !== sampleRate) {
-            this.stop(); this.ctx.close().catch(() => {});
-            this.ctx = null; this.gainNode = null; this.workletNode = null; this._workletReady = false;
+            // Sample rate mismatch — recreate context to avoid resampling artifacts
+            this.stop();
+            this.ctx.close().catch(() => {});
+            this.ctx = null;
+            this.gainNode = null;
         }
         if (!this.ctx) {
             const opts = sampleRate ? { sampleRate } : {};
@@ -69,50 +60,14 @@ class AudioPlayer {
             this.gainNode = this.ctx.createGain();
             this.gainNode.connect(this.ctx.destination);
         }
-        if (this.ctx.state === 'suspended') await this.ctx.resume();
+        if (this.ctx.state === 'suspended') this.ctx.resume();
+        // Cache hardware output latency for future use (not yet applied to scheduling)
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
-        this._CROSSFADE_FRAMES = Math.ceil(this.ctx.sampleRate * 0.003); // 3ms
-        // Bridge AudioContext to ClockSync for high-precision timing
-        if (window.clockSync?.setAudioContext) window.clockSync.setAudioContext(this.ctx);
-        if (!this._workletReady) {
-            try { await this.ctx.audioWorklet.addModule('/js/worklet-processor.js'); }
-            catch (e) { console.warn('[audio] worklet addModule:', e.message); }
-            this._createWorkletNode();
-            this._workletReady = true;
-        }
-    }
-
-    _createWorkletNode() {
-        if (this.workletNode) { try { this.workletNode.disconnect(); } catch {} }
-        this.workletNode = new AudioWorkletNode(this.ctx, 'listen-together-processor', {
-            outputChannelCount: [2], numberOfOutputs: 1
-        });
-        this.workletNode.connect(this.gainNode);
-        this.workletNode.port.onmessage = (e) => {
-            const msg = e.data;
-            if (msg.type === 'stats') {
-                this._workletBuffered = msg.buffered;
-                this._workletCapacity = msg.capacity;
-                this._workletTotalPlayed = msg.totalPlayedFrames;
-                this._workletConsumed = msg.totalConsumedFrames;
-                this._workletSampleRate = msg.sampleRate;
-                this._fedSinceLastStats = 0;
-            } else if (msg.type === 'overflow') {
-                this._log('overflow', { dropped: msg.dropped });
-            }
-        };
-    }
-
-    // Normalize segments: accept both ["seg.flac"] and [{filename:"seg.flac", sample_count:N}]
-    _normalizeSegments(segs) {
-        if (!segs || !segs.length) return [];
-        if (typeof segs[0] === 'string') return segs;
-        return segs.map(s => s.filename || s);
     }
 
     async loadAudio(audioInfo, roomCode) {
         this.stop();
-        this.segments = this._normalizeSegments(audioInfo.segments);
+        this.segments = audioInfo.segments || [];
         this.duration = audioInfo.duration || 0;
         this.segmentTime = audioInfo.segmentTime || 5;
         this.roomCode = roomCode;
@@ -126,10 +81,13 @@ class AudioPlayer {
         if (this._qualities.length > 0) {
             const preferred = this._quality;
             const initialQ = this._qualities.includes(preferred) ? preferred
-                : this._qualities.includes('medium') ? 'medium' : this._qualities[this._qualities.length - 1];
+                : this._qualities.includes('medium') ? 'medium'
+                : this._qualities[this._qualities.length - 1];
             this._actualQuality = initialQ;
             await this._loadQualitySegments(initialQ);
-        } else { this._actualQuality = 'medium'; }
+        } else {
+            this._actualQuality = 'medium';
+        }
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
         if (this.segments.length > 0) await this.preloadSegments(0, 1);
         if (this.segments.length > 1) this.preloadSegments(1, 4);
@@ -141,7 +99,8 @@ class AudioPlayer {
             const res = await fetch(`/api/library/files/${this._audioID}/segments/${quality}/`, {credentials:'include'});
             if (!res.ok) return;
             const data = await res.json();
-            this.segments = this._normalizeSegments(data.segments); this.segmentTime = data.segment_time || 5;
+            this.segments = data.segments || [];
+            this.segmentTime = data.segment_time || 5;
             this.duration = data.duration || this.duration;
             if (data.sample_rate) this._sampleRate = data.sample_rate;
             if (data.owner_id) this._ownerID = data.owner_id;
@@ -150,7 +109,8 @@ class AudioPlayer {
     }
 
     async setQuality(quality) {
-        this._quality = quality; localStorage.setItem('lt_quality', quality);
+        this._quality = quality;
+        localStorage.setItem('lt_quality', quality);
         if (quality === this._actualQuality && this.segments.length > 0) return;
         await this._upgradeQuality(quality);
     }
@@ -159,19 +119,19 @@ class AudioPlayer {
     getQualities() { return this._qualities; }
 
     async _upgradeQuality(targetQuality) {
-        if (this._upgrading || targetQuality === this._actualQuality) return;
+        if (this._upgrading) return;
+        if (targetQuality === this._actualQuality) return;
         if (!this._audioID || !this._ownerID) return;
         this._upgrading = true;
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, true);
         try {
             const res = await fetch(`/api/library/files/${this._audioID}/segments/${targetQuality}/`, {credentials:'include'});
-            if (!res.ok) throw new Error('upgrade fetch failed: ' + res.status);
+            if (!res.ok) throw new Error('upgrade segments fetch failed: ' + res.status);
             const data = await res.json();
-            const rawSegments = data.segments || [];
-            const newSegments = this._normalizeSegments(rawSegments);
+            const newSegments = data.segments || [];
             const newSegTime = data.segment_time || this.segmentTime;
             const newAudioUUID = data.audio_uuid || this._audioUUID;
-            if (!newSegments.length) throw new Error('no segments');
+            if (!newSegments.length) throw new Error('no segments for target quality');
             const newBuffers = new Map();
             for (let i = 0; i < newSegments.length; i++) {
                 if (!this._upgrading) return;
@@ -179,22 +139,42 @@ class AudioPlayer {
                 let arrayBuf = await window.audioCache.get(url);
                 if (!arrayBuf) {
                     for (let attempt = 0; attempt < 3; attempt++) {
-                        try { const r = await fetch(url, {credentials:'include'}); if (!r.ok) throw new Error(`HTTP ${r.status}`); arrayBuf = await r.arrayBuffer(); break; }
-                        catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
+                        try {
+                            const r = await fetch(url, {credentials:'include'});
+                            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                            arrayBuf = await r.arrayBuffer();
+                            break;
+                        } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
                     }
                     window.audioCache.put(url, arrayBuf.slice(0));
                 }
-                newBuffers.set(i, await this.ctx.decodeAudioData(arrayBuf));
+                const buffer = await this.ctx.decodeAudioData(arrayBuf);
+                newBuffers.set(i, buffer);
             }
             if (!this._upgrading) return;
+            if (this.isPlaying) {
+                const curPos = this.getCurrentTime();
+                const curSegEnd = (Math.floor(curPos / this.segmentTime) + 1) * this.segmentTime;
+                const waitMs = Math.max(0, (curSegEnd - curPos) * 1000);
+                if (waitMs > 50) await new Promise(r => setTimeout(r, waitMs));
+                if (!this._upgrading || !this.isPlaying) return;
+            }
             const resumePos = this.isPlaying ? this.getCurrentTime() : this.lastPosition;
             const wasPlaying = this.isPlaying;
             this.stop();
-            this.segments = newSegments; this.segmentTime = newSegTime;
-            this._audioUUID = newAudioUUID; this.buffers = newBuffers;
+            this.segments = newSegments;
+            this.segmentTime = newSegTime;
+            this._audioUUID = newAudioUUID;
+            this.buffers = newBuffers;
             this._actualQuality = targetQuality;
             if (data.duration) this.duration = data.duration;
-            if (wasPlaying) await this.playAtPosition(resumePos, this.serverPlayTime);
+            if (wasPlaying) {
+                this.isPlaying = true;
+                this.startOffset = resumePos;
+                this.startTime = this.ctx.currentTime;
+                this._driftOffset = 0;
+                this._startLookahead(resumePos, this.ctx.currentTime);
+            }
         } catch (e) { console.error('_upgradeQuality failed:', e);
         } finally { this._upgrading = false; if (this.onQualityChange) this.onQualityChange(this._actualQuality, false); }
     }
@@ -202,7 +182,8 @@ class AudioPlayer {
     _getSegmentURL(idx) {
         if (this._ownerID && this._audioID)
             return `/api/library/segments/${this._ownerID}/${this._audioUUID}/${this._actualQuality}/${this.segments[idx]}`;
-        return (this._trackSegBase || `/api/segments/${this.roomCode}/`) + this.segments[idx];
+        const base = this._trackSegBase || `/api/segments/${this.roomCode}/`;
+        return base + this.segments[idx];
     }
 
     async preloadSegments(startIdx, count) {
@@ -218,8 +199,11 @@ class AudioPlayer {
         let data = await window.audioCache.get(url);
         if (!data) {
             for (let attempt = 0; attempt < 3; attempt++) {
-                try { const res = await fetch(url, {credentials:'include'}); if (!res.ok) throw new Error(`HTTP ${res.status}`); data = await res.arrayBuffer(); break; }
-                catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
+                try {
+                    const res = await fetch(url, {credentials:'include'});
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    data = await res.arrayBuffer(); break;
+                } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
             }
             window.audioCache.put(url, data.slice(0));
         }
@@ -228,20 +212,20 @@ class AudioPlayer {
         return buffer;
     }
 
+    // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        await this.init(this._sampleRate || undefined);
+        this.init(this._sampleRate || undefined);
         this.stop();
         this.isPlaying = true;
-        this._feederGen++;
-        const gen = this._feederGen;
+        this._driftOffset = 0;
+        this._softCorrectionTotal = 0;
+        this._mergeChunkCount = 0;
+        this._resyncGen++;
+        this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
+        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality, ctxSR: this.ctx.sampleRate, targetSR: this._sampleRate || 'none' });
         this._playStartedAt = performance.now();
-        this._miniBuffer.clear(); this._shortBuffer.clear(); this._longBuffer.clear();
-        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
-
-        if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
-        this._fedFrames = 0; this._fedSinceLastStats = 0;
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -249,199 +233,332 @@ class AudioPlayer {
             await this.preloadSegments(segIdx, 2);
             if (this.onBuffering) this.onBuffering(false);
         }
-        if (!this.isPlaying || gen !== this._feederGen) return;
+        if (!this.isPlaying) return;
 
-        let actualPos = this.serverPlayPosition;
+        const ctxNow = this.ctx.currentTime;
+
+        // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
-            const waitMs = (scheduledAt - window.clockSync.offset) - Date.now();
+            const localScheduled = scheduledAt - window.clockSync.offset;
+            const waitMs = localScheduled - Date.now();
             if (waitMs > 2 && waitMs < 3000) {
-                await new Promise(r => setTimeout(r, waitMs));
-                if (!this.isPlaying || gen !== this._feederGen) return;
+                const ctxTarget = ctxNow + waitMs / 1000;
+                this.startOffset = this.serverPlayPosition;
+                this.startTime = ctxTarget;
+                this._startLookahead(this.serverPlayPosition, ctxTarget);
+                this._log('scheduledPlay', { waitMs: +waitMs.toFixed(0), lat: +((this._outputLatency||0)*1000).toFixed(1) });
+                return;
             }
         }
-        // Always recalculate elapsed after any wait
-        const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
-        actualPos = this.serverPlayPosition + elapsed;
+        // Fallback: calculate elapsed from server time
+        const now = window.clockSync.getServerTime();
+        const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
+        const actualPos = this.serverPlayPosition + elapsed;
+        this.startOffset = actualPos;
+        this.startTime = ctxNow;
+        this._startLookahead(actualPos, ctxNow);
+    }
 
-        this._feederStartPos = actualPos;
-        this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
-        this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
-
-        await this._feedSegments(gen, 1);
-        if (!this.isPlaying || gen !== this._feederGen) return;
-
-        this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
-        this._driftTimer = setInterval(() => this._driftLoop(), 250);
+    // === Lookahead Scheduler ===
+    // Instead of scheduling all segments at once, schedule 2-3 ahead
+    // and use setInterval to keep feeding the queue.
+    // Drift correction adjusts _nextSegTime for the NEXT segment — zero glitch.
+    _startLookahead(position, ctxStartTime) {
+        this._stopLookahead();
+        // Auto-upload log every 30s during playback
         this._logUploadTimer = setInterval(() => this.uploadLog(), 30000);
+        const segIdx = Math.floor(position / this.segmentTime);
+        const segOffset = position % this.segmentTime;
+        this._nextSegIdx = segIdx;
+        this._nextSegTime = ctxStartTime;
+        this._firstSegOffset = segOffset;
+        this._isFirstSeg = true;
+        // Schedule first 2 segments immediately
+        this._scheduleAhead();
+        // Then check every 200ms to keep the queue fed
+        this._lookaheadTimer = setInterval(() => this._scheduleAhead(), 200);
     }
 
-    async _feedSegments(gen, count) {
-        for (let i = 0; i < count; i++) {
-            if (!this.isPlaying || gen !== this._feederGen) return;
-            if (this._feederNextSeg >= this.segments.length) return;
-            const sr = this.ctx?.sampleRate || 48000;
-            const segFrames = Math.ceil(this.segmentTime * sr);
-            // Use known capacity (5s * sampleRate) if worklet hasn't reported yet
-            const capacity = this._workletCapacity > 0 ? this._workletCapacity : Math.ceil(sr * 5);
-            const buffered = this._workletBuffered + this._fedSinceLastStats;
-            if (buffered > capacity - segFrames) return;
+    _stopLookahead() {
+        if (this._lookaheadTimer) { clearInterval(this._lookaheadTimer); this._lookaheadTimer = null; }
+        if (this._logUploadTimer) { clearInterval(this._logUploadTimer); this._logUploadTimer = null; }
+    }
 
-            if (!this.buffers.has(this._feederNextSeg)) {
-                if (this.onBuffering) this.onBuffering(true);
-                await this.loadSegment(this._feederNextSeg);
-                if (this.onBuffering) this.onBuffering(false);
-                if (!this.isPlaying || gen !== this._feederGen) return;
+    // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
+    // Only trims Opus pre-skip for non-lossless formats
+    _mergeBuffers(bufferList, startOffset) {
+        if (!bufferList.length) return null;
+        const sampleRate = bufferList[0].sampleRate;
+        const numChannels = bufferList[0].numberOfChannels;
+        // Only trim Opus pre-skip for non-lossless (Opus/WebM) formats
+        const isLossless = this._actualQuality === 'lossless';
+        const OPUS_PRESKIP = isLossless ? 0 : Math.round(312 * sampleRate / 48000);
+        // Calculate per-buffer ranges [skipStart, usableEnd]
+        const ranges = bufferList.map((buf, i) => {
+            let skipStart = 0;
+            if (i === 0) {
+                skipStart = Math.round(startOffset * sampleRate);
+            } else if (OPUS_PRESKIP > 0) {
+                skipStart = Math.min(OPUS_PRESKIP, buf.length);
             }
-            const audioBuf = this.buffers.get(this._feederNextSeg);
-            if (!audioBuf) return;
-
-            const srcL = audioBuf.getChannelData(0);
-            const srcR = audioBuf.numberOfChannels > 1 ? audioBuf.getChannelData(1) : srcL;
-            const offsetFrames = Math.round(this._feederSegOffset * audioBuf.sampleRate);
-            this._feederSegOffset = 0;
-
-            // Crossfade with previous segment tail to eliminate Opus pre-skip gaps
-            let sliceL = srcL.slice(offsetFrames);
-            let sliceR = srcR.slice(offsetFrames);
-            if (this._prevTailL && sliceL.length > 0) {
-                const cfLen = Math.min(this._CROSSFADE_FRAMES, this._prevTailL.length, sliceL.length);
-                for (let j = 0; j < cfLen; j++) {
-                    const t = (j + 1) / (cfLen + 1);
-                    sliceL[j] = this._prevTailL[this._prevTailL.length - cfLen + j] * (1 - t) + sliceL[j] * t;
-                    sliceR[j] = this._prevTailR[this._prevTailR.length - cfLen + j] * (1 - t) + sliceR[j] * t;
-                }
-                this._prevTailL = null; this._prevTailR = null;
+            let usableEnd = buf.length;
+            // Only trim trailing silence for non-lossless
+            if (!isLossless && OPUS_PRESKIP > 0) {
+                const data = buf.getChannelData(0);
+                let end = data.length;
+                while (end > 0 && Math.abs(data[end - 1]) < 1e-6) end--;
+                usableEnd = Math.max(end, buf.length - OPUS_PRESKIP);
             }
-            // Save tail for next segment crossfade (only if segment long enough)
-            let sendL, sendR;
-            if (sliceL.length > this._CROSSFADE_FRAMES * 2) {
-                const tailLen = this._CROSSFADE_FRAMES;
-                this._prevTailL = sliceL.slice(sliceL.length - tailLen);
-                this._prevTailR = sliceR.slice(sliceR.length - tailLen);
-                sendL = sliceL.slice(0, sliceL.length - tailLen);
-                sendR = sliceR.slice(0, sliceR.length - tailLen);
-            } else {
-                // Segment too short for tail trimming, send all data
-                sendL = sliceL;
-                sendR = sliceR;
-                // Don't save tail — next segment will just not crossfade
-                this._prevTailL = null; this._prevTailR = null;
+            if (usableEnd <= skipStart) usableEnd = buf.length;
+            return { skipStart, usableEnd };
+        });
+        let totalSamples = 0;
+        for (const r of ranges) totalSamples += (r.usableEnd - r.skipStart);
+        if (totalSamples <= 0) return null;
+        const merged = this.ctx.createBuffer(numChannels, totalSamples, sampleRate);
+        for (let ch = 0; ch < numChannels; ch++) {
+            const out = merged.getChannelData(ch);
+            let pos = 0;
+            for (let i = 0; i < bufferList.length; i++) {
+                const src = bufferList[i].getChannelData(ch);
+                const { skipStart, usableEnd } = ranges[i];
+                out.set(src.subarray(skipStart, usableEnd), pos);
+                pos += usableEnd - skipStart;
             }
-            const len = sendL.length;
-            if (len <= 0) { this._feederNextSeg++; continue; }
-
-            const leftBuf = sendL.buffer;
-            const rightBuf = sendR.buffer;
-            this.workletNode.port.postMessage({ type: 'pcm', left: leftBuf, right: rightBuf }, [leftBuf, rightBuf]);
-            this._fedFrames += len;
-            this._fedSinceLastStats += len;
-            this._feederNextSeg++;
-            if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 3);
         }
+        return merged;
     }
 
-    async _feedLoop(gen) {
-        if (this._feeding || !this.isPlaying || gen !== this._feederGen) return;
-        this._feeding = true;
-        try { await this._feedSegments(gen, 2); }
-        finally { this._feeding = false; }
+    async _scheduleAhead() {
+        if (!this.isPlaying || this._scheduling) return;
+        this._scheduling = true;
+        try {
+        // Check if rate correction period has ended
+        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
+            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
+            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
+            this.startOffset += extraPlayed;
+            this._currentPlaybackRate = 1.0;
+            this._rateStartTime = 0;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = 1.0;
+            });
+            this._rateCorrectingUntil = 0;
+            this._log('rateRestored', { via: 'scheduler' });
+        }
+        const LOOKAHEAD = 2.0;
+        const MERGE_COUNT = this._isFirstSeg ? 1 : 3; // first segment plays immediately, then merge 3
+        const preloadCount = this._actualQuality === 'lossless' ? 2 : 4;
+
+        while (this._nextSegIdx < this.segments.length &&
+               this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
+            // Collect up to MERGE_COUNT consecutive segments to merge
+            const startIdx = this._nextSegIdx;
+            const endIdx = Math.min(startIdx + MERGE_COUNT, this.segments.length);
+            const bufferList = [];
+            for (let i = startIdx; i < endIdx; i++) {
+                if (!this.buffers.has(i)) {
+                    if (this.onBuffering) this.onBuffering(true);
+                    await this.loadSegment(i);
+                    if (this.onBuffering) this.onBuffering(false);
+                    if (!this.isPlaying) return;
+                }
+                const buf = this.buffers.get(i);
+                if (!buf) break;
+                bufferList.push(buf);
+            }
+            if (!bufferList.length) break;
+
+            const off = this._isFirstSeg ? this._firstSegOffset : 0;
+            const merged = this._mergeBuffers(bufferList, off);
+            if (!merged) break;
+
+            const source = this.ctx.createBufferSource();
+            source.buffer = merged;
+            source.connect(this.gainNode);
+            const t = this._nextSegTime;
+            const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
+            const effectiveDur = merged.duration / effectiveRate;
+
+            if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
+                source.playbackRate.value = this._currentPlaybackRate;
+            }
+            source.start(t);
+            this._log('chunkScheduled', { segs: `${startIdx}-${startIdx+bufferList.length-1}`, t: +t.toFixed(3), dur: +effectiveDur.toFixed(3), merged: +(merged.duration).toFixed(3), rate: effectiveRate, first: this._isFirstSeg });
+            source.onended = () => {
+                const idx = this.sources.indexOf(source);
+                if (idx > -1) this.sources.splice(idx, 1);
+            };
+            this.sources.push(source);
+            this._nextSegTime = t + effectiveDur;
+            this._nextSegIdx = startIdx + bufferList.length;
+            this._isFirstSeg = false;
+            // Preload upcoming segments
+            if (this._nextSegIdx < this.segments.length) {
+                this.preloadSegments(this._nextSegIdx, preloadCount);
+            }
+        }
+        } finally { this._scheduling = false; }
     }
 
-    _driftLoop() {
-        if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
-        if (performance.now() - this._playStartedAt < 3000) return;
+    // === Drift Correction ===
+    // Three-tier correction: soft (15-50ms), playbackRate (50-300ms), hard (>300ms)
+    correctDrift() {
+        if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
+        // Cooldown: skip drift correction for 3s after playAtPosition
+        if (this._playStartedAt && performance.now() - this._playStartedAt < 1500) return 0;
+        // Skip correction during playbackRate adjustment
+        if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
+        // Check if rate correction period has ended (backup recovery)
+        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
+            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
+            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
+            this.startOffset += extraPlayed;
+            this._currentPlaybackRate = 1.0;
+            this._rateStartTime = 0;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = 1.0;
+            });
+            this._rateCorrectingUntil = 0;
+            this._log('rateRestored', { via: 'correctDrift' });
+        }
+
+        // Debounce: max 4 corrections per second
+        const now = performance.now();
+        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 250) return 0;
+        this._lastCorrectionTime = now;
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
+        // Use getCurrentTime() which includes _driftOffset compensation
+        // This way, once a soft correction is applied and takes effect at the next segment,
+        // the drift measurement will reflect the correction
         const actualPos = this.getCurrentTime();
-        const ageMs = (actualPos - expectedPos) * 1000;
-        const ageUs = ageMs * 1000;
-
-        this._miniBuffer.add(ageUs); this._shortBuffer.add(ageUs); this._longBuffer.add(ageUs);
-        const miniMedian = this._miniBuffer.median();
-        const shortMedian = this._shortBuffer.median();
-        const longMedian = this._longBuffer.median();
-
-        this._updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian);
-        this._log('drift', { d: +ageMs.toFixed(1), mini: +(miniMedian/1000).toFixed(1), short: +(shortMedian/1000).toFixed(1), long: +(longMedian/1000).toFixed(1) });
-
-        // Hard sync thresholds (Snapcast, all in microseconds)
-        // longMedian > 2ms(2000us), shortMedian > 5ms(5000us), miniMedian > 50ms(50000us), age > 500ms
-        if ((this._longBuffer.full() && Math.abs(longMedian) > 2000 && Math.abs(ageMs) > 5) ||
-            (this._shortBuffer.full() && Math.abs(shortMedian) > 5000 && Math.abs(ageMs) > 5) ||
-            (this._miniBuffer.full() && Math.abs(miniMedian) > 50000 && Math.abs(ageMs) > 20) ||
-            (Math.abs(ageMs) > 500)) {
-            this._log('hardSync', { age: +ageMs.toFixed(1) });
-            // Cooldown: no hard sync within 3 seconds
-            if (performance.now() - this._lastHardSync < 3000) return;
-            this._lastHardSync = performance.now();
-            this._hardSyncing = true;
-            this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
-                .finally(() => { this._hardSyncing = false; });
-            return;
-        }
-
-        // Soft correction (Snapcast setRealSampleRate)
-        if (this._shortBuffer.full()) {
-            const CORRECTION_BEGIN = 100; // 100us
-            const sr = this.ctx.sampleRate;
-            let correctAfterXFrames = 0;
-            // age>0 = playing too fast → insert frames (negative correctAfterXFrames)
-            // age<0 = playing too slow → drop frames (positive correctAfterXFrames)
-            if (shortMedian > CORRECTION_BEGIN && miniMedian > 50 && ageUs > 50) {
-                // Too fast: slow down by inserting frames
-                let rateAdj = Math.min((shortMedian / 100) * 0.00005, 0.0005);
-                correctAfterXFrames = -Math.round(1 / rateAdj); // negative = insert
-            } else if (shortMedian < -CORRECTION_BEGIN && miniMedian < -50 && ageUs < -50) {
-                // Too slow: speed up by dropping frames
-                let rateAdj = Math.min((-shortMedian / 100) * 0.00005, 0.0005);
-                correctAfterXFrames = Math.round(1 / rateAdj); // positive = drop
-            }
-            if (this.workletNode) this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames });
-        }
-    }
-
-    _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian) {
+        const drift = actualPos - expectedPos;
+        // Debug display
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
-            const bufMs = Math.round(this._workletBuffered / (this.ctx?.sampleRate || 48000) * 1000);
-            driftEl.textContent = `Drift: ${ageMs.toFixed(1)}ms | buf: ${bufMs}ms`;
+            const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
+            const driftAcc = (this._driftOffset * 1000).toFixed(1);
+            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | accum: ${driftAcc}ms`;
+            // Detailed debug panel
+            const dbg = document.getElementById('syncDebug');
+            if (dbg) {
+                const ctxEl = (this.ctx.currentTime - this.startTime).toFixed(3);
+                const svrEl = ((serverNow - this.serverPlayTime) / 1000).toFixed(3);
+                const elapsed_ = this.ctx.currentTime - this.startTime;
+                const rawP = (this.startOffset + Math.max(0, elapsed_)).toFixed(3);
+                const expP = expectedPos.toFixed(3);
+                const curP = this.getCurrentTime().toFixed(3);
+                const segI = this._nextSegIdx;
+                const nst = (this._nextSegTime - this.ctx.currentTime).toFixed(3);
+                const rate = this._currentPlaybackRate || 1.0;
+                const lat = ((this._outputLatency||0)*1000).toFixed(0);
+                const off = window.clockSync.offset.toFixed(1);
+                const rtt = window.clockSync.rtt.toFixed(0);
+                const sam = window.clockSync.samples.length;
+                const syn = window.clockSync.synced ? 'Y' : 'N';
+                dbg.innerHTML = [
+                    `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
+                    `POS raw:${rawP} exp:${expP} cur:${curP} svrElapsed:${svrEl}s ctxElapsed:${ctxEl}s`,
+                    `SEG idx:${segI} nextIn:${nst}s rate:${rate} driftOff:${driftAcc}ms lat:${lat}ms`,
+                ].join('<br>');
+            }
         }
-        const dbg = document.getElementById('syncDebug');
-        if (dbg) {
-            const bufMs = Math.round(this._workletBuffered / (this.ctx?.sampleRate || 48000) * 1000);
-            const capMs = Math.round(this._workletCapacity / (this.ctx?.sampleRate || 48000) * 1000);
-            dbg.innerHTML = [
-                `CLK offset:${window.clockSync.offset.toFixed(1)}ms rtt:${window.clockSync.rtt.toFixed(0)}ms synced:${window.clockSync.synced?'Y':'N'}`,
-                `DRIFT age:${ageMs.toFixed(1)}ms mini:${(miniMedian/1000).toFixed(1)}ms short:${(shortMedian/1000).toFixed(1)}ms long:${(longMedian/1000).toFixed(1)}ms`,
-                `BUF ${bufMs}ms/${capMs}ms | fed:${this._feederNextSeg}/${this.segments.length}`,
-            ].join('<br>');
-        }
-    }
+        const absDrift = Math.abs(drift);
+        // Log every drift measurement for diagnostics
+        this._log('drift', { d: +(drift*1000).toFixed(1), exp: +expectedPos.toFixed(3), act: +actualPos.toFixed(3), acc: +(this._driftOffset*1000).toFixed(1), sources: this.sources.length });
 
-    correctDrift() {
-        if (!this.isPlaying || !this.serverPlayTime) return 0;
-        const expectedPos = this.serverPlayPosition + (window.clockSync.getServerTime() - this.serverPlayTime) / 1000;
-        return Math.round((this.getCurrentTime() - expectedPos) * 1000);
+        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime for next merged chunk
+        if (absDrift > 0.005 && absDrift <= 0.05) {
+            if (Math.abs(this._driftOffset + drift) > 0.5) {
+                this._log('softCorrectionCapped', { accum: +(this._driftOffset*1000).toFixed(0) });
+                this._driftOffset = 0;
+                if (!this._resyncing) {
+                    this._resyncing = true;
+                    this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
+                        .finally(() => { this._resyncing = false; });
+                }
+                return Math.round(drift * 1000);
+            }
+            this._nextSegTime += drift;
+            this._driftOffset += drift;
+            this._resyncBackoff = 1500;
+            return Math.round(drift * 1000);
+        }
+
+        // Tier 2: playbackRate correction (50-150ms) — immediate effect on playing sources
+        if (absDrift > 0.05 && absDrift <= 0.15) {
+            let rateOffset;
+            if (absDrift <= 0.08) rateOffset = 0.005;
+            else if (absDrift <= 0.12) rateOffset = 0.008;
+            else rateOffset = 0.01;
+            const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
+            const adjustedDuration = Math.min(3, absDrift / rateOffset);
+
+            this._log('tier2Rate', { drift: +(drift*1000).toFixed(0), rate, dur: +adjustedDuration.toFixed(1) });
+            this._rateStartTime = this.ctx.currentTime;
+            this._currentPlaybackRate = rate;
+            this.sources.forEach(source => {
+                if (source.playbackRate) source.playbackRate.value = rate;
+            });
+            this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
+            if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
+            this._rateCorrectionTimer = null;
+            this._resyncBackoff = 1500;
+            return Math.round(drift * 1000);
+        }
+
+        // Tier 3: Hard resync (>150ms) — lowered threshold since merged chunks reduce soft correction opportunities
+        if (absDrift > 0.15) {
+            const backoff = this._resyncBackoff || 1500;
+            if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
+            this._log('hardResync', { drift: +(drift*1000).toFixed(0), backoff });
+            this._lastResync = Date.now();
+            this._resyncBackoff = Math.min(backoff * 2, 10000);
+            if (!this._resyncing) {
+                this._resyncing = true;
+                this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
+                    .finally(() => { this._resyncing = false; });
+            }
+            return Math.round(drift * 1000);
+        }
+        return Math.round(drift * 1000);
     }
 
     stop() {
         if (this.isPlaying) this.lastPosition = this.getCurrentTime();
-        this.isPlaying = false; this._upgrading = false;
-        if (this._feederTimer) { clearInterval(this._feederTimer); this._feederTimer = null; }
-        if (this._driftTimer) { clearInterval(this._driftTimer); this._driftTimer = null; }
-        if (this._logUploadTimer) { clearInterval(this._logUploadTimer); this._logUploadTimer = null; }
-        this.uploadLog();
-        if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
-        this._fedFrames = 0; this._fedSinceLastStats = 0;
-        this._miniBuffer.clear(); this._shortBuffer.clear(); this._longBuffer.clear();
+        this.isPlaying = false;
+        this._stopLookahead();
+        this.uploadLog(); // auto-upload debug log on stop
+        this._upgrading = false;
+        this._scheduling = false;
+        // Clear playbackRate correction
+        if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
+        this._rateCorrectingUntil = 0;
+        this._currentPlaybackRate = 1.0;
+        this._rateStartTime = 0;
+        this.sources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
+        this.sources = [];
+        this._driftOffset = 0;
+        this._softCorrectionTotal = 0;
     }
 
     getCurrentTime() {
-        if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
-        const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        const pos = this._feederStartPos + this._workletConsumed / sr;
-        return this.duration > 0 ? Math.min(pos, this.duration) : pos;
+        if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
+        const elapsed = this.ctx.currentTime - this.startTime;
+        let pos = this.startOffset + Math.max(0, elapsed);
+        // Reflect accumulated Tier 1 soft corrections in reported position
+        // _driftOffset > 0 means we pushed segments later (was too fast), so actual position is behind raw elapsed
+        pos -= this._driftOffset;
+        // Compensate for playbackRate during Tier 2 correction
+        if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
+            const rateElapsed = this.ctx.currentTime - this._rateStartTime;
+            pos += rateElapsed * (this._currentPlaybackRate - 1.0);
+        }
+        // Clamp to duration
+        if (this.duration > 0 && pos > this.duration) pos = this.duration;
+        return pos;
     }
 
     setVolume(v) { if (this.gainNode) this.gainNode.gain.value = v; }
