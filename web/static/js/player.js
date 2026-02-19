@@ -256,11 +256,34 @@ class AudioPlayer {
         if (this._lookaheadTimer) { clearInterval(this._lookaheadTimer); this._lookaheadTimer = null; }
     }
 
+    // Merge multiple decoded AudioBuffers into one continuous buffer (PCM-level stitching)
+    _mergeBuffers(bufferList, startOffset) {
+        if (!bufferList.length) return null;
+        const sampleRate = bufferList[0].sampleRate;
+        const numChannels = bufferList[0].numberOfChannels;
+        // Calculate total length, accounting for startOffset on first buffer
+        const firstSkipSamples = Math.round(startOffset * sampleRate);
+        let totalSamples = bufferList[0].length - firstSkipSamples;
+        for (let i = 1; i < bufferList.length; i++) totalSamples += bufferList[i].length;
+        const merged = this.ctx.createBuffer(numChannels, totalSamples, sampleRate);
+        for (let ch = 0; ch < numChannels; ch++) {
+            const out = merged.getChannelData(ch);
+            let pos = 0;
+            for (let i = 0; i < bufferList.length; i++) {
+                const src = bufferList[i].getChannelData(ch);
+                const skip = (i === 0) ? firstSkipSamples : 0;
+                out.set(src.subarray(skip), pos);
+                pos += src.length - skip;
+            }
+        }
+        return merged;
+    }
+
     async _scheduleAhead() {
         if (!this.isPlaying || this._scheduling) return;
         this._scheduling = true;
         try {
-        // Check if rate correction period has ended (backup for setTimeout throttling)
+        // Check if rate correction period has ended
         if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
             const actualRateTime = this.ctx.currentTime - this._rateStartTime;
             const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
@@ -273,60 +296,56 @@ class AudioPlayer {
             this._rateCorrectingUntil = 0;
             console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
         }
-        const LOOKAHEAD = 1.5; // schedule segments up to 1.5s into the future
-        const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
+        const LOOKAHEAD = 2.0;
+        const MERGE_COUNT = 3; // merge 3 segments (~15s) into one buffer
+        const preloadCount = this._actualQuality === 'lossless' ? 2 : 4;
+
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
-            const i = this._nextSegIdx;
-            if (!this.buffers.has(i)) {
-                if (this.onBuffering) this.onBuffering(true);
-                await this.loadSegment(i);
-                if (this.onBuffering) this.onBuffering(false);
-                if (!this.isPlaying) return;
+            // Collect up to MERGE_COUNT consecutive segments to merge
+            const startIdx = this._nextSegIdx;
+            const endIdx = Math.min(startIdx + MERGE_COUNT, this.segments.length);
+            const bufferList = [];
+            for (let i = startIdx; i < endIdx; i++) {
+                if (!this.buffers.has(i)) {
+                    if (this.onBuffering) this.onBuffering(true);
+                    await this.loadSegment(i);
+                    if (this.onBuffering) this.onBuffering(false);
+                    if (!this.isPlaying) return;
+                }
+                const buf = this.buffers.get(i);
+                if (!buf) break;
+                bufferList.push(buf);
             }
-            const buffer = this.buffers.get(i);
-            if (!buffer) break;
-            const source = this.ctx.createBufferSource();
-            source.buffer = buffer;
-            const gain = this.ctx.createGain();
-            source.connect(gain);
-            gain.connect(this.gainNode);
+            if (!bufferList.length) break;
+
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
-            const dur = buffer.duration - off;
+            const merged = this._mergeBuffers(bufferList, off);
+            if (!merged) break;
+
+            const source = this.ctx.createBufferSource();
+            source.buffer = merged;
+            source.connect(this.gainNode);
             const t = this._nextSegTime;
-            const overlap = 0.02; // 20ms crossfade — eliminates clicks on mobile
-            // Calculate effective duration considering playbackRate
             const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
-            const effectiveDur = dur / effectiveRate;
-            const effectiveOverlap = overlap / effectiveRate;
-            // Crossfade envelope: equal-power style to avoid volume dips at boundaries
-            if (!this._isFirstSeg) {
-                // Fade in over overlap period
-                gain.gain.setValueAtTime(0.0001, Math.max(0, t - effectiveOverlap));
-                gain.gain.exponentialRampToValueAtTime(1, t);
-            }
-            const endTime = t + effectiveDur;
-            // Fade out over overlap period
-            gain.gain.setValueAtTime(1, Math.max(0, endTime - effectiveOverlap));
-            gain.gain.exponentialRampToValueAtTime(0.0001, endTime);
-            // Start: first seg at exact ctxStartTime, others overlap slightly
-            const startAt = this._isFirstSeg ? t : Math.max(0, t - effectiveOverlap);
-            // Set playbackRate BEFORE start() for immediate effect
+            const effectiveDur = merged.duration / effectiveRate;
+
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
-            source.start(startAt, off);
-            // Clean up ended sources
+            source.start(t);
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
                 if (idx > -1) this.sources.splice(idx, 1);
             };
             this.sources.push(source);
             this._nextSegTime = t + effectiveDur;
-            this._nextSegIdx = i + 1;
+            this._nextSegIdx = startIdx + bufferList.length;
             this._isFirstSeg = false;
             // Preload upcoming segments
-            if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
+            if (this._nextSegIdx < this.segments.length) {
+                this.preloadSegments(this._nextSegIdx, preloadCount);
+            }
         }
         } finally { this._scheduling = false; }
     }
