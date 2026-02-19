@@ -447,6 +447,9 @@ class AudioPlayer {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
+        // Reflect accumulated Tier 1 soft corrections in reported position
+        // _driftOffset > 0 means we pushed segments later (was too fast), so actual position is behind raw elapsed
+        pos -= this._driftOffset;
         // Compensate for playbackRate during Tier 2 correction
         if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
             const rateElapsed = this.ctx.currentTime - this._rateStartTime;
