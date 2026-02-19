@@ -179,8 +179,6 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
-                // Drift loop handles cross-device sync via server time comparison
-                // Just update anchors here, no separate hardSync check needed
                 // Clear short-term buffer to avoid mixing old/new anchor samples
                 if (window.audioPlayer._miniBuffer) window.audioPlayer._miniBuffer.clear();
                 if (window.audioPlayer._shortBuffer) window.audioPlayer._shortBuffer.clear();

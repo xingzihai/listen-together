@@ -35,19 +35,14 @@ class AudioPlayer {
         this._workletTotalPlayed = 0; this._workletConsumed = 0; this._workletSampleRate = 48000;
         this._feederTimer = null; this._feederNextSeg = 0;
         this._feederSegOffset = 0; this._feederGen = 0; this._feederStartPos = 0; this._feeding = false;
-        this._consumedBaseline = 0;
         this._fedSinceLastStats = 0;
         this._miniBuffer = new MedianBuffer(40);
         this._shortBuffer = new MedianBuffer(100);
         this._longBuffer = new MedianBuffer(500);
         this._driftTimer = null; this._hardSyncing = false; this._lastHardSync = 0;
         this._playStartedAt = 0; this._fedFrames = 0; this._sampleRate = 0;
-        this._ctxTimeAtPlay = 0; // AudioContext.currentTime when play started (same clock as worklet)
         this._prevTailL = null; this._prevTailR = null;
         this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
-        this._lastStatsTime = 0;
-        this._lastStatsConsumed = 0;
-        this._loadingPromises = new Map();
     }
 
     _log(event, data) {
@@ -102,8 +97,6 @@ class AudioPlayer {
                 this._workletConsumed = msg.totalConsumedFrames;
                 this._workletSampleRate = msg.sampleRate;
                 this._fedSinceLastStats = 0;
-                this._lastStatsTime = performance.now();
-                this._lastStatsConsumed = msg.totalConsumedFrames;
             } else if (msg.type === 'overflow') {
                 this._log('overflow', { dropped: msg.dropped });
             }
@@ -221,14 +214,6 @@ class AudioPlayer {
 
     async loadSegment(idx) {
         if (this.buffers.has(idx)) return this.buffers.get(idx);
-        if (this._loadingPromises.has(idx)) return this._loadingPromises.get(idx);
-        const promise = this._doLoadSegment(idx);
-        this._loadingPromises.set(idx, promise);
-        try { return await promise; }
-        finally { this._loadingPromises.delete(idx); }
-    }
-
-    async _doLoadSegment(idx) {
         const url = this._getSegmentURL(idx);
         let data = await window.audioCache.get(url);
         if (!data) {
@@ -257,8 +242,6 @@ class AudioPlayer {
 
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
         this._fedFrames = 0; this._fedSinceLastStats = 0;
-        this._workletConsumed = 0; this._workletBuffered = 0; this._workletTotalPlayed = 0;
-        this._consumedBaseline = 0;
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -268,7 +251,6 @@ class AudioPlayer {
         }
         if (!this.isPlaying || gen !== this._feederGen) return;
 
-        // Calculate position for segment selection (before feed)
         let actualPos = this.serverPlayPosition;
         if (scheduledAt) {
             const waitMs = (scheduledAt - window.clockSync.offset) - Date.now();
@@ -277,19 +259,16 @@ class AudioPlayer {
                 if (!this.isPlaying || gen !== this._feederGen) return;
             }
         }
+        // Always recalculate elapsed after any wait
         const elapsed = Math.max(0, (window.clockSync.getServerTime() - this.serverPlayTime) / 1000);
         actualPos = this.serverPlayPosition + elapsed;
 
-        // Anchor = data start position. consumed starts from 0.
-        // Feed delay causes fixed negative drift (~200-500ms) but soft correction is disabled.
         this._feederStartPos = actualPos;
         this._feederNextSeg = Math.floor(actualPos / this.segmentTime);
         this._feederSegOffset = actualPos - this._feederNextSeg * this.segmentTime;
 
-        await this._feedSegments(gen, 2);
+        await this._feedSegments(gen, 1);
         if (!this.isPlaying || gen !== this._feederGen) return;
-
-        this._playStartedAt = performance.now();
 
         this._feederTimer = setInterval(() => this._feedLoop(gen), 100);
         this._driftTimer = setInterval(() => this._driftLoop(), 250);
@@ -302,11 +281,9 @@ class AudioPlayer {
             if (this._feederNextSeg >= this.segments.length) return;
             const sr = this.ctx?.sampleRate || 48000;
             const segFrames = Math.ceil(this.segmentTime * sr);
+            // Use known capacity (5s * sampleRate) if worklet hasn't reported yet
             const capacity = this._workletCapacity > 0 ? this._workletCapacity : Math.ceil(sr * 5);
-            // Time-decay compensation: estimate how much worklet consumed since last stats
-            const statAge = this._lastStatsTime > 0 ? (performance.now() - this._lastStatsTime) / 1000 : 0;
-            const estimatedConsumed = Math.floor(statAge * sr);
-            const buffered = Math.max(0, this._workletBuffered - estimatedConsumed) + this._fedSinceLastStats;
+            const buffered = this._workletBuffered + this._fedSinceLastStats;
             if (buffered > capacity - segFrames) return;
 
             if (!this.buffers.has(this._feederNextSeg)) {
@@ -324,7 +301,6 @@ class AudioPlayer {
             this._feederSegOffset = 0;
 
             // Crossfade with previous segment tail to eliminate Opus pre-skip gaps
-            // Instead of trimming tail, we overlap-blend: prev tail fades out, new head fades in
             let sliceL = srcL.slice(offsetFrames);
             let sliceR = srcR.slice(offsetFrames);
             if (this._prevTailL && sliceL.length > 0) {
@@ -336,29 +312,31 @@ class AudioPlayer {
                 }
                 this._prevTailL = null; this._prevTailR = null;
             }
-            // Save tail reference for next segment crossfade (no trimming — send full data)
-            if (sliceL.length > this._CROSSFADE_FRAMES) {
-                this._prevTailL = sliceL.slice(sliceL.length - this._CROSSFADE_FRAMES);
-                this._prevTailR = sliceR.slice(sliceR.length - this._CROSSFADE_FRAMES);
+            // Save tail for next segment crossfade (only if segment long enough)
+            let sendL, sendR;
+            if (sliceL.length > this._CROSSFADE_FRAMES * 2) {
+                const tailLen = this._CROSSFADE_FRAMES;
+                this._prevTailL = sliceL.slice(sliceL.length - tailLen);
+                this._prevTailR = sliceR.slice(sliceR.length - tailLen);
+                sendL = sliceL.slice(0, sliceL.length - tailLen);
+                sendR = sliceR.slice(0, sliceR.length - tailLen);
             } else {
+                // Segment too short for tail trimming, send all data
+                sendL = sliceL;
+                sendR = sliceR;
+                // Don't save tail — next segment will just not crossfade
                 this._prevTailL = null; this._prevTailR = null;
             }
-            // Send ALL frames (no tail trimming — eliminates cumulative position drift)
-            const sendL = sliceL;
-            const sendR = sliceR;
             const len = sendL.length;
             if (len <= 0) { this._feederNextSeg++; continue; }
 
-            // sliceL/sliceR are from Float32Array.slice() — independent ArrayBuffers
-            // prevTail was saved via .slice() before this point — also independent
-            // Safe to transfer sendL/sendR buffers directly
             const leftBuf = sendL.buffer;
             const rightBuf = sendR.buffer;
             this.workletNode.port.postMessage({ type: 'pcm', left: leftBuf, right: rightBuf }, [leftBuf, rightBuf]);
             this._fedFrames += len;
             this._fedSinceLastStats += len;
             this._feederNextSeg++;
-            if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 5);
+            if (this._feederNextSeg < this.segments.length) this.preloadSegments(this._feederNextSeg, 3);
         }
     }
 
@@ -371,7 +349,7 @@ class AudioPlayer {
 
     _driftLoop() {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
-        if (performance.now() - this._playStartedAt < 5000) return;
+        if (performance.now() - this._playStartedAt < 3000) return;
 
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
@@ -384,7 +362,7 @@ class AudioPlayer {
         const shortMedian = this._shortBuffer.median();
         const longMedian = this._longBuffer.median();
 
-        this._updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian, actualPos);
+        this._updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian);
         this._log('drift', { d: +ageMs.toFixed(1), mini: +(miniMedian/1000).toFixed(1), short: +(shortMedian/1000).toFixed(1), long: +(longMedian/1000).toFixed(1) });
 
         // Hard sync thresholds (Snapcast, all in microseconds)
@@ -392,26 +370,38 @@ class AudioPlayer {
         if ((this._longBuffer.full() && Math.abs(longMedian) > 2000 && Math.abs(ageMs) > 5) ||
             (this._shortBuffer.full() && Math.abs(shortMedian) > 5000 && Math.abs(ageMs) > 5) ||
             (this._miniBuffer.full() && Math.abs(miniMedian) > 50000 && Math.abs(ageMs) > 20) ||
-            (Math.abs(ageMs) > 1000)) {
+            (Math.abs(ageMs) > 500)) {
             this._log('hardSync', { age: +ageMs.toFixed(1) });
             // Cooldown: no hard sync within 3 seconds
             if (performance.now() - this._lastHardSync < 3000) return;
             this._lastHardSync = performance.now();
             this._hardSyncing = true;
-            // Use server time for cross-device sync accuracy
-            const serverNow = window.clockSync.getServerTime();
-            const serverPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
-            this.playAtPosition(serverPos, serverNow)
+            this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
                 .finally(() => { this._hardSyncing = false; });
             return;
         }
 
-        // Soft correction DISABLED — stabilize base playback first
-        // Will re-enable after confirming no underrun/overflow/stutter
-        // if (this._shortBuffer.full()) { ... }
+        // Soft correction (Snapcast setRealSampleRate)
+        if (this._shortBuffer.full()) {
+            const CORRECTION_BEGIN = 100; // 100us
+            const sr = this.ctx.sampleRate;
+            let correctAfterXFrames = 0;
+            // age>0 = playing too fast → insert frames (negative correctAfterXFrames)
+            // age<0 = playing too slow → drop frames (positive correctAfterXFrames)
+            if (shortMedian > CORRECTION_BEGIN && miniMedian > 50 && ageUs > 50) {
+                // Too fast: slow down by inserting frames
+                let rateAdj = Math.min((shortMedian / 100) * 0.00005, 0.0005);
+                correctAfterXFrames = -Math.round(1 / rateAdj); // negative = insert
+            } else if (shortMedian < -CORRECTION_BEGIN && miniMedian < -50 && ageUs < -50) {
+                // Too slow: speed up by dropping frames
+                let rateAdj = Math.min((-shortMedian / 100) * 0.00005, 0.0005);
+                correctAfterXFrames = Math.round(1 / rateAdj); // positive = drop
+            }
+            if (this.workletNode) this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames });
+        }
     }
 
-    _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian, actualPos) {
+    _updateDebugDisplay(ageMs, miniMedian, shortMedian, longMedian) {
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
             const bufMs = Math.round(this._workletBuffered / (this.ctx?.sampleRate || 48000) * 1000);
@@ -444,15 +434,13 @@ class AudioPlayer {
         this.uploadLog();
         if (this.workletNode) this.workletNode.port.postMessage({ type: 'clear' });
         this._fedFrames = 0; this._fedSinceLastStats = 0;
-        this._workletConsumed = 0; this._workletBuffered = 0; this._workletTotalPlayed = 0;
-        this._consumedBaseline = 0;
         this._miniBuffer.clear(); this._shortBuffer.clear(); this._longBuffer.clear();
     }
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
         const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
-        const pos = this._feederStartPos + (this._workletConsumed - (this._consumedBaseline || 0)) / sr;
+        const pos = this._feederStartPos + this._workletConsumed / sr;
         return this.duration > 0 ? Math.min(pos, this.duration) : pos;
     }
 
