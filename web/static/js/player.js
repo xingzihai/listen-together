@@ -215,10 +215,8 @@ class AudioPlayer {
         this.serverPlayPosition = position || 0;
         this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
 
-        // Capture ctx↔wall clock relationship ONCE before any async work
-        // This avoids drift between the two clocks during preload
-        const ctxSnap = this.ctx.currentTime;
-        const wallSnap = performance.now();
+        // Set cooldown: skip drift correction for 3s after playAtPosition to let playback stabilize
+        this._playStartedAt = performance.now();
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -228,8 +226,9 @@ class AudioPlayer {
         }
         if (!this.isPlaying) return;
 
-        // Use the snapshot to convert wall time → ctx time accurately
-        const ctxNow = ctxSnap + (performance.now() - wallSnap) / 1000;
+        // Re-snapshot AFTER async preload so elapsed calculation is accurate
+        const ctxNow = this.ctx.currentTime;
+        const wallNow = performance.now();
 
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
@@ -400,6 +399,8 @@ class AudioPlayer {
     // Three-tier correction: soft (15-50ms), playbackRate (50-300ms), hard (>300ms)
     correctDrift() {
         if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
+        // Cooldown: skip drift correction for 3s after playAtPosition
+        if (this._playStartedAt && performance.now() - this._playStartedAt < 3000) return 0;
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
         // Check if rate correction period has ended (backup recovery)
