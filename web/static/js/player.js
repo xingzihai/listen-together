@@ -46,9 +46,17 @@ class AudioPlayer {
         fetch('/api/debug-log', { method: 'POST', headers: {'Content-Type':'application/json'}, body: this.dumpLog() }).catch(() => {});
     }
 
-    init() {
+    init(sampleRate) {
+        if (this.ctx && sampleRate && this.ctx.sampleRate !== sampleRate) {
+            // Sample rate mismatch — recreate context to avoid resampling artifacts
+            this.stop();
+            this.ctx.close().catch(() => {});
+            this.ctx = null;
+            this.gainNode = null;
+        }
         if (!this.ctx) {
-            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const opts = sampleRate ? { sampleRate } : {};
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)(opts);
             this.gainNode = this.ctx.createGain();
             this.gainNode.connect(this.ctx.destination);
         }
@@ -214,8 +222,6 @@ class AudioPlayer {
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
         this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
-
-        // Set cooldown: skip drift correction for 3s after playAtPosition to let playback stabilize
         this._playStartedAt = performance.now();
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
@@ -225,6 +231,19 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
         if (!this.isPlaying) return;
+
+        // Reinit ctx to match audio sample rate (avoids resampling artifacts)
+        const firstBuf = this.buffers.get(segIdx);
+        if (firstBuf && firstBuf.sampleRate !== this.ctx.sampleRate) {
+            this._log('sampleRateMismatch', { ctx: this.ctx.sampleRate, audio: firstBuf.sampleRate });
+            // Re-decode all cached buffers with new ctx
+            const oldBuffers = new Map(this.buffers);
+            this.init(firstBuf.sampleRate);
+            this.isPlaying = true;
+            this.buffers.clear();
+            // Re-load segments (old decoded buffers are tied to old ctx)
+            await this.preloadSegments(segIdx, 2);
+        }
 
         // Re-snapshot AFTER async preload so elapsed calculation is accurate
         const ctxNow = this.ctx.currentTime;

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html><head><title>Audio Test</title></head>
+<body>
+<h3>Audio Playback Test</h3>
+<button id="test1">Test 1: 48kHz ctx (old behavior)</button><br><br>
+<button id="test2">Test 2: 44100Hz ctx (new fix)</button><br><br>
+<button id="test3">Test 3: HTML Audio</button>
+<p id="info" style="color:blue"></p>
+<p id="err" style="color:red"></p>
+<script>
+const info = document.getElementById('info');
+const err = document.getElementById('err');
+
+document.getElementById('test1').onclick = async () => {
+    try {
+        err.textContent = '';
+        const c = new AudioContext(); await c.resume();
+        info.textContent = 'ctx: ' + c.sampleRate + 'Hz | Fetching...';
+        const res = await fetch('/test-audio/seg_000.flac');
+        const buf = await c.decodeAudioData(await res.arrayBuffer());
+        info.textContent += ' | buf: ' + buf.sampleRate + 'Hz ' + buf.duration.toFixed(2) + 's | Playing...';
+        const src = c.createBufferSource(); src.buffer = buf; src.connect(c.destination); src.start();
+    } catch(e) { err.textContent = e.message; }
+};
+
+document.getElementById('test2').onclick = async () => {
+    try {
+        err.textContent = '';
+        const c = new AudioContext({ sampleRate: 44100 }); await c.resume();
+        info.textContent = 'ctx: ' + c.sampleRate + 'Hz | Fetching...';
+        const res = await fetch('/test-audio/seg_000.flac');
+        const buf = await c.decodeAudioData(await res.arrayBuffer());
+        info.textContent += ' | buf: ' + buf.sampleRate + 'Hz ' + buf.duration.toFixed(2) + 's | Playing...';
+        const src = c.createBufferSource(); src.buffer = buf; src.connect(c.destination); src.start();
+    } catch(e) { err.textContent = e.message; }
+};
+
+document.getElementById('test3').onclick = () => {
+    err.textContent = '';
+    new Audio('/test-audio/seg_000.flac').play().then(() => info.textContent = 'HTML Audio playing').catch(e => err.textContent = e.message);
+};
+</script>
+</body></html>
