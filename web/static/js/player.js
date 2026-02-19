@@ -214,8 +214,8 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.stop(); // stop FIRST to clean all old sources
         this.init(this._sampleRate || undefined);
+        this.stop();
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
@@ -235,9 +235,22 @@ class AudioPlayer {
         }
         if (!this.isPlaying) return;
 
-        // Always use fallback path: calculate elapsed from server time
-        // This avoids the scheduledPlay race condition where old sources overlap
         const ctxNow = this.ctx.currentTime;
+
+        // Try hardware-level scheduling if scheduledAt is still in the future
+        if (scheduledAt) {
+            const localScheduled = scheduledAt - window.clockSync.offset;
+            const waitMs = localScheduled - Date.now();
+            if (waitMs > 2 && waitMs < 3000) {
+                const ctxTarget = ctxNow + waitMs / 1000;
+                this.startOffset = this.serverPlayPosition;
+                this.startTime = ctxTarget;
+                this._startLookahead(this.serverPlayPosition, ctxTarget);
+                this._log('scheduledPlay', { waitMs: +waitMs.toFixed(0), lat: +((this._outputLatency||0)*1000).toFixed(1) });
+                return;
+            }
+        }
+        // Fallback: calculate elapsed from server time
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
