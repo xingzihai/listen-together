@@ -45,6 +45,7 @@ class AudioPlayer {
         this._prevTailL = null; this._prevTailR = null;
         this._CROSSFADE_FRAMES = 144; // ~3ms@48kHz, set properly after ctx init
         this._lastStatsTime = 0;
+        this._lastStatsConsumed = 0;
         this._loadingPromises = new Map();
     }
 
@@ -101,6 +102,7 @@ class AudioPlayer {
                 this._workletSampleRate = msg.sampleRate;
                 this._fedSinceLastStats = 0;
                 this._lastStatsTime = performance.now();
+                this._lastStatsConsumed = msg.totalConsumedFrames;
             } else if (msg.type === 'overflow') {
                 this._log('overflow', { dropped: msg.dropped });
             }
@@ -365,11 +367,9 @@ class AudioPlayer {
         if (!this.isPlaying || !this.serverPlayTime || this._hardSyncing) return;
         if (performance.now() - this._playStartedAt < 3000) return;
 
-        // Cross-device drift: compare local playback position vs server expected position
-        // Both use wall clock (server time), this is the ONLY drift that matters for sync
         const serverNow = window.clockSync.getServerTime();
         const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
-        const actualPos = this.getCurrentTime(); // ctx.currentTime based, real-time
+        const actualPos = this.getCurrentTime();
         const ageMs = (actualPos - expectedPos) * 1000;
         const ageUs = ageMs * 1000;
 
@@ -458,8 +458,14 @@ class AudioPlayer {
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
-        // Primary: use AudioContext clock (real-time, no async delay)
-        const pos = this._feederStartPos + (this.ctx.currentTime - this._ctxTimeAtPlay);
+        const sr = this._workletSampleRate || this.ctx.sampleRate || 48000;
+        // Interpolate consumed frames between stats updates to eliminate async lag
+        let consumed = this._workletConsumed;
+        if (this._lastStatsTime > 0 && this._workletBuffered > 0) {
+            const elapsed = (performance.now() - this._lastStatsTime) / 1000;
+            consumed = this._lastStatsConsumed + elapsed * sr;
+        }
+        const pos = this._feederStartPos + consumed / sr;
         return this.duration > 0 ? Math.min(pos, this.duration) : pos;
     }
 
