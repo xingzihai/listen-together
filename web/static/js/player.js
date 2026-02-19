@@ -223,7 +223,7 @@ class AudioPlayer {
         this._rateStartTime = 0;
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
-        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality });
+        this._log('playAtPosition', { pos: this.serverPlayPosition, scheduledAt, quality: this._actualQuality, ctxSR: this.ctx.sampleRate, targetSR: this._sampleRate || 'none' });
         this._playStartedAt = performance.now();
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);

@@ -349,6 +349,7 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 		"segments":     qi.Segments,
 		"duration":     manifest.Duration,
 		"segment_time": manifest.SegmentTime,
+		"sample_rate":  manifest.SampleRate,
 		"owner_id":     af.OwnerID,
 		"audio_uuid":   af.Filename,
 	})
