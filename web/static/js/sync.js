@@ -21,12 +21,28 @@ class ClockSync {
 
     _scheduleNext() {
         if (this._timer) clearTimeout(this._timer);
-        // Aggressive: 150ms when unsynced, 300ms always after synced
-        const interval = !this.synced ? 150 : 300;
+        // Adaptive frequency: 150ms unsynced, 300ms normal, 2000ms when stable
+        let interval = !this.synced ? 150 : 300;
+        if (this.synced && this._isStable()) interval = 2000;
         this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
     }
 
+    // Check if recent offsets are stable (all changes < 3ms)
+    _isStable() {
+        if (this.samples.length < 5) return false;
+        const recent = this.samples.slice(-5);
+        for (let i = 1; i < recent.length; i++) {
+            if (Math.abs(recent[i].offset - recent[i-1].offset) > 3) return false;
+        }
+        return true;
+    }
+
     stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } }
+
+    // Burst mode: send 8 rapid pings for quick re-sync (e.g., after visibility change)
+    burst() {
+        for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 50);
+    }
 
     ping() {
         if (!this.ws || this.ws.readyState !== 1) return;
@@ -51,8 +67,18 @@ class ClockSync {
                 this.samples = [];
                 this.synced = false;
                 this.rtt = Infinity;
+                // Network change: accelerate back to 300ms
+                this._scheduleNext();
             }
             this._lastNetType = net;
+        }
+
+        // Detect offset jump > 10ms: accelerate sync frequency
+        if (this.synced && this.samples.length > 0) {
+            const lastOffset = this.samples[this.samples.length - 1].offset;
+            if (Math.abs(offset - lastOffset) > 10) {
+                this._scheduleNext(); // Reset to faster interval
+            }
         }
 
         if (rtt > 1000) return;
@@ -75,9 +101,9 @@ class ClockSync {
         for (let i = 0; i < topN; i++) sum += byRtt[i].offset;
         const newOffset = sum / topN;
 
-        // Tight EMA: small changes (<10ms) blend aggressively, large jumps apply immediately
+        // EMA: small changes (<10ms) blend with 0.7/0.3, large jumps apply immediately
         if (this.synced && Math.abs(newOffset - this.offset) < 10) {
-            this.offset = 0.9 * this.offset + 0.1 * newOffset;
+            this.offset = 0.7 * this.offset + 0.3 * newOffset;
         } else {
             this.offset = newOffset;
         }

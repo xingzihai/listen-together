@@ -575,3 +575,18 @@ $('addFromLibBtn').onclick = async () => {
 };
 $('libraryModalClose').onclick = () => $('libraryModal').classList.add('hidden');
 $('libraryModal').onclick = e => { if (e.target === e.currentTarget) e.currentTarget.classList.add('hidden'); };
+
+// === Visibility change: re-sync when page becomes visible ===
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && window.clockSync && window.audioPlayer.isPlaying) {
+        console.log('[sync] page visible, triggering burst re-sync');
+        window.clockSync.burst();
+        // Wait 500ms for offset to converge, then correct drift
+        setTimeout(() => {
+            if (window.audioPlayer.isPlaying) {
+                const drift = window.audioPlayer.correctDrift();
+                if (drift) console.log('[sync] post-visibility drift corrected:', drift, 'ms');
+            }
+        }, 500);
+    }
+});

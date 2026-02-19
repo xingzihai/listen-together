@@ -136,7 +136,7 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	// SyncTick: broadcast current playback position to all playing rooms every 2s
+	// SyncTick: broadcast current playback position to all playing rooms every 1s
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -146,15 +146,17 @@ func main() {
 				state := rm.State
 				pos := rm.Position
 				startT := rm.StartTime
+				clientCount := len(rm.Clients)
 				var clients []*room.Client
-				if state == room.StatePlaying {
-					clients = make([]*room.Client, 0, len(rm.Clients))
+				// Only broadcast to multi-client rooms
+				if state == room.StatePlaying && clientCount > 1 {
+					clients = make([]*room.Client, 0, clientCount)
 					for _, c := range rm.Clients {
 						clients = append(clients, c)
 					}
 				}
 				rm.Mu.RUnlock()
-				if state != room.StatePlaying {
+				if clients == nil {
 					continue
 				}
 				elapsed := time.Since(startT).Seconds()
