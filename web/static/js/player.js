@@ -35,8 +35,8 @@ class AudioPlayer {
             this.gainNode.connect(this.ctx.destination);
         }
         if (this.ctx.state === 'suspended') this.ctx.resume();
-        // Cache hardware output latency for compensation
-        this._outputLatency = (this.ctx.outputLatency || 0) + (this.ctx.baseLatency || 0);
+        // Cache hardware output latency for future use (not yet applied to scheduling)
+        this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
     }
 
     async loadAudio(audioInfo, roomCode) {
@@ -216,26 +216,22 @@ class AudioPlayer {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - Date.now();
             if (waitMs > 2 && waitMs < 3000) {
-                // Convert wait to ctx timeline, compensate for hardware output latency
-                // Devices with higher latency schedule earlier so sound arrives at the same moment
-                const latComp = this._outputLatency || 0;
-                const ctxTarget = ctxNow + waitMs / 1000 - latComp;
+                // Convert wait to ctx timeline
+                const ctxTarget = ctxNow + waitMs / 1000;
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
                 this._startLookahead(this.serverPlayPosition, ctxTarget);
-                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${(latComp*1000).toFixed(1)}ms`);
+                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${((this._outputLatency||0)*1000).toFixed(1)}ms`);
                 return;
             }
         }
         // Fallback: calculate how much time has passed since scheduledAt/serverTime
-        // Compensate for hardware output latency
-        const latComp = this._outputLatency || 0;
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
         this.startOffset = actualPos;
-        this.startTime = ctxNow - latComp;
-        this._startLookahead(actualPos, ctxNow - latComp);
+        this.startTime = ctxNow;
+        this._startLookahead(actualPos, ctxNow);
     }
 
     // === Lookahead Scheduler ===
