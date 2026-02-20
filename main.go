@@ -440,12 +440,52 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// --- Per-connection message rate limiter (sliding window) ---
+	const (
+		msgRateWindow  = time.Second
+		msgRateLimit   = 10 // normal messages per second
+		pingRateLimit  = 5  // ping messages per second
+	)
+	var (
+		msgTimes  = make([]time.Time, 0, msgRateLimit)
+		pingTimes = make([]time.Time, 0, pingRateLimit)
+	)
+	checkRate := func(times *[]time.Time, limit int) bool {
+		now := time.Now()
+		cutoff := now.Add(-msgRateWindow)
+		valid := (*times)[:0]
+		for _, t := range *times {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) >= limit {
+			*times = valid
+			return false
+		}
+		*times = append(valid, now)
+		return true
+	}
+
 	for {
 		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		// Rate limit check
+		if msg.Type == "ping" {
+			if !checkRate(&pingTimes, pingRateLimit) {
+				safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+				break
+			}
+		} else {
+			if !checkRate(&msgTimes, msgRateLimit) {
+				safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+				break
+			}
+		}
 
 		switch msg.Type {
 		case "create":
