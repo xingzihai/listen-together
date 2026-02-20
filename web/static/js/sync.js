@@ -88,8 +88,9 @@ class ClockSync {
             }
         }
 
-        // Expire old samples (10s — only keep very fresh data)
-        const cutoff = performance.now() - 10000;
+        // Expire old samples: 10s when unsynced (need fresh data), 30s when stable
+        const expiry = (this.synced && this._isStable()) ? 30000 : 10000;
+        const cutoff = performance.now() - expiry;
         this.samples = this.samples.filter(s => s.ts > cutoff);
 
         if (this.samples.length < 3) { this.synced = false; this.updateUI(); return; }

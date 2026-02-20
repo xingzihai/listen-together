@@ -180,8 +180,8 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
-                // Immediate drift check after anchor update
-                const drift = window.audioPlayer.correctDrift();
+                // Immediate drift check after anchor update (skip debounce)
+                const drift = window.audioPlayer.correctDrift(true);
                 if (drift) console.log('syncTick drift corrected:', drift, 'ms');
             }
             break;
@@ -593,7 +593,8 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && window.clockSync && window.audioPlayer.isPlaying) {
         console.log('[sync] page visible, triggering burst re-sync');
         window.clockSync.burst();
-        // Wait 500ms for offset to converge, then correct drift
+        // Immediately catch up on segment scheduling that was throttled in background
+        if (window.audioPlayer._scheduleAhead) window.audioPlayer._scheduleAhead();
         setTimeout(() => {
             if (window.audioPlayer.isPlaying) {
                 const drift = window.audioPlayer.correctDrift();

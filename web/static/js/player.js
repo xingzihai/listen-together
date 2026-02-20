@@ -202,6 +202,7 @@ class AudioPlayer {
         this.isPlaying = true;
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
+        this._pendingDriftCorrection = 0;
         this._resyncGen++;
         this._rateStartTime = 0;
 
@@ -260,7 +261,9 @@ class AudioPlayer {
         this.startOffset = actualPos;
         // Schedule earlier by outputLatency, but keep startTime as logical anchor
         this.startTime = ctxNow; // logical anchor, no latency bias
-        this._startLookahead(actualPos, ctxNow - latency);
+        // Ensure schedule target is not in the past
+        const schedFallback = Math.max(ctxNow - latency, this.ctx.currentTime);
+        this._startLookahead(actualPos, schedFallback);
     }
 
     // === Lookahead Scheduler ===
@@ -327,6 +330,11 @@ class AudioPlayer {
                 source.playbackRate.value = this._currentPlaybackRate;
             }
             source.start(t, off);
+            // Transfer pending drift correction now that the corrected segment is actually scheduled
+            if (this._pendingDriftCorrection) {
+                this._driftOffset += this._pendingDriftCorrection;
+                this._pendingDriftCorrection = 0;
+            }
             // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
@@ -344,7 +352,7 @@ class AudioPlayer {
 
     // === Drift Correction ===
     // Three-tier correction: soft (15-50ms), playbackRate (50-300ms), hard (>300ms)
-    correctDrift() {
+    correctDrift(skipDebounce) {
         if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
         // Skip correction during playbackRate adjustment
         if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
@@ -362,9 +370,9 @@ class AudioPlayer {
             console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
         }
 
-        // Debounce: max 10 corrections per second
+        // Debounce: max 10 corrections per second (skip for syncTick with fresh anchor)
         const now = performance.now();
-        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 100) return 0;
+        if (!skipDebounce && this._lastCorrectionTime && now - this._lastCorrectionTime < 100) return 0;
         this._lastCorrectionTime = now;
 
         const serverNow = window.clockSync.getServerTime();
@@ -423,9 +431,9 @@ class AudioPlayer {
             // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
             // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
             this._nextSegTime += drift;
-            this._driftOffset += drift;
-            // Don't update _softCorrectionTotal — correction affects future scheduling,
-            // not current position. getCurrentTime() stays pure measurement.
+            // Don't update _driftOffset here — the actual audio hasn't changed yet.
+            // _driftOffset is updated in _scheduleAhead when the corrected segment is actually scheduled.
+            this._pendingDriftCorrection = (this._pendingDriftCorrection || 0) + drift;
             this._resyncBackoff = 500;
             return Math.round(drift * 1000);
         }
@@ -440,7 +448,7 @@ class AudioPlayer {
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const neededCatchUp = absDrift;
-            const adjustedDuration = Math.min(2, neededCatchUp / rateOffset);
+            const adjustedDuration = Math.min(5, neededCatchUp / rateOffset);
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
@@ -494,6 +502,7 @@ class AudioPlayer {
         this.sources = [];
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
+        this._pendingDriftCorrection = 0;
     }
 
     getCurrentTime() {
