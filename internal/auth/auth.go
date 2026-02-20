@@ -239,7 +239,7 @@ func setTokenCookieWithRequest(w http.ResponseWriter, r *http.Request, token str
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   86400,
 	})
 }
