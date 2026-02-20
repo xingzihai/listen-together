@@ -500,9 +500,61 @@ func (d *DB) UpdateUserRole(id int64, role string) error {
 	return fmt.Errorf("update user role failed after %d retries: %w", maxRetries, lastErr)
 }
 
-func (d *DB) DeleteUser(id int64) error {
-	_, err := d.conn.Exec("DELETE FROM users WHERE id=?", id)
-	return err
+// DeleteUser removes a user and all associated data in a transaction.
+// Returns the list of audio filenames that were owned by the user so the
+// caller can clean up the files on disk.
+func (d *DB) DeleteUser(id int64) ([]string, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+
+	// 1. Collect audio filenames for disk cleanup
+	rows, err := tx.Query("SELECT filename FROM audio_files WHERE owner_id=?", id)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("query audio files: %w", err)
+	}
+	var filenames []string
+	for rows.Next() {
+		var fn string
+		if err := rows.Scan(&fn); err != nil {
+			rows.Close()
+			tx.Rollback()
+			return nil, fmt.Errorf("scan filename: %w", err)
+		}
+		filenames = append(filenames, fn)
+	}
+	rows.Close()
+
+	// 2. Delete library_shares where user is owner or recipient
+	if _, err := tx.Exec("DELETE FROM library_shares WHERE owner_id=? OR shared_with_id=?", id, id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete library_shares: %w", err)
+	}
+
+	// 3. Delete playlist_items that reference this user's audio files
+	if _, err := tx.Exec("DELETE FROM playlist_items WHERE audio_id IN (SELECT id FROM audio_files WHERE owner_id=?)", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete playlist_items: %w", err)
+	}
+
+	// 4. Delete audio files
+	if _, err := tx.Exec("DELETE FROM audio_files WHERE owner_id=?", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete audio_files: %w", err)
+	}
+
+	// 5. Delete the user record
+	if _, err := tx.Exec("DELETE FROM users WHERE id=?", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete user: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return filenames, nil
 }
 
 func (d *DB) ListUsersPaged(page, pageSize int) ([]*User, int, error) {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -444,9 +445,18 @@ func (h *AuthHandlers) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if h.Manager != nil {
 		h.Manager.CloseRoomsByOwnerID(target.ID)
 	}
-	if err := h.DB.DeleteUser(target.ID); err != nil {
+	deletedFiles, err := h.DB.DeleteUser(target.ID)
+	if err != nil {
 		jsonError(w, "删除失败", 500)
 		return
+	}
+	// Clean up audio files from disk
+	for _, fn := range deletedFiles {
+		audioDir := os.Getenv("AUDIO_DIR")
+		if audioDir == "" {
+			audioDir = "audio_files"
+		}
+		os.RemoveAll(filepath.Join(audioDir, fn))
 	}
 	GlobalRoleCache.Invalidate(target.ID)
 	jsonOK(w, map[string]string{"message": "ok"})
