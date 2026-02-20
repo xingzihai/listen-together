@@ -445,10 +445,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		msgRateWindow  = time.Second
 		msgRateLimit   = 10 // normal messages per second
 		pingRateLimit  = 5  // ping messages per second
+		totalRateLimit = 12 // all messages combined per second
 	)
 	var (
-		msgTimes  = make([]time.Time, 0, msgRateLimit)
-		pingTimes = make([]time.Time, 0, pingRateLimit)
+		msgTimes   = make([]time.Time, 0, msgRateLimit)
+		pingTimes  = make([]time.Time, 0, pingRateLimit)
+		totalTimes = make([]time.Time, 0, totalRateLimit)
 	)
 	checkRate := func(times *[]time.Time, limit int) bool {
 		now := time.Now()
@@ -474,7 +476,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-		// Rate limit check
+		// Rate limit check — total first, then per-type
+		if !checkRate(&totalTimes, totalRateLimit) {
+			safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+			break
+		}
 		if msg.Type == "ping" {
 			if !checkRate(&pingTimes, pingRateLimit) {
 				safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
