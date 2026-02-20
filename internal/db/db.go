@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const maxRetries = 3
 
 // AudioFile represents a file in a user's audio library
 type AudioFile struct {
@@ -96,18 +99,36 @@ func Open(path string) (*DB, error) {
 
 func (d *DB) Close() error { return d.conn.Close() }
 
-func (d *DB) nextUID() (int64, error) {
+// isUniqueConstraintError checks if an error is a SQLite UNIQUE constraint violation.
+func isUniqueConstraintError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// nextUIDInTx returns the next UID within a transaction.
+// admin/owner UIDs start at 100, regular users at 10001.
+func nextUIDInTx(tx *sql.Tx, role string) (int64, error) {
 	var uid int64
-	err := d.conn.QueryRow("SELECT COALESCE(MAX(uid),0) FROM users").Scan(&uid)
+	err := tx.QueryRow("SELECT COALESCE(MAX(uid),0) FROM users").Scan(&uid)
 	if err != nil {
 		return 0, err
 	}
-	return uid + 1, nil
+	next := uid + 1
+	if role == "owner" || role == "admin" {
+		if next < 100 {
+			next = 100
+		}
+	} else {
+		if next < 10001 {
+			next = 10001
+		}
+	}
+	return next, nil
 }
 
-func (d *DB) nextSUID() (int64, error) {
+// nextSUIDInTx returns the next SUID within a transaction. SUIDs start at 1.
+func nextSUIDInTx(tx *sql.Tx) (int64, error) {
 	var suid int64
-	err := d.conn.QueryRow("SELECT COALESCE(MAX(suid),0) FROM users WHERE suid > 0").Scan(&suid)
+	err := tx.QueryRow("SELECT COALESCE(MAX(suid),0) FROM users WHERE suid > 0").Scan(&suid)
 	if err != nil {
 		return 0, err
 	}
@@ -328,23 +349,51 @@ func (d *DB) CreateUser(username, password, role string) (*User, error) {
 	if err != nil {
 		return nil, err
 	}
-	uid, err := d.nextUID()
-	if err != nil {
-		return nil, fmt.Errorf("generate uid: %w", err)
-	}
-	var suid int64
-	if role == "owner" || role == "admin" {
-		suid, err = d.nextSUID()
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		tx, err := d.conn.Begin()
 		if err != nil {
-			return nil, fmt.Errorf("generate suid: %w", err)
+			return nil, fmt.Errorf("begin tx: %w", err)
 		}
+
+		uid, err := nextUIDInTx(tx, role)
+		if err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("generate uid: %w", err)
+		}
+
+		var suid int64
+		if role == "owner" || role == "admin" {
+			suid, err = nextSUIDInTx(tx)
+			if err != nil {
+				tx.Rollback()
+				return nil, fmt.Errorf("generate suid: %w", err)
+			}
+		}
+
+		res, err := tx.Exec("INSERT INTO users(uid,suid,username,password_hash,role) VALUES(?,?,?,?,?)", uid, suid, username, string(hash), role)
+		if err != nil {
+			tx.Rollback()
+			if isUniqueConstraintError(err) && !strings.Contains(err.Error(), "username") {
+				lastErr = err
+				continue // retry on uid/suid conflict
+			}
+			return nil, err
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("commit: %w", err)
+		}
+
+		id, _ := res.LastInsertId()
+		return &User{ID: id, UID: uid, SUID: suid, Username: username, Role: role, PasswordVersion: 1, CreatedAt: time.Now()}, nil
 	}
-	res, err := d.conn.Exec("INSERT INTO users(uid,suid,username,password_hash,role) VALUES(?,?,?,?,?)", uid, suid, username, string(hash), role)
-	if err != nil {
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return &User{ID: id, UID: uid, SUID: suid, Username: username, Role: role, PasswordVersion: 1, CreatedAt: time.Now()}, nil
+	return nil, fmt.Errorf("create user failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func (d *DB) GetUserByUsername(username string) (*User, error) {
@@ -410,16 +459,45 @@ func (d *DB) UpdateUsername(id int64, newUsername string) error {
 }
 
 func (d *DB) UpdateUserRole(id int64, role string) error {
-	var suid int64
-	if role == "owner" || role == "admin" {
-		// Check if user already has a suid
-		d.conn.QueryRow("SELECT suid FROM users WHERE id=?", id).Scan(&suid)
-		if suid == 0 {
-			suid, _ = d.nextSUID()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		tx, err := d.conn.Begin()
+		if err != nil {
+			return fmt.Errorf("begin tx: %w", err)
 		}
+
+		var suid int64
+		if role == "owner" || role == "admin" {
+			tx.QueryRow("SELECT suid FROM users WHERE id=?", id).Scan(&suid)
+			if suid == 0 {
+				suid, err = nextSUIDInTx(tx)
+				if err != nil {
+					tx.Rollback()
+					return fmt.Errorf("generate suid: %w", err)
+				}
+			}
+		}
+
+		_, err = tx.Exec("UPDATE users SET role=?, suid=? WHERE id=?", role, suid, id)
+		if err != nil {
+			tx.Rollback()
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return fmt.Errorf("commit: %w", err)
+		}
+		return nil
 	}
-	_, err := d.conn.Exec("UPDATE users SET role=?, suid=? WHERE id=?", role, suid, id)
-	return err
+	return fmt.Errorf("update user role failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func (d *DB) DeleteUser(id int64) error {
