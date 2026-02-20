@@ -81,8 +81,8 @@ async function delFile(id){
 }
 async function loadShares(){
     const res=await fetch('/api/library/shares'); const data=await res.json();
-    document.getElementById('myShares').innerHTML=(data.my_shares||[]).map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;color:var(--text-secondary)">${s.shared_name} (UID:${s.shared_uid}) <button class="btn-del" onclick="unshare(${s.shared_uid})">✕</button></div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
-    document.getElementById('sharedWithMe').innerHTML=(data.shared_with_me||[]).map(s=>`<div style="padding:4px 0;font-size:13px;color:var(--text-secondary)">${s.owner_name} (UID:${s.owner_uid})</div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
+    document.getElementById('myShares').innerHTML=(data.my_shares||[]).map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;color:var(--text-secondary)">${escapeHtml(s.shared_name)} (UID:${s.shared_uid}) <button class="btn-del" onclick="unshare(${parseInt(s.shared_uid)})">✕</button></div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
+    document.getElementById('sharedWithMe').innerHTML=(data.shared_with_me||[]).map(s=>`<div style="padding:4px 0;font-size:13px;color:var(--text-secondary)">${escapeHtml(s.owner_name)} (UID:${s.owner_uid})</div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
 }
 async function unshare(uid){
     await fetch('/api/library/share/'+uid,{method:'DELETE'}); loadShares();

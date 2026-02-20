@@ -54,9 +54,13 @@ func isAudioMagic(buf []byte) bool {
 	if buf[0] == 0x49 && buf[1] == 0x44 && buf[2] == 0x33 {
 		return true
 	}
-	// MP3 sync word (0xFFFB, 0xFFF3, 0xFFF2, 0xFFE3, etc.)
+	// MP3 frame sync: 11 bits set + valid MPEG version + valid layer
 	if buf[0] == 0xFF && (buf[1]&0xE0) == 0xE0 {
-		return true
+		version := (buf[1] >> 3) & 0x03
+		layer := (buf[1] >> 1) & 0x03
+		if version != 0x01 && layer != 0x00 {
+			return true
+		}
 	}
 	// FLAC: "fLaC"
 	if buf[0] == 0x66 && buf[1] == 0x4C && buf[2] == 0x61 && buf[3] == 0x43 {
@@ -66,12 +70,14 @@ func isAudioMagic(buf []byte) bool {
 	if buf[0] == 0x4F && buf[1] == 0x67 && buf[2] == 0x67 && buf[3] == 0x53 {
 		return true
 	}
-	// RIFF: WAV, AIF (RIFF....WAVE or RIFF....AVI)
-	if buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 {
+	// WAV: RIFF....WAVE
+	if len(buf) >= 12 && buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 &&
+		buf[8] == 0x57 && buf[9] == 0x41 && buf[10] == 0x56 && buf[11] == 0x45 {
 		return true
 	}
-	// AIFF: "FORM"
-	if buf[0] == 0x46 && buf[1] == 0x4F && buf[2] == 0x52 && buf[3] == 0x4D {
+	// AIFF: FORM....AIFF or FORM....AIFC
+	if len(buf) >= 12 && buf[0] == 0x46 && buf[1] == 0x4F && buf[2] == 0x52 && buf[3] == 0x4D &&
+		buf[8] == 0x41 && buf[9] == 0x49 && buf[10] == 0x46 && (buf[11] == 0x46 || buf[11] == 0x43) {
 		return true
 	}
 	// M4A/AAC in MP4 container: "ftyp" at offset 4
@@ -84,10 +90,6 @@ func isAudioMagic(buf []byte) bool {
 	}
 	// WMA: ASF header GUID (30 26 B2 75 8E 66 CF 11)
 	if len(buf) >= 8 && buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xB2 && buf[3] == 0x75 {
-		return true
-	}
-	// AAC ADTS raw: sync word 0xFFF1 or 0xFFF9
-	if buf[0] == 0xFF && (buf[1] == 0xF1 || buf[1] == 0xF9) {
 		return true
 	}
 	return false
