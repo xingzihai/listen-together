@@ -310,8 +310,8 @@ class AudioPlayer {
             this._rateCorrectingUntil = 0;
             console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
         }
-        const LOOKAHEAD = 1.5; // schedule segments up to 1.5s into the future
-        const preloadCount = this._actualQuality === 'lossless' ? 2 : 3;
+        const LOOKAHEAD = this._actualQuality === 'lossless' ? 3.0 : 1.5;
+        const preloadCount = this._actualQuality === 'lossless' ? 3 : 3;
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
             const i = this._nextSegIdx;
@@ -325,7 +325,10 @@ class AudioPlayer {
             if (!buffer) break;
             const source = this.ctx.createBufferSource();
             source.buffer = buffer;
-            source.connect(this.gainNode);
+            // Per-segment gain for crossfade at boundaries
+            const segGain = this.ctx.createGain();
+            segGain.connect(this.gainNode);
+            source.connect(segGain);
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
@@ -333,6 +336,17 @@ class AudioPlayer {
             const effectiveDur = dur / effectiveRate;
             if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
                 source.playbackRate.value = this._currentPlaybackRate;
+            }
+            // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
+            const fadeTime = 0.003;
+            if (!this._isFirstSeg && i > 0) {
+                segGain.gain.setValueAtTime(0, t);
+                segGain.gain.linearRampToValueAtTime(1, t + fadeTime);
+            }
+            if (i < this.segments.length - 1) {
+                const fadeOutStart = t + effectiveDur - fadeTime;
+                segGain.gain.setValueAtTime(1, fadeOutStart);
+                segGain.gain.linearRampToValueAtTime(0, t + effectiveDur);
             }
             source.start(t, off);
             // Transfer pending drift correction now that the corrected segment is actually scheduled
@@ -498,13 +512,23 @@ class AudioPlayer {
         this._stopLookahead();
         this._upgrading = false;
         this._scheduling = false;
-        // Clear playbackRate correction
         if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
         this._rateCorrectingUntil = 0;
         this._currentPlaybackRate = 1.0;
         this._rateStartTime = 0;
-        this.sources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
+        // Fade out to avoid click/pop, then stop sources
+        if (this.gainNode && this.ctx) {
+            const now = this.ctx.currentTime;
+            this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
+            this.gainNode.gain.linearRampToValueAtTime(0, now + 0.005);
+        }
+        const oldSources = this.sources;
         this.sources = [];
+        setTimeout(() => {
+            oldSources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
+            // Restore gain for next playback
+            if (this.gainNode) this.gainNode.gain.value = 1.0;
+        }, 10);
         this._driftOffset = 0;
         this._softCorrectionTotal = 0;
         this._pendingDriftCorrection = 0;

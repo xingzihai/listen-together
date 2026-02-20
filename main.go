@@ -504,8 +504,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if state == room.StatePlaying {
 					elapsed := time.Since(startT).Seconds()
 					currentPos := pos + elapsed
-					scheduledTime := syncpkg.GetServerTime() + 800
-					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
+					// No ScheduledAt for join restore — client needs to load segments first,
+					// so scheduledAt would always expire. Let client use elapsed fallback.
+					nowMs := syncpkg.GetServerTime()
+					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: nowMs})
 				}
 			}
 
@@ -554,8 +556,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Seek(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 800
-			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime}, "")
+			nowMs := syncpkg.GetServerTime()
+			scheduledTime := nowMs + 800
+			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs, ScheduledAt: scheduledTime}, "")
 
 		case "kick":
 			if currentRoom == nil {

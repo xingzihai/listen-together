@@ -67,9 +67,16 @@ function connect(onOpen) {
                 // JWT invalid — kicked by new login on another device
                 sessionExpired();
             } else {
-                setTimeout(() => connect(), 3000);
+                setTimeout(() => connect(() => {
+                    // Rejoin room after reconnect
+                    if (roomCode) {
+                        ws.send(JSON.stringify({ type: 'join', roomCode }));
+                    }
+                }), 3000);
             }
-        }).catch(() => setTimeout(() => connect(), 3000));
+        }).catch(() => setTimeout(() => connect(() => {
+            if (roomCode) ws.send(JSON.stringify({ type: 'join', roomCode }));
+        }), 3000));
     };
     ws.onerror = e => console.error('WS error', e);
 }
@@ -131,7 +138,7 @@ async function handleMessage(msg) {
         case 'play':
             // If play carries trackAudio and we don't have audio loaded, load it first
             if (msg.trackAudio && !audioInfo) {
-                await handleTrackChange(msg);
+                await handleTrackChange(msg, true); // join restore, don't re-broadcast play
                 if (!pendingPlay) await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
             } else {
                 await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
@@ -447,7 +454,7 @@ $('playModeBtn').onclick = async () => {
 };
 
 // handleTrackChange: server sends full audio metadata via trackChange
-async function handleTrackChange(msg) {
+async function handleTrackChange(msg, isJoinRestore) {
     const ta = msg.trackAudio;
     if (!ta) return;
 
@@ -490,8 +497,8 @@ async function handleTrackChange(msg) {
         if (pendingPlay) {
             const pp = pendingPlay; pendingPlay = null;
             await doPlay(pp.position, pp.serverTime, pp.scheduledAt);
-        } else if (isHost && ws) {
-            // Host: track loaded, send play to server to coordinate all clients
+        } else if (isHost && ws && !isJoinRestore) {
+            // Host: track loaded, send play to server (only for active track change, not join restore)
             ws.send(JSON.stringify({ type: 'play', position: 0 }));
         }
 
