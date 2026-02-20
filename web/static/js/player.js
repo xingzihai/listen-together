@@ -18,6 +18,7 @@ class AudioPlayer {
         this._nextSegIdx = 0;       // next segment to schedule
         this._nextSegTime = 0;      // AudioContext time for next segment
         this._driftOffset = 0;      // accumulated soft drift correction (seconds)
+        this._pendingDriftCorrection = 0; // pending correction waiting for segment schedule
         this._softCorrectionTotal = 0; // total soft correction for UI display (seconds)
         this._lastResync = 0;
         this._resyncGen = 0;        // generation counter: incremented on each playAtPosition
