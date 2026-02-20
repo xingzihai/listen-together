@@ -182,8 +182,49 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 
 	title := strings.TrimSuffix(header.Filename, ext)
 	artist := r.FormValue("artist")
+	album := ""
+	genre := ""
+	year := ""
+	lyrics := ""
 
-	af, err := h.DB.AddAudioFile(user.UserID, audioID, header.Filename, title, artist, manifest.Duration, written, probe.Format, probe.Bitrate, string(qualitiesJSON))
+	// Extract metadata from audio file tags
+	meta, err := audio.ExtractMetadata(storedPath)
+	if err == nil {
+		if meta.Title != "" {
+			title = meta.Title
+		}
+		if meta.Artist != "" {
+			artist = meta.Artist
+		}
+		if meta.Album != "" {
+			album = meta.Album
+		}
+		if meta.Genre != "" {
+			genre = meta.Genre
+		}
+		if meta.Year != "" {
+			year = meta.Year
+		}
+		if meta.Lyrics != "" {
+			lyrics = meta.Lyrics
+		}
+	}
+
+	// If no lyrics from format tags, try stream tags
+	if lyrics == "" {
+		if lrc, err := audio.ExtractLyrics(storedPath); err == nil && lrc != "" {
+			lyrics = lrc
+		}
+	}
+
+	// Extract cover art
+	coverArt := ""
+	coverPath := filepath.Join(audioDir, "cover.jpg")
+	if err := audio.ExtractCoverArt(storedPath, coverPath); err == nil {
+		coverArt = "cover.jpg"
+	}
+
+	af, err := h.DB.AddAudioFile(user.UserID, audioID, header.Filename, title, artist, album, genre, year, lyrics, manifest.Duration, written, probe.Format, probe.Bitrate, string(qualitiesJSON), coverArt)
 	if err != nil {
 		os.RemoveAll(audioDir)
 		jsonError(w, "保存记录失败", 500)
@@ -439,6 +480,13 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 		"segment_time": manifest.SegmentTime,
 		"owner_id":     af.OwnerID,
 		"audio_uuid":   af.Filename,
+		"title":        af.Title,
+		"artist":       af.Artist,
+		"album":        af.Album,
+		"genre":        af.Genre,
+		"year":         af.Year,
+		"lyrics":       af.Lyrics,
+		"cover_art":    af.CoverArt,
 	})
 }
 
@@ -506,6 +554,113 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 	http.ServeFile(w, r, filePath)
 }
 
+// ServeCoverArt serves cover art for an audio file.
+// GET /api/library/cover/{userID}/{audioUUID}/cover.jpg
+func (h *LibraryHandlers) ServeCoverArt(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r)
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Parse: /api/library/cover/{userID}/{audioUUID}/cover.jpg
+	path := strings.TrimPrefix(r.URL.Path, "/api/library/cover/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 3 {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Sanitize path components
+	userID := filepath.Base(parts[0])
+	audioUUID := filepath.Base(parts[1])
+	filename := filepath.Base(parts[2])
+
+	// Prevent path traversal
+	for _, comp := range []string{userID, audioUUID, filename} {
+		if strings.Contains(comp, "..") || strings.Contains(comp, "/") || strings.Contains(comp, "\\") {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if filename != "cover.jpg" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Access control: look up audio file by UUID, verify permission
+	af, err := h.DB.GetAudioFileByUUID(audioUUID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Check if cover art exists
+	if af.CoverArt == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Use DB owner ID for path, not URL parameter
+	ownerIDStr := strconv.FormatInt(af.OwnerID, 10)
+	filePath := filepath.Join(h.DataDir, "library", ownerIDStr, audioUUID, "cover.jpg")
+
+	// Verify file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("Content-Type", "image/jpeg")
+	http.ServeFile(w, r, filePath)
+}
+
+// GetLyrics returns plain text lyrics for an audio file.
+// GET /api/library/lyrics/{userID}/{audioUUID}
+func (h *LibraryHandlers) GetLyrics(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r)
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/library/lyrics/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	audioUUID := filepath.Base(parts[1])
+	if strings.Contains(audioUUID, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	af, err := h.DB.GetAudioFileByUUID(audioUUID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(af.Lyrics))
+}
+
 func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
 	wrap := func(handler http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -516,6 +671,8 @@ func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/library/upload", wrap(h.Upload))
 	mux.HandleFunc("/api/library/files", wrap(h.ListFiles))
 	mux.HandleFunc("/api/library/segments/", wrap(h.ServeSegmentFile))
+	mux.HandleFunc("/api/library/cover/", wrap(h.ServeCoverArt))
+	mux.HandleFunc("/api/library/lyrics/", wrap(h.GetLyrics))
 	mux.HandleFunc("/api/library/files/", wrap(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.Contains(path, "/segments/") {

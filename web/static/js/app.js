@@ -8,6 +8,56 @@ let trackLoading = false, pendingPlay = null;
 let trackChangeGen = 0;
 let deviceKicked = false;
 
+// --- Cover Art ---
+function updateCoverArt(ownerID, audioUUID) {
+    const img = $('coverImage');
+    const placeholder = $('coverPlaceholder');
+    if (!img || !placeholder) return;
+    if (!ownerID || !audioUUID) {
+        img.style.display = 'none';
+        placeholder.style.display = 'flex';
+        // Also update bar cover
+        const barImg = $('barCoverImage');
+        const barPh = $('barCoverPlaceholder');
+        if (barImg) barImg.style.display = 'none';
+        if (barPh) barPh.style.display = 'flex';
+        return;
+    }
+    const url = `/api/library/cover/${ownerID}/${audioUUID}/cover.jpg`;
+    img.onload = () => { img.style.display = 'block'; placeholder.style.display = 'none'; };
+    img.onerror = () => { img.style.display = 'none'; placeholder.style.display = 'flex'; };
+    img.src = url;
+    // Also update bar cover
+    const barImg = $('barCoverImage');
+    const barPh = $('barCoverPlaceholder');
+    if (barImg) {
+        barImg.onload = () => { barImg.style.display = 'block'; if (barPh) barPh.style.display = 'none'; };
+        barImg.onerror = () => { barImg.style.display = 'none'; if (barPh) barPh.style.display = 'flex'; };
+        barImg.src = url;
+    }
+}
+
+function updateTrackMeta(item) {
+    const titleEl = $('trackTitle');
+    const artistEl = $('trackArtist');
+    if (titleEl) titleEl.textContent = item.title || item.original_name || '未知歌曲';
+    if (artistEl) artistEl.textContent = item.artist || '';
+    // Also update bar track info
+    const barTitle = $('barTrackTitle');
+    const barArtist = $('barTrackArtist');
+    if (barTitle) barTitle.textContent = item.title || item.original_name || '未知歌曲';
+    if (barArtist) barArtist.textContent = item.artist || '';
+}
+
+function updatePrevNextButtons() {
+    const prev = $('prevTrackBtn');
+    const next = $('nextTrackBtn');
+    if (!prev || !next) return;
+    const hasPlaylist = playlistItems && playlistItems.length > 0;
+    prev.disabled = !(isHost && hasPlaylist && playlistItems.length > 1);
+    next.disabled = !(isHost && hasPlaylist && playlistItems.length > 1);
+}
+
 // Unified fetch wrapper: auto-handles 401 (session expired)
 async function authFetch(url, opts = {}) {
     const res = await fetch(url, { ...opts, credentials: 'include' });
@@ -55,6 +105,9 @@ function renderAvatarBar() {
 function showScreen(id) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     $(id).classList.add('active');
+    // Show/hide bottom player bar when in room
+    const bar = $('bottomBar');
+    if (bar) { if (id === 'room') bar.classList.remove('hidden'); else bar.classList.add('hidden'); }
 }
 
 function formatTime(s) {
@@ -119,6 +172,9 @@ async function handleMessage(msg) {
             playlist = null; playlistItems = []; currentTrackIndex = -1;
             trackLoading = false; pendingPlay = null;
             $('trackName').textContent = '未选择歌曲';
+            if ($('trackTitle')) $('trackTitle').textContent = '未选择歌曲';
+            if ($('trackArtist')) $('trackArtist').textContent = '';
+            updateCoverArt(null, null);
             $('currentTime').textContent = '0:00';
             $('totalTime').textContent = '0:00';
             $('progressBar').value = 0; $('progressBar').max = 0;
@@ -396,6 +452,20 @@ $('progressBar').onchange = e => {
 
 $('volumeSlider').oninput = e => window.audioPlayer.setVolume(e.target.value / 100);
 
+// Prev/Next track buttons
+$('prevTrackBtn').onclick = () => {
+    if (!isHost || !playlistItems || playlistItems.length < 2) return;
+    let idx = currentTrackIndex - 1;
+    if (idx < 0) idx = playlistItems.length - 1;
+    ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
+};
+$('nextTrackBtn').onclick = () => {
+    if (!isHost || !playlistItems || playlistItems.length < 2) return;
+    let idx = currentTrackIndex + 1;
+    if (idx >= playlistItems.length) idx = 0;
+    ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
+};
+
 $('audiencePanelClose').onclick = () => $('audiencePanel').classList.add('hidden');
 $('copyInviteLink').onclick = () => {
     const link = location.origin + '/#' + roomCode;
@@ -430,7 +500,8 @@ function renderPlaylist() {
     container.innerHTML = playlistItems.map((item, i) => {
         const active = i === currentTrackIndex ? ' active' : '';
         const delBtn = isHost ? `<button class="pi-del" data-id="${item.id}">✕</button>` : '';
-        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-info"><div class="pi-title">${escapeHtml(item.title || item.original_name)}</div><div class="pi-meta">${escapeHtml(item.artist || '')} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
+        const coverUrl = `/api/library/cover/${item.owner_id}/${item.audio_uuid || item.filename}/cover.jpg`;
+        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-cover"><img src="${coverUrl}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" alt=""><div class="pi-cover-placeholder" style="display:none">♪</div></div><div class="pi-info"><div class="pi-title">${escapeHtml(item.title || item.original_name)}</div><div class="pi-meta">${escapeHtml(item.artist || '')} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
     }).join('');
     container.querySelectorAll('.pi-del').forEach(btn => {
         btn.onclick = async (e) => {
@@ -447,6 +518,7 @@ function renderPlaylist() {
         };
     });
     updatePlayModeBtn();
+    updatePrevNextButtons();
 }
 
 function updatePlayModeBtn() {
@@ -483,6 +555,11 @@ async function handleTrackChange(msg, isJoinRestore) {
     trackLoading = true;
     currentTrackIndex = msg.trackIndex;
     renderPlaylist();
+    updatePrevNextButtons();
+
+    // Update cover art and metadata from trackAudio
+    updateCoverArt(ta.owner_id, ta.audio_uuid);
+    updateTrackMeta(ta);
 
     const qualities = ta.qualities || [];
     const preferredQ = localStorage.getItem('lt_quality') || 'medium';

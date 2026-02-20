@@ -22,6 +22,11 @@ type AudioFile struct {
 	OriginalName    string    `json:"original_name"`
 	Title           string    `json:"title"`
 	Artist          string    `json:"artist"`
+	Album           string    `json:"album"`
+	Genre           string    `json:"genre"`
+	Year            string    `json:"year"`
+	Lyrics          string    `json:"lyrics,omitempty"`
+	CoverArt        string    `json:"cover_art"`
 	Duration        float64   `json:"duration"`
 	Size            int64     `json:"size"`
 	OriginalFormat  string    `json:"original_format"`
@@ -285,6 +290,11 @@ func (d *DB) init() error {
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN original_format TEXT DEFAULT ''`)
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN original_bitrate INTEGER DEFAULT 0`)
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN qualities TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN album TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN cover_art TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN genre TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN year TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN lyrics TEXT DEFAULT ''`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS library_shares (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		owner_id INTEGER NOT NULL,
@@ -293,6 +303,12 @@ func (d *DB) init() error {
 		UNIQUE(owner_id, shared_with_id),
 		FOREIGN KEY(owner_id) REFERENCES users(id),
 		FOREIGN KEY(shared_with_id) REFERENCES users(id)
+	)`)
+	d.conn.Exec(`CREATE TABLE IF NOT EXISTS user_settings (
+		user_id INTEGER PRIMARY KEY,
+		settings_json TEXT NOT NULL DEFAULT '{}',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(uid)
 	)`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS playlists (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -598,18 +614,18 @@ func (d *DB) ListUsers() ([]*User, error) {
 
 // --- Audio Library CRUD ---
 
-func (d *DB) AddAudioFile(ownerID int64, filename, originalName, title, artist string, duration float64, size int64, originalFormat string, originalBitrate int, qualities string) (*AudioFile, error) {
-	res, err := d.conn.Exec("INSERT INTO audio_files(owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities) VALUES(?,?,?,?,?,?,?,?,?,?)",
-		ownerID, filename, originalName, title, artist, duration, size, originalFormat, originalBitrate, qualities)
+func (d *DB) AddAudioFile(ownerID int64, filename, originalName, title, artist, album, genre, year, lyrics string, duration float64, size int64, originalFormat string, originalBitrate int, qualities, coverArt string) (*AudioFile, error) {
+	res, err := d.conn.Exec("INSERT INTO audio_files(owner_id,filename,original_name,title,artist,album,genre,year,lyrics,duration,size,original_format,original_bitrate,qualities,cover_art) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		ownerID, filename, originalName, title, artist, album, genre, year, lyrics, duration, size, originalFormat, originalBitrate, qualities, coverArt)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
-	return &AudioFile{ID: id, OwnerID: ownerID, Filename: filename, OriginalName: originalName, Title: title, Artist: artist, Duration: duration, Size: size, OriginalFormat: originalFormat, OriginalBitrate: originalBitrate, Qualities: qualities, CreatedAt: time.Now()}, nil
+	return &AudioFile{ID: id, OwnerID: ownerID, Filename: filename, OriginalName: originalName, Title: title, Artist: artist, Album: album, Genre: genre, Year: year, Lyrics: lyrics, Duration: duration, Size: size, OriginalFormat: originalFormat, OriginalBitrate: originalBitrate, Qualities: qualities, CoverArt: coverArt, CreatedAt: time.Now()}, nil
 }
 
 func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
-	rows, err := d.conn.Query("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE owner_id=? ORDER BY created_at DESC", ownerID)
+	rows, err := d.conn.Query("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE owner_id=? ORDER BY created_at DESC", ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -617,7 +633,7 @@ func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
 	var files []*AudioFile
 	for rows.Next() {
 		f := &AudioFile{}
-		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
 		files = append(files, f)
 	}
 	return files, nil
@@ -625,8 +641,8 @@ func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
 
 func (d *DB) GetAudioFileByID(id int64) (*AudioFile, error) {
 	f := &AudioFile{}
-	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE id=?", id).
-		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE id=?", id).
+		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -635,8 +651,8 @@ func (d *DB) GetAudioFileByID(id int64) (*AudioFile, error) {
 
 func (d *DB) GetAudioFileByUUID(uuid string) (*AudioFile, error) {
 	f := &AudioFile{}
-	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE filename=?", uuid).
-		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE filename=?", uuid).
+		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +729,7 @@ func (d *DB) GetMyShares(ownerID int64) ([]*LibraryShare, error) {
 }
 
 func (d *DB) GetAccessibleAudioFiles(userID int64) ([]*AudioFile, error) {
-	rows, err := d.conn.Query(`SELECT a.id,a.owner_id,a.filename,a.original_name,a.title,a.artist,a.duration,a.size,a.original_format,a.original_bitrate,a.qualities,a.created_at,u.username
+	rows, err := d.conn.Query(`SELECT a.id,a.owner_id,a.filename,a.original_name,a.title,a.artist,a.album,a.genre,a.year,a.lyrics,a.cover_art,a.duration,a.size,a.original_format,a.original_bitrate,a.qualities,a.created_at,u.username
 		FROM audio_files a JOIN users u ON u.id=a.owner_id
 		WHERE a.owner_id=? OR a.owner_id IN (SELECT owner_id FROM library_shares WHERE shared_with_id=?)
 		ORDER BY a.created_at DESC`, userID, userID)
@@ -724,7 +740,7 @@ func (d *DB) GetAccessibleAudioFiles(userID int64) ([]*AudioFile, error) {
 	var files []*AudioFile
 	for rows.Next() {
 		f := &AudioFile{}
-		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt, &f.OwnerName)
+		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt, &f.OwnerName)
 		files = append(files, f)
 	}
 	return files, nil
@@ -840,4 +856,19 @@ func (d *DB) ReorderPlaylistItems(playlistID int64, itemIDs []int64) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func (d *DB) GetUserSettings(userID int64) (string, error) {
+	var s string
+	err := d.conn.QueryRow("SELECT settings_json FROM user_settings WHERE user_id=?", userID).Scan(&s)
+	if err != nil {
+		return "{}", nil
+	}
+	return s, nil
+}
+
+func (d *DB) SaveUserSettings(userID int64, settingsJSON string) error {
+	_, err := d.conn.Exec(`INSERT INTO user_settings(user_id, settings_json, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(user_id) DO UPDATE SET settings_json=excluded.settings_json, updated_at=CURRENT_TIMESTAMP`, userID, settingsJSON)
+	return err
 }

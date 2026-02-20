@@ -439,6 +439,37 @@ func (h *AuthHandlers) AdminUpdateRole(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"message": "ok"})
 }
 
+func (h *AuthHandlers) UserSettings(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	if user == nil {
+		jsonError(w, "unauthorized", 401)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s, err := h.DB.GetUserSettings(user.UserID)
+		if err != nil {
+			jsonError(w, "db error", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(s))
+	case http.MethodPut:
+		var raw json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			jsonError(w, "invalid json", 400)
+			return
+		}
+		if err := h.DB.SaveUserSettings(user.UserID, string(raw)); err != nil {
+			jsonError(w, "save failed", 500)
+			return
+		}
+		jsonOK(w, map[string]string{"status": "ok"})
+	default:
+		jsonError(w, "method not allowed", 405)
+	}
+}
+
 func (h *AuthHandlers) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		jsonError(w, "method not allowed", 405)
@@ -497,6 +528,9 @@ func (h *AuthHandlers) RegisterRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("/api/auth/username", func(w http.ResponseWriter, r *http.Request) {
 		AuthMiddleware(http.HandlerFunc(h.ChangeUsername)).ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/api/user/settings", func(w http.ResponseWriter, r *http.Request) {
+		AuthMiddleware(http.HandlerFunc(h.UserSettings)).ServeHTTP(w, r)
 	})
 	// Admin routes (owner only)
 	mux.HandleFunc("/api/admin/users", func(w http.ResponseWriter, r *http.Request) {

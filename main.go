@@ -736,12 +736,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			var qualities []string
 			json.Unmarshal([]byte(af.Qualities), &qualities)
 			trackAudio = &room.TrackAudioInfo{
-				AudioID:   af.ID,
-				OwnerID:   af.OwnerID,
-				AudioUUID: af.Filename,
-				Filename:  af.OriginalName,
-				Duration:  af.Duration,
-				Qualities: qualities,
+				AudioID:      af.ID,
+				OwnerID:      af.OwnerID,
+				AudioUUID:    af.Filename,
+				Filename:     af.OriginalName,
+				Title:        af.Title,
+				Artist:       af.Artist,
+				OriginalName: af.OriginalName,
+				Duration:     af.Duration,
+				Qualities:    qualities,
 			}
 
 			currentRoom.Mu.Lock()

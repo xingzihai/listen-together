@@ -1,187 +1,1132 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ListenTogether</title>
-    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/theme_variables.css">
+    <script src="js/tailwindcss.js?v=1771593419"></script>
+    <script src="js/tailwind_setup.js?v=1771593419"></script>
+    <link rel="stylesheet" href="fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="css/style.css?v=1771593419">
+    <style>
+        ::-webkit-scrollbar { width:8px; height:8px; }
+        ::-webkit-scrollbar-track { background:#f1f1f1; }
+        ::-webkit-scrollbar-thumb { background:#c1c1c1; border-radius:4px; }
+        ::-webkit-scrollbar-thumb:hover { background:#a8a8a8; }
+        .glass { background:rgba(255,255,255,0.7); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); border:1px solid rgba(255,255,255,0.18); }
+        .no-scrollbar::-webkit-scrollbar { display:none; }
+        .no-scrollbar { -ms-overflow-style:none; scrollbar-width:none; }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes coverPulse { 0%,100%{box-shadow:0 12px 48px rgba(0,0,0,0.1),0 0 40px rgba(16,185,129,0.12)} 50%{box-shadow:0 12px 48px rgba(0,0,0,0.1),0 0 60px rgba(16,185,129,0.2)} }
+        .screen { display:none; animation:fadeIn 0.4s ease; }
+        .screen.active { display:block; }
+        .hidden { display:none !important; }
+    </style>
 </head>
-<body>
-    <div id="versionTag" style="position:fixed;top:4px;left:8px;font-size:11px;color:rgba(255,255,255,0.35);z-index:9999;pointer-events:none;">v0.6.1</div>
-    <div id="userBar" class="user-bar hidden">
-        <span id="currentUsername"></span>
-        <button id="settingsBtn" class="btn-icon" title="设置">⚙️</button>
-        <button id="libraryBtn" class="btn-icon hidden" title="音频库">📚</button>
-        <button id="adminBtn" class="btn-icon hidden" title="用户管理">👥</button>
-        <button id="logoutBtn" class="btn-icon" title="登出">🚪</button>
+<body class="bg-gray-50 min-h-screen font-sans text-gray-800 style-vinyl">
+
+<!-- Version Tag -->
+<div id="versionTag" class="fixed top-2 left-2 text-xs text-gray-400/60 z-10">v0.7.0</div>
+
+<!-- User Bar -->
+<div id="userBar" class="fixed top-0 right-0 px-4 py-2 flex items-center gap-3 z-[70] bg-gradient-to-b from-white/80 to-transparent hidden">
+    <span id="currentUsername" class="text-sm text-gray-600"></span>
+    <button id="settingsBtn" class="text-gray-400 hover:text-emerald-500 transition-colors" title="设置"><i class="fas fa-cog"></i></button>
+    <button id="libraryBtn" class="text-gray-400 hover:text-emerald-500 transition-colors hidden" title="音频库"><i class="fas fa-book"></i></button>
+    <button id="adminBtn" class="text-gray-400 hover:text-emerald-500 transition-colors hidden" title="用户管理"><i class="fas fa-users-cog"></i></button>
+    <button id="logoutBtn" class="text-gray-400 hover:text-red-500 transition-colors" title="登出"><i class="fas fa-sign-out-alt"></i></button>
+</div>
+
+<div class="w-full min-h-screen flex justify-center items-center has-[#room.active]:items-start" id="mainContainer">
+
+<!-- ==================== Login Screen ==================== -->
+<div id="loginScreen" class="screen w-full max-w-md px-5 mx-auto">
+    <div class="text-center mb-10">
+        <div class="w-20 h-20 mx-auto mb-4 bg-gradient-to-br from-emerald-500 to-emerald-400 rounded-2xl flex items-center justify-center shadow-lg shadow-emerald-200">
+            <i class="fas fa-music text-white text-3xl"></i>
+        </div>
+        <h1 class="text-3xl font-bold text-gray-800 tracking-tight">ListenTogether</h1>
+        <p class="text-gray-500 mt-1">和朋友一起听音乐</p>
     </div>
-
-    <div class="container">
-        <!-- Login Screen -->
-        <div id="loginScreen" class="screen">
-            <div class="logo">
-                <span class="icon">🎵</span>
-                <h1>ListenTogether</h1>
-                <p class="tagline">Sync music with friends</p>
-            </div>
-            <div class="auth-box">
-                <div class="auth-tabs">
-                    <button id="loginTab" class="auth-tab active">登录</button>
-                    <button id="registerTab" class="auth-tab">注册</button>
-                </div>
-                <div id="loginForm">
-                    <input type="text" id="loginUsername" placeholder="用户名" autocomplete="username">
-                    <input type="password" id="loginPassword" placeholder="密码" autocomplete="current-password">
-                    <button id="loginSubmit" class="btn primary">登录</button>
-                </div>
-                <div id="registerForm" class="hidden">
-                    <input type="text" id="regUsername" placeholder="用户名（3-20字符，字母数字下划线）" autocomplete="username">
-                    <input type="password" id="regPassword" placeholder="密码（至少6位）" autocomplete="new-password">
-                    <input type="password" id="regPassword2" placeholder="确认密码" autocomplete="new-password">
-                    <button id="registerSubmit" class="btn primary">注册</button>
-                </div>
-                <div id="authError" class="auth-error"></div>
-            </div>
+    <div class="bg-white/95 backdrop-blur-lg rounded-2xl p-6 border border-gray-100 shadow-sm">
+        <div class="flex mb-5 border-b-2 border-gray-100">
+            <button id="loginTab" class="flex-1 py-3 text-sm font-medium text-emerald-600 border-b-2 border-emerald-500 -mb-[2px] transition-all">登录</button>
+            <button id="registerTab" class="flex-1 py-3 text-sm font-medium text-gray-400 border-b-2 border-transparent -mb-[2px] transition-all hover:text-gray-600">注册</button>
         </div>
-
-        <!-- Home Screen -->
-        <div id="home" class="screen">
-            <div class="logo">
-                <span class="icon">🎵</span>
-                <h1>ListenTogether</h1>
-                <p class="tagline">Sync music with friends</p>
-            </div>
-            <div class="actions">
-                <button id="createBtn" class="btn primary">Create Room</button>
-                <div id="createDivider" class="divider"><span>or</span></div>
-                <div class="join-form">
-                    <input type="text" id="roomCodeInput" placeholder="Enter room code" maxlength="8">
-                    <button id="joinBtn" class="btn secondary">Join</button>
-                </div>
-            </div>
+        <div id="loginForm">
+            <input type="text" id="loginUsername" placeholder="用户名" autocomplete="username" class="w-full px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm mb-3 focus:outline-none focus:border-emerald-500 transition-colors">
+            <input type="password" id="loginPassword" placeholder="密码" autocomplete="current-password" class="w-full px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm mb-3 focus:outline-none focus:border-emerald-500 transition-colors">
+            <button id="loginSubmit" class="w-full py-3 bg-gradient-to-r from-emerald-500 to-emerald-400 text-white rounded-xl font-semibold shadow-md shadow-emerald-200 hover:shadow-lg hover:shadow-emerald-200 transition-all">登录</button>
         </div>
+        <div id="registerForm" class="hidden">
+            <input type="text" id="regUsername" placeholder="用户名（3-20字符，字母数字下划线）" autocomplete="username" class="w-full px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm mb-3 focus:outline-none focus:border-emerald-500 transition-colors">
+            <input type="password" id="regPassword" placeholder="密码（至少6位）" autocomplete="new-password" class="w-full px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm mb-3 focus:outline-none focus:border-emerald-500 transition-colors">
+            <input type="password" id="regPassword2" placeholder="确认密码" autocomplete="new-password" class="w-full px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm mb-3 focus:outline-none focus:border-emerald-500 transition-colors">
+            <button id="registerSubmit" class="w-full py-3 bg-gradient-to-r from-emerald-500 to-emerald-400 text-white rounded-xl font-semibold shadow-md shadow-emerald-200 hover:shadow-lg hover:shadow-emerald-200 transition-all">注册</button>
+        </div>
+        <div id="authError" class="text-red-500 text-xs text-center mt-3 min-h-[18px]"></div>
+    </div>
+</div>
 
-        <!-- Room Screen -->
-        <div id="room" class="screen">
-            <div class="room-header">
-                <div class="room-info">
-                    <span class="room-code" id="displayCode"></span>
-                    <span class="user-count"><span id="userCount">1</span> listening</span>
-                </div>
-                <button id="copyCode" class="btn-icon" title="Copy room code">📋</button>
-                <button id="leaveBtn" class="btn-icon" title="退出房间" style="margin-left:4px;color:#e74c3c;">✕</button>
+<!-- ==================== Home Screen ==================== -->
+<div id="home" class="screen w-full max-w-md px-5 mx-auto">
+    <div class="text-center mb-10">
+        <div class="w-20 h-20 mx-auto mb-4 bg-gradient-to-br from-emerald-500 to-emerald-400 rounded-2xl flex items-center justify-center shadow-lg shadow-emerald-200">
+            <i class="fas fa-music text-white text-3xl"></i>
+        </div>
+        <h1 class="text-3xl font-bold text-gray-800 tracking-tight">ListenTogether</h1>
+        <p class="text-gray-500 mt-1">和朋友一起听音乐</p>
+    </div>
+    <div class="flex flex-col gap-3">
+        <button id="createBtn" class="w-full py-3.5 rounded-xl font-semibold shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all" style="background:#10b981;color:#fff">创建房间</button>
+        <div id="createDivider" class="text-center text-gray-400 text-xs relative my-1"><span class="bg-gray-50 px-4 relative z-10">或</span><div class="absolute top-1/2 left-0 right-0 h-px bg-gray-200"></div></div>
+        <div class="flex gap-2">
+            <input type="text" id="roomCodeInput" placeholder="输入房间码" maxlength="8" class="flex-1 px-4 py-3 border border-gray-200 rounded-lg bg-white text-sm text-center uppercase tracking-widest focus:outline-none focus:border-emerald-500 transition-colors">
+            <button id="joinBtn" class="px-6 py-3 bg-gray-100 text-gray-700 rounded-lg font-semibold border border-gray-200 hover:bg-gray-200 transition-all">加入</button>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== Room Screen ==================== -->
+<div id="room" class="screen w-full max-w-screen-xl mx-auto px-4 pt-4 pb-32 min-h-screen bg-gradient-to-br from-emerald-50 via-white to-rose-50">
+    <!-- Dynamic Glassmorphism Background -->
+    <div id="dynamicBg" class="fixed inset-0 -z-10 overflow-hidden transition-all duration-1000">
+        <div id="bgBlob1" class="absolute rounded-full mix-blend-multiply filter blur-3xl opacity-40 animate-blob"></div>
+        <div id="bgBlob2" class="absolute rounded-full mix-blend-multiply filter blur-3xl opacity-40 animate-blob animation-delay-2000"></div>
+        <div id="bgBlob3" class="absolute rounded-full mix-blend-multiply filter blur-3xl opacity-40 animate-blob animation-delay-4000"></div>
+        <div id="bgOverlay" class="absolute inset-0 backdrop-blur-xl bg-white/60"></div>
+    </div>
+    <!-- Room Header -->
+    <div id="roomHeader" class="relative mb-3 select-none" style="z-index:60">
+        <!-- Compact: pill with room code + count -->
+        <div id="rhCompact" class="inline-flex items-center gap-2 px-4 py-2 bg-white/90 backdrop-blur rounded-xl border border-gray-200/60 shadow-sm cursor-pointer transition-all hover:shadow-md" style="position:fixed;top:0.5rem;left:0.5rem;z-index:65" onclick="window._rhToggle()">
+            <span id="displayCode" class="text-sm font-bold tracking-widest text-emerald-600"></span>
+            <span class="text-xs text-gray-400">·</span>
+            <span class="text-xs text-gray-400"><span id="userCount">1</span>人</span>
+        </div>
+        <!-- Expanded: full bar -->
+        <div id="rhFull" class="hidden flex items-center px-4 py-2.5 bg-white/95 backdrop-blur-lg rounded-xl border border-gray-200/60 shadow-md gap-3 transition-all" style="position:fixed;top:0.5rem;left:0.5rem;z-index:65">
+            <!-- Left: room info (clickable to collapse) -->
+            <div class="flex flex-col cursor-pointer" onclick="window._rhToggle()">
+                <span id="displayCodeFull" class="text-base font-bold tracking-widest text-emerald-600"></span>
+                <span class="text-xs text-gray-400"><span id="userCountFull">1</span> 人在听</span>
             </div>
-
-            <div id="avatarBar" class="avatar-bar"></div>
-
-            <div id="audiencePanel" class="audience-panel hidden">
-                <div class="audience-header">
-                    <span>听众列表</span>
-                    <button id="audiencePanelClose" class="btn-icon">✕</button>
-                </div>
-                <div id="audienceList" class="audience-list"></div>
-                <div class="audience-footer">
-                    <button id="copyInviteLink" class="btn primary btn-full">📎 复制邀请链接</button>
-                </div>
+            <button id="copyCode" class="text-gray-400 hover:text-emerald-500 p-1.5 rounded-lg hover:bg-gray-50 transition-all text-sm" title="复制房间码">📋</button>
+            <button onclick="document.getElementById('audiencePanel').classList.toggle('hidden')" class="text-gray-400 hover:text-emerald-500 p-1.5 rounded-lg hover:bg-gray-50 transition-all text-sm" title="听众管理">👥</button>
+            <button id="leaveBtn" class="text-gray-400 hover:text-red-500 p-1.5 rounded-lg hover:bg-red-50 transition-all text-sm" title="退出房间">✕</button>
+            <!-- Avatars fill remaining space -->
+            <div id="avatarBar" class="flex items-center gap-1.5 flex-1 justify-end overflow-hidden cursor-pointer"></div>
+        </div>
+        <!-- Audience dropdown (below full bar) -->
+        <div id="audiencePanel" class="hidden absolute left-0 right-0 mt-1 bg-white/95 backdrop-blur-lg rounded-xl border border-gray-200/60 shadow-lg overflow-hidden" style="top:100%">
+            <div class="flex justify-between items-center px-4 py-2 border-b border-gray-100 text-sm font-semibold">
+                <span>听众列表</span>
+                <button id="audiencePanelClose" class="text-gray-400 hover:text-gray-600 p-1">✕</button>
             </div>
-
-            <div class="player">
-                <div class="track-info">
-                    <div class="track-name" id="trackName">No track loaded</div>
-                    <div class="sync-status" id="syncStatus">Syncing...</div>
-                    <div class="sync-status" id="driftStatus" style="font-size:11px;color:#aaa;"></div>
-                    <div id="syncDebug" style="font-size:10px;color:#888;font-family:monospace;line-height:1.4;margin-top:2px;white-space:pre;"></div>
-                </div>
-
-                <div class="progress-container">
-                    <span id="seekTooltip" class="seek-tooltip hidden"></span>
-                    <input type="range" id="progressBar" class="progress" min="0" max="100" value="0">
-                    <div class="time-display">
-                        <span id="currentTime">0:00</span>
-                        <span id="totalTime">0:00</span>
-                    </div>
-                </div>
-
-                <div class="controls">
-                    <button id="playPauseBtn" class="btn-control play" disabled>▶</button>
-                </div>
-
-                <div class="volume-control">
-                    <span>🔊</span>
-                    <input type="range" id="volumeSlider" class="volume" min="0" max="100" value="80">
-                    <select id="qualitySelector" class="quality-select hidden" title="音质选择"></select>
-                </div>
-            </div>
-
-            <!-- Playlist Panel -->
-            <div id="playlistPanel" class="playlist-panel hidden">
-                <div class="playlist-header">
-                    <span>🎶 播放列表</span>
-                    <div class="playlist-actions">
-                        <button id="playModeBtn" class="btn-icon" title="播放模式">🔁</button>
-                        <button id="addFromLibBtn" class="btn-icon" title="从音频库添加">➕</button>
-                    </div>
-                </div>
-                <div id="playlistItems" class="playlist-items"></div>
-                <div id="playlistEmpty" class="playlist-empty">播放列表为空</div>
+            <div id="audienceList" class="max-h-60 overflow-y-auto px-3 py-2"></div>
+            <div class="px-3 py-2 border-t border-gray-100">
+                <button id="copyInviteLink" class="w-full py-2 bg-emerald-500 text-white rounded-lg text-sm font-semibold hover:bg-emerald-600 transition-colors">📎 复制邀请链接</button>
             </div>
         </div>
     </div>
 
-    <!-- Library Modal -->
-    <div id="libraryModal" class="modal-overlay hidden">
-        <div class="modal-card">
-            <div class="modal-header">
-                <span>从音频库添加</span>
-                <button id="libraryModalClose" class="btn-icon">✕</button>
+    <!-- Main Player Area -->
+    <div id="playerMain" class="player-main flex items-center py-[5vh] md:py-[8vh] w-full min-h-[60vh] transition-all duration-700" style="flex-direction:column;justify-content:center;padding:5vh 3vw">
+        <!-- Left: Cover Art (vinyl disc) -->
+        <div id="coverWrapper" class="cover-wrapper cover-idle flex-shrink-0 flex items-center justify-center transition-all duration-700">
+            <div id="coverContainer" class="cover-disc relative overflow-hidden shadow-2xl ring-1 ring-black/5 transition-all duration-700" style="width:min(80vw,20rem);height:min(80vw,20rem);border-radius:1rem">
+                <div id="coverPlaceholder" class="w-full h-full flex items-center justify-center bg-gradient-to-br from-emerald-100 via-gray-100 to-rose-100">
+                    <i class="fas fa-music text-7xl text-emerald-300 opacity-40"></i>
+                </div>
+                <img id="coverImage" class="w-full h-full object-cover absolute inset-0" alt="cover" style="display:none">
+                <!-- Vinyl center hole (inside disc, rotates with it) -->
+                <div id="vinylCenter" class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 transition-opacity duration-700 z-10">
+                    <div class="rounded-full bg-white/90 shadow-inner border-2 border-black/5" style="width:15%;height:15%"></div>
+                </div>
             </div>
-            <div class="modal-body">
-                <div id="libraryList" class="library-list"></div>
-                <div id="libraryEmpty" class="playlist-empty">无可用音频</div>
+        </div>
+        <!-- Right: Track Info + Lyrics -->
+        <div id="trackInfoPanel" class="track-info-panel flex-1 min-w-0 flex flex-col items-center md:items-start gap-[2vh] w-full opacity-0 pointer-events-none transition-all duration-700 max-h-0 overflow-hidden" style="padding-top:2.5rem">
+            <div class="w-full text-center md:text-left">
+                <div id="trackTitle" class="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-800 truncate leading-tight">未选择歌曲</div>
+                <div id="trackArtist" class="text-base md:text-lg text-gray-500 mt-2 truncate"></div>
+            </div>
+            <div id="trackName" class="hidden">No track loaded</div>
+            <!-- Top resize handle -->
+            <div id="lyricsResizeTop" class="w-full h-2 cursor-ns-resize flex items-center justify-center group" title="拖拽调整歌词区域">
+                <div class="w-16 border-t-2 border-dashed border-gray-400 group-hover:border-emerald-400 transition-colors"></div>
+            </div>
+            <div id="lyricsContainer" class="flex-1 overflow-y-auto no-scrollbar mt-1 w-full" style="max-height:50vh">
+                <div id="lyricsContent" class="flex flex-col gap-2 md:gap-3 text-center md:text-left">
+                    <p id="lyricsEmpty" class="text-gray-400 text-lg">暂无歌词</p>
+                </div>
+            </div>
+            <!-- Bottom resize handle -->
+            <div id="lyricsResizeBottom" class="w-full h-2 cursor-ns-resize flex items-center justify-center group" title="拖拽调整歌词区域">
+                <div class="w-16 border-t-2 border-dashed border-gray-400 group-hover:border-emerald-400 transition-colors"></div>
             </div>
         </div>
     </div>
 
-    <!-- Settings Modal -->
-    <div id="settingsOverlay" class="modal-overlay hidden">
-        <div class="modal-card">
-            <div class="modal-header">
-                <span>账号设置</span>
-                <button id="settingsClose" class="btn-icon">✕</button>
+    <!-- Playlist Modal (popup overlay) -->
+    <div id="playlistModal" class="playlist-sidebar hidden">
+        <div class="playlist-sidebar-content">
+            <div class="flex justify-between items-center px-4 py-3 border-b border-gray-200 font-semibold text-sm">
+                <span><i class="fas fa-list-ul mr-1 text-emerald-500"></i> 播放列表</span>
+                <div class="flex gap-1">
+                    <button id="addFromLibBtn" class="text-gray-400 hover:text-emerald-500 p-1.5 transition-colors" title="从音频库添加">➕</button>
+                    <button id="playlistModalClose" class="text-gray-400 hover:text-gray-600 p-1.5 transition-colors">✕</button>
+                </div>
             </div>
-            <div class="modal-body">
-                <div class="settings-section">
-                    <h3 class="settings-title">账号信息</h3>
-                    <div class="settings-info">
-                        <div>UID：<span id="settingsUID" class="uid-display"></span> <span id="settingsSUID" class="suid-display"></span></div>
-                        <div>用户名：<span id="settingsUsername"></span></div>
-                        <div>角色：<span id="settingsRole"></span></div>
-                        <div>注册时间：<span id="settingsCreatedAt"></span></div>
-                    </div>
+            <div id="playlistItems" class="flex-1 overflow-y-auto no-scrollbar"></div>
+            <div id="playlistEmpty" class="text-gray-400 text-center py-5 text-sm">播放列表为空</div>
+        </div>
+    </div>
+    <!-- Hidden compat element for app.js -->
+    <div id="playlistPanel" class="hidden"></div>
+</div>
+
+</div><!-- /mainContainer -->
+
+<!-- ==================== Bottom Player Bar (lxserver style) ==================== -->
+<div id="bottomBar" class="hidden">
+<footer id="playerBar" class="fixed bottom-0 left-0 w-full bg-white/95 backdrop-blur-lg border-t border-gray-200 shadow-[0_-4px_12px_rgba(0,0,0,0.06)] z-50 px-4 md:px-6 py-2"
+    <!-- Debug Panel (pops up above footer) -->
+    <div id="debugPanel" class="hidden" style="position:absolute;bottom:100%;left:0;right:0;background:white;border-top:1px solid #e5e7eb;z-index:10;padding:6px 16px;">
+        <div id="syncStatus" class="text-xs text-emerald-600"></div>
+        <div id="driftStatus" class="text-xs text-gray-400"></div>
+        <div id="syncDebug" class="text-[10px] text-gray-400 font-mono whitespace-pre mt-0.5"></div>
+    </div>
+    <!-- Row 1: Progress Bar -->
+    <div class="w-full flex items-center gap-2 text-xs text-gray-500 font-mono">
+        <span id="currentTime" class="w-10 text-right">0:00</span>
+        <div class="flex-1 h-6 flex items-center relative group">
+            <div class="w-full bg-gray-200 rounded-full h-1.5 cursor-pointer relative z-10 progress-wrapper group/prog">
+                <span id="seekTooltip" class="seek-tooltip hidden"></span>
+                <input type="range" id="progressBar" class="progress-input" min="0" max="100" value="0">
+                <div class="progress-fill-bar">
+                    <div class="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white border-2 border-emerald-500 rounded-full shadow opacity-0 group-hover/prog:opacity-100 transition-opacity"></div>
                 </div>
-                <div class="settings-section">
-                    <h3 class="settings-title">修改用户名</h3>
-                    <input type="text" id="newUsernameInput" placeholder="新用户名（3-20字符，字母数字下划线）">
-                    <input type="password" id="usernamePassword" placeholder="当前密码">
-                    <div id="usernameError" class="settings-error"></div>
-                    <button id="changeUsernameBtn" class="btn primary btn-full">确认修改</button>
+            </div>
+        </div>
+        <span id="totalTime" class="w-10">0:00</span>
+    </div>
+    <!-- Row 2: Song Info + Controls + Volume -->
+    <div class="flex items-center gap-3 mt-1">
+        <!-- Left: Cover + Title -->
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+            <div id="barCoverContainer" class="w-10 h-10 md:w-12 md:h-12 bg-gray-100 rounded-lg overflow-hidden flex-shrink-0 relative border border-gray-200">
+                <div id="barCoverPlaceholder" class="w-full h-full flex items-center justify-center text-gray-400 text-sm"><i class="fas fa-music"></i></div>
+                <img id="barCoverImage" class="w-full h-full object-cover absolute inset-0" alt="" style="display:none">
+            </div>
+            <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-1.5"><div id="barTrackTitle" class="font-semibold text-gray-800 truncate text-sm">未选择歌曲</div><button onclick="document.getElementById('debugPanel').classList.toggle('hidden')" class="text-gray-300 hover:text-gray-500 transition-colors flex-shrink-0" title="调试"><i class="fas fa-bug text-xs"></i></button></div>
+                <div id="barTrackArtist" class="text-xs text-gray-500 truncate"></div>
+            </div>
+        </div>
+        <!-- Center: Playback Controls -->
+        <div class="flex items-center gap-4">
+            <button id="prevTrackBtn" class="text-gray-500 hover:text-emerald-600 text-base transition-colors" disabled><i class="fas fa-step-backward"></i></button>
+            <button id="playPauseBtn" class="w-10 h-10 rounded-full bg-emerald-500 text-white shadow-lg shadow-emerald-200 hover:bg-emerald-600 hover:scale-105 transition-all flex items-center justify-center text-lg" disabled>▶</button>
+            <button id="nextTrackBtn" class="text-gray-500 hover:text-emerald-600 text-base transition-colors" disabled><i class="fas fa-step-forward"></i></button>
+        </div>
+        <!-- Right: Mode + Playlist + Volume -->
+        <div class="flex items-center gap-2 flex-1 justify-end">
+            <button id="playModeBtn" class="text-gray-500 hover:text-emerald-500 transition-colors p-1.5" title="播放模式">🔁</button>
+            <button id="playlistToggleBtn" class="text-gray-500 hover:text-emerald-500 transition-colors p-1.5" title="播放列表" onclick="document.getElementById('playlistModal').classList.toggle('hidden')"><i class="fas fa-list-ul"></i></button>
+            <select id="qualitySelector" class="bg-gray-50 text-gray-700 border border-gray-200 rounded-lg px-2 py-1 text-xs cursor-pointer focus:outline-none hover:border-emerald-500 hidden"></select>
+            <div class="relative">
+                <button id="styleToggleBtn" class="text-gray-500 hover:text-emerald-500 transition-colors p-1.5" title="切换样式"><i class="fas fa-palette"></i></button>
+                <div id="styleMenu" class="hidden absolute bottom-full mb-2 right-0 bg-white rounded-xl shadow-lg border border-gray-200 py-1 min-w-[140px] z-[100]">
+                    <button class="style-menu-item w-full text-left px-4 py-2 text-sm hover:bg-gray-50" data-style="vinyl">🎵 唱片机</button>
+                    <button class="style-menu-item w-full text-left px-4 py-2 text-sm hover:bg-gray-50" data-style="card">🃏 卡片</button>
                 </div>
-                <div class="settings-section">
-                    <h3 class="settings-title">修改密码</h3>
-                    <input type="password" id="oldPwInput" placeholder="旧密码">
-                    <input type="password" id="newPwInput" placeholder="新密码（至少6位）">
-                    <input type="password" id="confirmPwInput" placeholder="确认新密码">
-                    <div id="passwordError" class="settings-error"></div>
-                    <button id="changePasswordBtn" class="btn primary btn-full">确认修改</button>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-gray-400 text-sm"><i class="fas fa-volume-up"></i></span>
+                <div class="volume-bar-wrapper">
+                    <div class="volume-fill-bar"></div>
+                    <input type="range" id="volumeSlider" class="volume-input" min="0" max="100" value="80">
                 </div>
             </div>
         </div>
     </div>
+</footer>
+</div><!-- /bottomBar -->
 
-    <script src="js/auth.js?v=23"></script>
-    <script src="js/cache.js?v=23"></script>
-    <script src="js/sync.js?v=23"></script>
-    <script src="js/player.js?v=23"></script>
-    <script src="js/app.js?v=23"></script>
+<!-- ==================== Library Modal ==================== -->
+<div id="libraryModal" class="fixed inset-0 bg-black/25 backdrop-blur-sm z-[300] flex justify-center items-center hidden">
+    <div class="bg-white rounded-2xl w-[400px] max-w-[95vw] max-h-[85vh] overflow-y-auto shadow-xl border border-gray-100 animate-fade-in">
+        <div class="flex justify-between items-center px-5 py-4 border-b border-gray-100 font-semibold">
+            <span>从音频库添加</span>
+            <button id="libraryModalClose" class="text-gray-400 hover:text-gray-600 p-1">✕</button>
+        </div>
+        <div class="p-5">
+            <div id="libraryList" class="max-h-96 overflow-y-auto"></div>
+            <div id="libraryEmpty" class="text-gray-400 text-center py-5 text-sm">无可用音频</div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== Settings Modal ==================== -->
+<div id="settingsOverlay" class="fixed inset-0 bg-black/25 backdrop-blur-sm z-[300] flex justify-center items-center hidden">
+    <div class="bg-white rounded-2xl w-[400px] max-w-[95vw] max-h-[85vh] overflow-y-auto shadow-xl border border-gray-100 animate-fade-in">
+        <div class="flex justify-between items-center px-5 py-4 border-b border-gray-100 font-semibold">
+            <span>账号设置</span>
+            <button id="settingsClose" class="text-gray-400 hover:text-gray-600 p-1">✕</button>
+        </div>
+        <div class="p-5 space-y-6">
+            <div>
+                <h3 class="text-sm font-semibold text-emerald-600 mb-3">账号信息</h3>
+                <div class="text-sm text-gray-500 leading-loose">
+                    <div>UID：<span id="settingsUID" class="text-gray-800 font-mono"></span> <span id="settingsSUID" class="text-amber-500 font-mono text-xs"></span></div>
+                    <div>用户名：<span id="settingsUsername" class="text-gray-800"></span></div>
+                    <div>角色：<span id="settingsRole" class="text-gray-800"></span></div>
+                    <div>注册时间：<span id="settingsCreatedAt" class="text-gray-800"></span></div>
+                </div>
+            </div>
+            <div>
+                <h3 class="text-sm font-semibold text-emerald-600 mb-3">修改用户名</h3>
+                <input type="text" id="newUsernameInput" placeholder="新用户名（3-20字符，字母数字下划线）" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg bg-gray-50 text-sm mb-2 focus:outline-none focus:border-emerald-500">
+                <input type="password" id="usernamePassword" placeholder="当前密码" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg bg-gray-50 text-sm mb-2 focus:outline-none focus:border-emerald-500">
+                <div id="usernameError" class="text-red-500 text-xs min-h-[18px] mb-1"></div>
+                <button id="changeUsernameBtn" class="w-full py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-400 text-white rounded-xl font-semibold text-sm shadow-sm">确认修改</button>
+            </div>
+            <div>
+                <h3 class="text-sm font-semibold text-emerald-600 mb-3">修改密码</h3>
+                <input type="password" id="oldPwInput" placeholder="旧密码" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg bg-gray-50 text-sm mb-2 focus:outline-none focus:border-emerald-500">
+                <input type="password" id="newPwInput" placeholder="新密码（至少6位）" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg bg-gray-50 text-sm mb-2 focus:outline-none focus:border-emerald-500">
+                <input type="password" id="confirmPwInput" placeholder="确认新密码" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg bg-gray-50 text-sm mb-2 focus:outline-none focus:border-emerald-500">
+                <div id="passwordError" class="text-red-500 text-xs min-h-[18px] mb-1"></div>
+                <button id="changePasswordBtn" class="w-full py-2.5 bg-gradient-to-r from-emerald-500 to-emerald-400 text-white rounded-xl font-semibold text-sm shadow-sm">确认修改</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="js/auth.js?v=1771593419"></script>
+<script src="js/cache.js?v=1771593419"></script>
+<script src="js/sync.js?v=1771593419"></script>
+<script src="js/player.js?v=1771593419"></script>
+<script src="js/app.js?v=1771593419"></script>
+<script>
+// Lyrics + Playlist modal logic (non-invasive, does not modify app.js)
+(function() {
+    var lyrics = [];
+    var currentLine = -1;
+    var lastTrackKey = '';
+
+    // --- Playlist Modal ---
+    var plBtn = document.getElementById('playlistToggleBtn');
+    var plModal = document.getElementById('playlistModal');
+    var plClose = document.getElementById('playlistModalClose');
+    if (plBtn) plBtn.onclick = function() { plModal.classList.toggle('hidden'); };
+    if (plClose) plClose.onclick = function() { plModal.classList.add('hidden'); };
+    if (plModal) plModal.onclick = function(e) { if (e.target === plModal) plModal.classList.add('hidden'); };
+
+    // --- LRC Parser ---
+    function parseLRC(text) {
+        if (!text) return [];
+        var lines = text.split('\n');
+        var result = [];
+        var re = /\[(\d{1,2}):(\d{2})(?:[.:])(\d{1,3})?\]/g;
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line) continue;
+            var match, times = [];
+            re.lastIndex = 0;
+            while ((match = re.exec(line)) !== null) {
+                var min = parseInt(match[1], 10);
+                var sec = parseInt(match[2], 10);
+                var ms = match[3] ? parseInt(match[3].padEnd(3, '0').slice(0, 3), 10) : 0;
+                times.push(min * 60 + sec + ms / 1000);
+            }
+            if (times.length === 0) continue;
+            var txt = line.replace(/\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/g, '').trim();
+            if (!txt) continue;
+            for (var t = 0; t < times.length; t++) {
+                result.push({ time: times[t], text: txt });
+            }
+        }
+        result.sort(function(a, b) { return a.time - b.time; });
+        return result;
+    }
+
+    function renderLyrics() {
+        var container = document.getElementById('lyricsContent');
+        var empty = document.getElementById('lyricsEmpty');
+        if (!container) return;
+        if (!lyrics.length) {
+            container.innerHTML = '';
+            if (empty) { empty.style.display = ''; container.appendChild(empty); }
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+        container.innerHTML = lyrics.map(function(l, i) {
+            return '<p class="lyric-line" data-idx="' + i + '">' + escapeH(l.text) + '</p>';
+        }).join('');
+        currentLine = -1;
+    }
+
+    function escapeH(s) {
+        var d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+    }
+
+    function updateActiveLine(currentTime) {
+        if (!lyrics.length) return;
+        var idx = -1;
+        for (var i = lyrics.length - 1; i >= 0; i--) {
+            if (currentTime >= lyrics[i].time - 0.15) { idx = i; break; }
+        }
+        if (idx === currentLine) return;
+        currentLine = idx;
+        var container = document.getElementById('lyricsContent');
+        if (!container) return;
+        var lines = container.querySelectorAll('.lyric-line');
+        for (var j = 0; j < lines.length; j++) {
+            lines[j].classList.toggle('active', j === idx);
+        }
+        if (idx >= 0 && lines[idx]) {
+            var lyricsBox = document.getElementById('lyricsContainer');
+            if (lyricsBox) {
+                var top = lines[idx].offsetTop - lyricsBox.offsetTop - lyricsBox.clientHeight / 2 + lines[idx].clientHeight / 2;
+                lyricsBox.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+            }
+        }
+    }
+
+    // --- Load lyrics when track changes ---
+    window.loadLyrics = function(userID, audioUUID) {
+        var key = userID + '/' + audioUUID;
+        if (key === lastTrackKey) return;
+        lastTrackKey = key;
+        lyrics = []; currentLine = -1;
+        renderLyrics();
+        if (!userID || !audioUUID) return;
+        fetch('/api/library/lyrics/' + userID + '/' + audioUUID, { credentials: 'include' })
+            .then(function(r) { return r.ok ? r.text() : ''; })
+            .then(function(lrc) {
+                if (userID + '/' + audioUUID !== lastTrackKey) return;
+                lyrics = parseLRC(lrc);
+                if (!lyrics.length && lrc && lrc.trim()) {
+                    // Plain text lyrics (not LRC format)
+                    var plainLines = lrc.split('\n').filter(function(l) { return l.trim(); });
+                    lyrics = plainLines.map(function(l, i) { return { time: -1, text: l.trim() }; });
+                }
+                renderLyrics();
+            })
+            .catch(function() {});
+    };
+
+    // --- Watch for track changes via MutationObserver on trackTitle ---
+    var titleEl = document.getElementById('trackTitle');
+    if (titleEl) {
+        var observer = new MutationObserver(function() {
+            var coverImg = document.getElementById('coverImage');
+            if (coverImg && coverImg.src) {
+                var m = coverImg.src.match(/\/cover\/(\d+)\/([^/]+)\//);
+                if (m) window.loadLyrics(m[1], m[2]);
+            }
+        });
+        observer.observe(titleEl, { childList: true, characterData: true, subtree: true });
+    }
+
+    // --- Cover animation state machine ---
+    var coverWrapper = document.getElementById('coverWrapper');
+    var trackInfoPanel = document.getElementById('trackInfoPanel');
+    var coverState = 'idle'; // idle | active | playing
+
+    function setCoverState(newState) {
+        if (newState === coverState) return;
+        coverState = newState;
+        if (!coverWrapper || !trackInfoPanel) return;
+        var main = document.getElementById('playerMain');
+        coverWrapper.classList.remove('cover-idle', 'cover-active', 'cover-playing', 'cover-paused');
+        if (newState === 'idle') {
+            coverWrapper.classList.add('cover-idle');
+            trackInfoPanel.classList.remove('visible');
+            if (main) {
+                main.style.flexDirection = 'column';
+                main.style.justifyContent = 'center';
+                main.style.alignItems = 'center';
+                main.style.gap = '';
+                main.style.padding = '5vh 3vw';
+            }
+        } else if (newState === 'active') {
+            coverWrapper.classList.add('cover-active');
+            trackInfoPanel.classList.add('visible');
+            if (main) {
+                main.style.flexDirection = 'row';
+                main.style.justifyContent = 'flex-start';
+                main.style.alignItems = 'flex-start';
+                main.style.gap = '5vw';
+                main.style.padding = '8vh 2vw';
+            }
+        } else if (newState === 'playing') {
+            coverWrapper.classList.add('cover-active', 'cover-playing');
+            trackInfoPanel.classList.add('visible');
+            if (main) {
+                main.style.flexDirection = 'row';
+                main.style.justifyContent = 'flex-start';
+                main.style.alignItems = 'flex-start';
+                main.style.gap = '5vw';
+                main.style.padding = '8vh 2vw';
+            }
+        }
+    }
+
+    // Watch trackTitle changes to detect song loaded
+    var coverObserver = new MutationObserver(function() {
+        var title = (document.getElementById('trackTitle') || {}).textContent || '';
+        if (title && title !== '未选择歌曲' && title !== 'No track loaded') {
+            // Song loaded — check if playing
+            var btn = document.getElementById('playPauseBtn');
+            var isPlaying = btn && (btn.textContent.trim() === '⏸');
+            setCoverState(isPlaying ? 'playing' : 'active');
+        } else {
+            setCoverState('idle');
+        }
+    });
+    if (titleEl) coverObserver.observe(titleEl, { childList: true, characterData: true, subtree: true });
+
+    // Watch play/pause button to detect playing state
+    var playBtn = document.getElementById('playPauseBtn');
+    if (playBtn) {
+        var playObserver = new MutationObserver(function() {
+            var title = (document.getElementById('trackTitle') || {}).textContent || '';
+            if (!title || title === '未选择歌曲' || title === 'No track loaded') return;
+            var isPlaying = playBtn.textContent.trim() === '⏸';
+            if (isPlaying) {
+                setCoverState('playing');
+                coverWrapper && coverWrapper.classList.remove('cover-paused');
+            } else {
+                setCoverState('playing'); // keep circle shape
+                coverWrapper && coverWrapper.classList.add('cover-paused');
+            }
+        });
+        playObserver.observe(playBtn, { childList: true, characterData: true, subtree: true });
+    }
+
+    // --- Sync lyrics with playback progress + cover state ---
+    var lastLoadedTitle = '';
+    setInterval(function() {
+        // Detect track by DOM content (can't access app.js let variables)
+        var titleEl = document.getElementById('trackTitle');
+        var title = titleEl ? titleEl.textContent.trim() : '';
+        var hasTrack = title && title !== '未选择歌曲' && title !== 'No track loaded';
+
+        // Auto-load lyrics via cover image src (contains ownerID/audioUUID)
+        if (hasTrack && title !== lastLoadedTitle) {
+            lastLoadedTitle = title;
+            var coverImg = document.getElementById('coverImage');
+            if (coverImg && coverImg.src) {
+                var m = coverImg.src.match(/\/cover\/(\d+)\/([^/]+)\//);
+                if (m) window.loadLyrics(m[1], m[2]);
+            }
+        }
+
+        // Update cover state from DOM
+        if (hasTrack) {
+            var btn = document.getElementById('playPauseBtn');
+            var isPlaying = btn && (btn.textContent.trim() === '⏸');
+            if (isPlaying) {
+                setCoverState('playing');
+                coverWrapper && coverWrapper.classList.remove('cover-paused');
+            } else {
+                if (coverState === 'idle') setCoverState('active');
+                if (coverState === 'playing') coverWrapper && coverWrapper.classList.add('cover-paused');
+            }
+        } else {
+            setCoverState('idle');
+            lastLoadedTitle = '';
+        }
+
+        // Sync lyrics
+        if (!lyrics.length) return;
+        var el = document.getElementById('currentTime');
+        if (!el) return;
+        var text = el.textContent || '';
+        var parts = text.split(':');
+        if (parts.length !== 2) return;
+        var secs = parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+        if (isNaN(secs)) return;
+        updateActiveLine(secs);
+    }, 300);
+
+    // Reset lyrics when leaving room
+    var origLeave = document.getElementById('leaveBtn');
+    if (origLeave) {
+        var origClick = origLeave.onclick;
+        origLeave.onclick = function() {
+            lyrics = []; currentLine = -1; lastTrackKey = '';
+            renderLyrics();
+            if (origClick) origClick.apply(this, arguments);
+        };
+    }
+})();
+</script>
+<!-- ==================== Layout Editor ==================== -->
+<div id="layoutEditor" class="fixed inset-0 bg-black/20 backdrop-blur-sm z-[400] flex justify-center items-center hidden">
+  <div class="bg-white rounded-2xl w-[360px] max-w-[95vw] shadow-xl border border-gray-100 p-5">
+    <div class="flex justify-between items-center mb-4">
+      <span class="font-semibold text-gray-800">🎨 布局编辑器</span>
+      <button onclick="document.getElementById('layoutEditor').classList.add('hidden')" class="text-gray-400 hover:text-gray-600">✕</button>
+    </div>
+    <div class="flex gap-2 mb-4">
+      <button onclick="applyPreset('vinyl')" class="flex-1 py-2 rounded-lg text-sm font-medium bg-gray-100 hover:bg-emerald-100 transition-colors">🎵 唱片机</button>
+      <button onclick="applyPreset('card')" class="flex-1 py-2 rounded-lg text-sm font-medium bg-gray-100 hover:bg-emerald-100 transition-colors">🃏 卡片</button>
+    </div>
+    <div class="space-y-3">
+      <div><label class="text-xs text-gray-500">封面位置</label><input type="range" id="edCoverLeft" min="5" max="40" class="w-full accent-emerald-500" oninput="updateLayout()"></div>
+      <div><label class="text-xs text-gray-500">歌词位置</label><input type="range" id="edLyricsLeft" min="30" max="80" class="w-full accent-emerald-500" oninput="updateLayout()"></div>
+      <div><label class="text-xs text-gray-500">封面大小</label><input type="range" id="edCoverSize" min="15" max="30" class="w-full accent-emerald-500" oninput="updateLayout()"></div>
+      <div><label class="text-xs text-gray-500">封面垂直位置</label><input type="range" id="edCoverTop" min="20" max="80" value="50" class="w-full accent-emerald-500" oninput="updateLayout()"></div>
+      <div><label class="text-xs text-gray-500">歌词垂直位置</label><input type="range" id="edLyricsTop" min="20" max="80" value="50" class="w-full accent-emerald-500" oninput="updateLayout()"></div>
+      <div><label class="text-xs text-gray-500">歌词高亮色</label><input type="color" id="edLyricsColor" value="#10b981" class="w-8 h-8 rounded cursor-pointer" oninput="updateLayout()"></div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="saveLayout()" class="flex-1 py-2 rounded-lg text-sm font-semibold" style="background:#10b981;color:#fff">保存</button>
+      <button onclick="resetLayout()" class="flex-1 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-semibold hover:bg-gray-200">重置</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// === Lyrics Resize Handles ===
+(function() {
+    var lc = document.getElementById('lyricsContainer');
+    var topH = document.getElementById('lyricsResizeTop');
+    var botH = document.getElementById('lyricsResizeBottom');
+    if (!lc || !topH || !botH) return;
+    function startDrag(e, dir) {
+        e.preventDefault();
+        var startY = e.clientY || e.touches[0].clientY;
+        var startH = lc.offsetHeight;
+        function onMove(ev) {
+            var y = ev.clientY || (ev.touches && ev.touches[0].clientY) || startY;
+            var delta = dir === 'top' ? (startY - y) : (y - startY);
+            var newH = Math.max(100, Math.min(window.innerHeight * 0.8, startH + delta));
+            lc.style.maxHeight = newH + 'px';
+        }
+        function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            document.removeEventListener('touchmove', onMove);
+            document.removeEventListener('touchend', onUp);
+            localStorage.setItem('lt_lyrics_height', lc.style.maxHeight);
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        document.addEventListener('touchmove', onMove);
+        document.addEventListener('touchend', onUp);
+    }
+    topH.addEventListener('mousedown', function(e) { startDrag(e, 'top'); });
+    topH.addEventListener('touchstart', function(e) { startDrag(e, 'top'); });
+    botH.addEventListener('mousedown', function(e) { startDrag(e, 'bottom'); });
+    botH.addEventListener('touchstart', function(e) { startDrag(e, 'bottom'); });
+    var saved = localStorage.getItem('lt_lyrics_height');
+    if (saved) lc.style.maxHeight = saved;
+})();
+
+// === Progress Fill Bar Sync ===
+(function() {
+    var pb = document.getElementById('progressBar');
+    var fill = document.querySelector('.progress-fill-bar');
+    if (!pb || !fill) return;
+    setInterval(function() {
+        var max = parseFloat(pb.max) || 100;
+        var val = parseFloat(pb.value) || 0;
+        fill.style.width = (max > 0 ? (val / max * 100) : 0) + '%';
+    }, 20);
+})();
+
+// === Sync Watchdog: reset stuck flags every 3s ===
+(function() {
+    setInterval(function() {
+        var ap = window.audioPlayer;
+        if (!ap || !ap.isPlaying) return;
+        // Reset stuck _resyncing flag
+        if (ap._resyncing) {
+            ap._resyncing = false;
+            console.log('[watchdog] reset stuck _resyncing');
+        }
+        // Reset stuck playbackRate correction
+        if (ap._rateCorrectingUntil && ap.ctx && ap.ctx.currentTime > ap._rateCorrectingUntil + 2) {
+            ap._currentPlaybackRate = 1.0;
+            ap._rateCorrectingUntil = 0;
+            ap._rateStartTime = 0;
+            ap.sources.forEach(function(s) { if (s.playbackRate) s.playbackRate.value = 1.0; });
+            console.log('[watchdog] reset stuck playbackRate');
+        }
+        // Reset excessive backoff
+        if (ap._resyncBackoff > 2000) {
+            ap._resyncBackoff = 500;
+            console.log('[watchdog] reset excessive backoff');
+        }
+    }, 3000);
+})();
+
+// === Volume Fill Bar Sync ===
+(function() {
+    var vs = document.getElementById('volumeSlider');
+    var vf = document.querySelector('.volume-fill-bar');
+    var vw = document.querySelector('.volume-bar-wrapper');
+    if (!vs || !vf) return;
+    function syncVolFill() {
+        var pct = vs.value + '%';
+        vf.style.width = pct;
+        if (vw) vw.style.setProperty('--vol-pct', pct);
+    }
+    vs.addEventListener('input', syncVolFill);
+    // Also poll in case app.js changes value programmatically
+    setInterval(syncVolFill, 200);
+    syncVolFill();
+})();
+
+// === Room Header Toggle ===
+window._rhToggle = function() {
+    var c = document.getElementById('rhCompact');
+    var f = document.getElementById('rhFull');
+    var ub = document.getElementById('userBar');
+    var ap = document.getElementById('audiencePanel');
+    var pm = document.getElementById('playerMain');
+    if (f.classList.contains('hidden')) {
+        // Expanding: show full bar, HIDE userBar
+        f.classList.remove('hidden');
+        c.classList.add('hidden');
+        if (ub) ub.style.display = 'none';
+        if (pm) pm.style.paddingTop = '3.5rem';
+    } else {
+        // Collapsing: show compact, SHOW userBar
+        f.classList.add('hidden');
+        c.classList.remove('hidden');
+        if (ub) ub.style.display = '';
+        if (ap) ap.classList.add('hidden');
+        if (pm) pm.style.paddingTop = '';
+    }
+};
+// Sync compact ↔ full header text
+setInterval(function() {
+    var dc = document.getElementById('displayCode');
+    var dcf = document.getElementById('displayCodeFull');
+    var uc = document.getElementById('userCount');
+    var ucf = document.getElementById('userCountFull');
+    if (dc && dcf) dcf.textContent = dc.textContent;
+    if (uc && ucf) ucf.textContent = uc.textContent;
+}, 500);
+// Click outside room header to collapse
+document.addEventListener('click', function(e) {
+    var rh = document.getElementById('roomHeader');
+    if (rh && !rh.contains(e.target)) {
+        var f = document.getElementById('rhFull');
+        var c = document.getElementById('rhCompact');
+        var ub = document.getElementById('userBar');
+        var ap = document.getElementById('audiencePanel');
+        if (f && !f.classList.contains('hidden')) {
+            f.classList.add('hidden');
+            c.classList.remove('hidden');
+            if (ub) ub.style.display = '';
+            if (ap) ap.classList.add('hidden');
+            var pm = document.getElementById('playerMain');
+            if (pm) pm.style.paddingTop = '';
+        }
+    }
+});
+
+// === Style Toggle + Layout Editor ===
+(function() {
+    // Toast notification
+    function showToast(msg) {
+        var t = document.createElement('div');
+        t.textContent = msg;
+        t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 20px;border-radius:8px;font-size:14px;z-index:9999;opacity:0;transition:opacity .3s';
+        document.body.appendChild(t);
+        requestAnimationFrame(function(){ t.style.opacity = '1'; });
+        setTimeout(function(){ t.style.opacity = '0'; setTimeout(function(){ t.remove(); }, 300); }, 2000);
+    }
+    window.showToast = showToast;
+    var PRESETS = {
+        vinyl: { coverLeft: 30, lyricsLeft: 65, coverSize: 26, coverTop: 50, lyricsTop: 50 },
+        card:  { coverLeft: 15, lyricsLeft: 45, coverSize: 22, coverTop: 50, lyricsTop: 50 }
+    };
+
+    function setStyleClass(name) {
+        document.body.classList.remove('style-vinyl', 'style-card');
+        document.body.classList.add('style-' + name);
+    }
+
+    function applyCSS(cl, ll, cs, ct, lt, lc) {
+        document.documentElement.style.setProperty('--cover-left', cl + '%');
+        document.documentElement.style.setProperty('--lyrics-left', ll + '%');
+        document.documentElement.style.setProperty('--cover-size', cs + 'rem');
+        if (ct !== undefined) document.documentElement.style.setProperty('--cover-top', ct + '%');
+        if (lt !== undefined) document.documentElement.style.setProperty('--lyrics-top', lt + '%');
+        if (lc) document.documentElement.style.setProperty('--lyrics-active-color', lc);
+    }
+
+    function setSliders(cl, ll, cs, ct, lt, lc) {
+        var eCL = document.getElementById('edCoverLeft');
+        var eLL = document.getElementById('edLyricsLeft');
+        var eCS = document.getElementById('edCoverSize');
+        var eCT = document.getElementById('edCoverTop');
+        var eLT = document.getElementById('edLyricsTop');
+        var eLC = document.getElementById('edLyricsColor');
+        if (eCL) eCL.value = cl;
+        if (eLL) eLL.value = ll;
+        if (eCS) eCS.value = cs;
+        if (eCT) eCT.value = ct !== undefined ? ct : 50;
+        if (eLT) eLT.value = lt !== undefined ? lt : 50;
+        if (eLC) eLC.value = lc || '#10b981';
+    }
+
+    function getCurrentStyle() {
+        return document.body.classList.contains('style-card') ? 'card' : 'vinyl';
+    }
+
+    window.updateLayout = function() {
+        var cl = document.getElementById('edCoverLeft').value;
+        var ll = document.getElementById('edLyricsLeft').value;
+        var cs = document.getElementById('edCoverSize').value;
+        var ct = document.getElementById('edCoverTop').value;
+        var lt = document.getElementById('edLyricsTop').value;
+        var lc = document.getElementById('edLyricsColor').value;
+        applyCSS(cl, ll, cs, ct, lt, lc);
+    };
+
+    window.saveLayout = function() {
+        var config = {
+            coverLeft: +document.getElementById('edCoverLeft').value,
+            lyricsLeft: +document.getElementById('edLyricsLeft').value,
+            coverSize: +document.getElementById('edCoverSize').value,
+            coverTop: +document.getElementById('edCoverTop').value,
+            lyricsTop: +document.getElementById('edLyricsTop').value,
+            lyricsColor: document.getElementById('edLyricsColor').value,
+            style: getCurrentStyle()
+        };
+        localStorage.setItem('lt_layout_config', JSON.stringify(config));
+        localStorage.setItem('lt_player_style', config.style);
+        fetch('/api/user/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ layout: config })
+        }).then(function(r) {
+            if (r.ok) { showToast('✅ 布局已保存'); } else { showToast('❌ 保存失败'); }
+        }).catch(function() { showToast('❌ 网络错误'); });
+        document.getElementById('layoutEditor').classList.add('hidden');
+    };
+
+    window.applyPreset = function(name) {
+        setStyleClass(name);
+        localStorage.setItem('lt_player_style', name);
+        var saved = localStorage.getItem('lt_layout_config');
+        if (saved) {
+            try {
+                var c = JSON.parse(saved);
+                c.style = name;
+                localStorage.setItem('lt_layout_config', JSON.stringify(c));
+            } catch(e) {}
+        } else {
+            var p = PRESETS[name] || PRESETS.vinyl;
+            setSliders(p.coverLeft, p.lyricsLeft, p.coverSize, p.coverTop, p.lyricsTop);
+            applyCSS(p.coverLeft, p.lyricsLeft, p.coverSize, p.coverTop, p.lyricsTop);
+        }
+    };
+
+    window.resetLayout = function() {
+        localStorage.removeItem('lt_layout_config');
+        localStorage.removeItem('lt_player_style');
+        applyPreset('vinyl');
+    };
+
+    // Style toggle button — popup menu
+    var toggleBtn = document.getElementById('styleToggleBtn');
+    var styleMenu = document.getElementById('styleMenu');
+    if (toggleBtn && styleMenu) {
+        function updateStyleMenuChecks() {
+            var cur = getCurrentStyle();
+            styleMenu.querySelectorAll('.style-menu-item').forEach(function(item) {
+                var s = item.dataset.style;
+                var label = s === 'vinyl' ? '🎵 唱片机' : '🃏 卡片';
+                item.textContent = (s === cur ? '✓ ' : '   ') + label;
+            });
+        }
+        toggleBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            updateStyleMenuChecks();
+            styleMenu.classList.toggle('hidden');
+        });
+        styleMenu.querySelectorAll('.style-menu-item').forEach(function(item) {
+            item.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var next = item.dataset.style;
+                setStyleClass(next);
+                var cl = +document.getElementById('edCoverLeft').value;
+                var ll = +document.getElementById('edLyricsLeft').value;
+                var cs = +document.getElementById('edCoverSize').value;
+                var config = { coverLeft: cl, lyricsLeft: ll, coverSize: cs, style: next };
+                localStorage.setItem('lt_layout_config', JSON.stringify(config));
+                localStorage.setItem('lt_player_style', next);
+                fetch('/api/user/settings', {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include', body: JSON.stringify({ layout: config })
+                }).then(function(r) {
+                    if (r.ok) showToast('已切换为' + (next === 'vinyl' ? '唱片机' : '卡片') + '样式');
+                }).catch(function(){});
+                styleMenu.classList.add('hidden');
+            });
+        });
+        // Close menu on outside click
+        document.addEventListener('click', function(e) {
+            if (!toggleBtn.contains(e.target) && !styleMenu.contains(e.target)) {
+                styleMenu.classList.add('hidden');
+            }
+        });
+    }
+
+        // Right-click on style toggle button opens layout editor
+    var stBtn = document.getElementById('styleToggleBtn');
+    if (stBtn) {
+        stBtn.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+            var root = getComputedStyle(document.documentElement);
+            var cl = parseInt(root.getPropertyValue('--cover-left')) || 30;
+            var ll = parseInt(root.getPropertyValue('--lyrics-left')) || 65;
+            var cs = parseInt(root.getPropertyValue('--cover-size')) || 26;
+            var ct = parseInt(root.getPropertyValue('--cover-top')) || 50;
+            var lt = parseInt(root.getPropertyValue('--lyrics-top')) || 50;
+            var lc = root.getPropertyValue('--lyrics-active-color').trim() || '#10b981';
+            setSliders(cl, ll, cs, ct, lt, lc);
+            document.getElementById('layoutEditor').classList.remove('hidden');
+        });
+    }
+
+    // Click outside editor to close
+    var editor = document.getElementById('layoutEditor');
+    if (editor) {
+        editor.addEventListener('click', function(e) {
+            if (e.target === editor) editor.classList.add('hidden');
+        });
+    }
+
+    // Load saved config: try server first, fallback to localStorage
+    function loadFromLocal() {
+        var saved = localStorage.getItem('lt_layout_config');
+        if (saved) {
+            try {
+                var c = JSON.parse(saved);
+                setStyleClass(c.style || 'vinyl');
+                setSliders(c.coverLeft, c.lyricsLeft, c.coverSize, c.coverTop, c.lyricsTop, c.lyricsColor);
+                applyCSS(c.coverLeft, c.lyricsLeft, c.coverSize, c.coverTop, c.lyricsTop, c.lyricsColor);
+            } catch(e) { applyPreset('vinyl'); }
+        } else {
+            var style = localStorage.getItem('lt_player_style') || 'vinyl';
+            applyPreset(style);
+        }
+    }
+    fetch('/api/user/settings', { credentials: 'include' })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+            if (data && data.layout) {
+                var c = data.layout;
+                localStorage.setItem('lt_layout_config', JSON.stringify(c));
+                setStyleClass(c.style || 'vinyl');
+                setSliders(c.coverLeft, c.lyricsLeft, c.coverSize, c.coverTop, c.lyricsTop, c.lyricsColor);
+                applyCSS(c.coverLeft, c.lyricsLeft, c.coverSize, c.coverTop, c.lyricsTop, c.lyricsColor);
+            } else { loadFromLocal(); }
+        })
+        .catch(function() { loadFromLocal(); });
+})();
+</script>
+<script>
+// === Problem 6: Library buttons show playlist count + allow re-add ===
+(function() {
+    var libraryList = document.getElementById('libraryList');
+    if (!libraryList) return;
+
+    function getPlaylistCounts() {
+        var counts = {};
+        var items = document.querySelectorAll('#playlistItems .playlist-item');
+        items.forEach(function(item) {
+            var titleEl = item.querySelector('.pi-title');
+            if (titleEl) {
+                var t = titleEl.textContent.trim();
+                counts[t] = (counts[t] || 0) + 1;
+            }
+        });
+        return counts;
+    }
+
+    function updateLibraryBtnLabels() {
+        var counts = getPlaylistCounts();
+        var items = libraryList.querySelectorAll('.library-item');
+        items.forEach(function(item) {
+            var titleEl = item.querySelector('.li-title');
+            var btn = item.querySelector('.btn-add');
+            if (!titleEl || !btn) return;
+            var title = titleEl.textContent.trim();
+            var count = counts[title] || 0;
+            // Re-enable button so user can add again
+            if (btn.textContent === '✓' || btn.textContent === '✗') {
+                btn.disabled = false;
+            }
+            if (count > 0 && !btn.disabled) {
+                btn.textContent = '添加 (' + count + ')';
+            } else if (!btn.disabled && btn.textContent !== '...') {
+                btn.textContent = '添加';
+            }
+            // Override onclick to allow re-add
+            if (!btn._patched) {
+                btn._patched = true;
+                var origClick = btn.onclick;
+                btn.onclick = function() {
+                    btn.disabled = true; btn.textContent = '...';
+                    var audioId = parseInt(btn.dataset.id);
+                    var roomCode = (document.getElementById('displayCode') || {}).textContent || '';
+                    fetch('/api/room/' + roomCode + '/playlist/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',
+                        body: JSON.stringify({ audio_id: audioId })
+                    }).then(function(r) {
+                        if (r.ok) {
+                            btn.textContent = '✓';
+                            btn.disabled = false;
+                            setTimeout(function() { updateLibraryBtnLabels(); }, 800);
+                        } else { btn.textContent = '✗'; btn.disabled = false; }
+                    }).catch(function() { btn.textContent = '✗'; btn.disabled = false; });
+                };
+            }
+        });
+    }
+
+    // Watch libraryList for content changes (app.js renders list here)
+    var obs = new MutationObserver(function() {
+        setTimeout(updateLibraryBtnLabels, 100);
+    });
+    obs.observe(libraryList, { childList: true, subtree: true });
+
+    // Also update when playlist changes
+    var plItems = document.getElementById('playlistItems');
+    if (plItems) {
+        var plObs = new MutationObserver(function() {
+            var modal = document.getElementById('libraryModal');
+            if (modal && !modal.classList.contains('hidden')) {
+                setTimeout(updateLibraryBtnLabels, 200);
+            }
+        });
+        plObs.observe(plItems, { childList: true, subtree: true });
+    }
+})();
+</script>
+<script>
+// === Dynamic Glassmorphism Background ===
+(function() {
+    // 1. Color extraction from cover image
+    function extractColors(img) {
+        var canvas = document.createElement('canvas');
+        var ctx = canvas.getContext('2d');
+        canvas.width = 64; canvas.height = 64;
+        ctx.drawImage(img, 0, 0, 64, 64);
+        var data = ctx.getImageData(0, 0, 64, 64).data;
+        var colors = [];
+        var regions = [[0,0,32,32], [32,0,64,32], [16,32,48,64]];
+        regions.forEach(function(r) {
+            var rr=0, gg=0, bb=0, count=0;
+            for (var y=r[1]; y<r[3]; y++) {
+                for (var x=r[0]; x<r[2]; x++) {
+                    var i = (y*64+x)*4;
+                    rr += data[i]; gg += data[i+1]; bb += data[i+2]; count++;
+                }
+            }
+            colors.push([Math.round(rr/count), Math.round(gg/count), Math.round(bb/count)]);
+        });
+        return colors;
+    }
+
+    // 2. Apply colors to blobs
+    function applyBgColors(colors) {
+        var blobs = [document.getElementById('bgBlob1'), document.getElementById('bgBlob2'), document.getElementById('bgBlob3')];
+        colors.forEach(function(c, i) {
+            if (blobs[i]) blobs[i].style.backgroundColor = 'rgb('+c[0]+','+c[1]+','+c[2]+')';
+        });
+    }
+
+    // 3. Watch cover image changes
+    var lastCoverSrc = '';
+    setInterval(function() {
+        var img = document.getElementById('coverImage');
+        if (!img || !img.src || img.style.display === 'none' || img.src === lastCoverSrc) return;
+        lastCoverSrc = img.src;
+        var tempImg = new Image();
+        tempImg.crossOrigin = 'anonymous';
+        tempImg.onload = function() {
+            try {
+                var colors = extractColors(tempImg);
+                applyBgColors(colors);
+            } catch(e) { console.log('color extract failed:', e); }
+        };
+        tempImg.src = img.src;
+    }, 1000);
+
+    // 4. Audio-driven background animation
+    var analyser = null;
+    var dataArray = null;
+
+    function setupAnalyser() {
+        var ap = window.audioPlayer;
+        if (!ap || !ap.ctx || !ap.gainNode) return false;
+        if (analyser) return true;
+        try {
+            analyser = ap.ctx.createAnalyser();
+            analyser.fftSize = 256;
+            ap.gainNode.connect(analyser);
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            return true;
+        } catch(e) { return false; }
+    }
+
+    function animateBackground() {
+        requestAnimationFrame(animateBackground);
+        if (!analyser || !dataArray) { setupAnalyser(); return; }
+        analyser.getByteFrequencyData(dataArray);
+
+        var bass = 0;
+        for (var i = 0; i < 10; i++) bass += dataArray[i];
+        bass = bass / (10 * 255);
+
+        var mid = 0;
+        for (var i = 10; i < 40; i++) mid += dataArray[i];
+        mid = mid / (30 * 255);
+
+        var blobs = [document.getElementById('bgBlob1'), document.getElementById('bgBlob2'), document.getElementById('bgBlob3')];
+        if (blobs[0]) {
+            var scale = 40 + bass * 15;
+            blobs[0].style.width = scale + 'vw';
+            blobs[0].style.height = scale + 'vw';
+            blobs[0].style.opacity = 0.3 + bass * 0.3;
+        }
+        if (blobs[1]) {
+            var scale2 = 35 + mid * 12;
+            blobs[1].style.width = scale2 + 'vw';
+            blobs[1].style.height = scale2 + 'vw';
+            blobs[1].style.opacity = 0.25 + mid * 0.25;
+        }
+        if (blobs[2]) {
+            blobs[2].style.opacity = 0.2 + (bass + mid) / 2 * 0.3;
+        }
+
+        var overlay = document.getElementById('bgOverlay');
+        if (overlay) {
+            var blur = 40 - bass * 15;
+            overlay.style.backdropFilter = 'blur(' + blur + 'px)';
+            overlay.style.webkitBackdropFilter = 'blur(' + blur + 'px)';
+        }
+    }
+
+    requestAnimationFrame(animateBackground);
+})();
+</script>
 </body>
 </html>
