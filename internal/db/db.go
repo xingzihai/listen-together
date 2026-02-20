@@ -296,12 +296,14 @@ func (d *DB) init() error {
 	)`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS playlists (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		room_code TEXT NOT NULL,
+		room_code TEXT NOT NULL UNIQUE,
 		created_by INTEGER NOT NULL,
 		play_mode TEXT NOT NULL DEFAULT 'sequential',
 		current_index INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
+	// Migrate: add unique index if table already existed without it
+	d.conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_room_code ON playlists(room_code)`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS playlist_items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		playlist_id INTEGER NOT NULL,
@@ -642,15 +644,26 @@ func (d *DB) GetAudioFileByUUID(uuid string) (*AudioFile, error) {
 }
 
 func (d *DB) DeleteAudioFile(id, ownerID int64) error {
-	// Remove from any playlists first
-	d.conn.Exec("DELETE FROM playlist_items WHERE audio_id=?", id)
-	res, err := d.conn.Exec("DELETE FROM audio_files WHERE id=? AND owner_id=?", id, ownerID)
+	tx, err := d.conn.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM playlist_items WHERE audio_id=?", id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete playlist_items: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM audio_files WHERE id=? AND owner_id=?", id, ownerID)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete audio_file: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		tx.Rollback()
 		return fmt.Errorf("not found or not owner")
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
@@ -735,6 +748,17 @@ func (d *DB) CreatePlaylist(roomCode string, createdBy int64) (*Playlist, error)
 	return &Playlist{ID: id, RoomCode: roomCode, CreatedBy: createdBy, PlayMode: "sequential", CurrentIndex: 0, CreatedAt: time.Now()}, nil
 }
 
+func (d *DB) GetOrCreatePlaylist(roomCode string, createdBy int64) (*Playlist, error) {
+	d.conn.Exec("INSERT OR IGNORE INTO playlists(room_code,created_by) VALUES(?,?)", roomCode, createdBy)
+	p := &Playlist{}
+	err := d.conn.QueryRow("SELECT id,room_code,created_by,play_mode,current_index,created_at FROM playlists WHERE room_code=?", roomCode).
+		Scan(&p.ID, &p.RoomCode, &p.CreatedBy, &p.PlayMode, &p.CurrentIndex, &p.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 func (d *DB) GetPlaylistByRoom(roomCode string) (*Playlist, error) {
 	p := &Playlist{}
 	err := d.conn.QueryRow("SELECT id,room_code,created_by,play_mode,current_index,created_at FROM playlists WHERE room_code=?", roomCode).
@@ -745,13 +769,26 @@ func (d *DB) GetPlaylistByRoom(roomCode string) (*Playlist, error) {
 	return p, nil
 }
 
-func (d *DB) AddPlaylistItem(playlistID, audioID int64, position int) (*PlaylistItem, error) {
-	res, err := d.conn.Exec("INSERT INTO playlist_items(playlist_id,audio_id,position) VALUES(?,?,?)", playlistID, audioID, position)
+func (d *DB) AddPlaylistItem(playlistID, audioID int64, _ int) (*PlaylistItem, error) {
+	tx, err := d.conn.Begin()
 	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	var pos int
+	if err := tx.QueryRow("SELECT COALESCE(MAX(position),0)+1 FROM playlist_items WHERE playlist_id=?", playlistID).Scan(&pos); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("get next position: %w", err)
+	}
+	res, err := tx.Exec("INSERT INTO playlist_items(playlist_id,audio_id,position) VALUES(?,?,?)", playlistID, audioID, pos)
+	if err != nil {
+		tx.Rollback()
 		return nil, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
 	id, _ := res.LastInsertId()
-	return &PlaylistItem{ID: id, PlaylistID: playlistID, AudioID: audioID, Position: position}, nil
+	return &PlaylistItem{ID: id, PlaylistID: playlistID, AudioID: audioID, Position: pos}, nil
 }
 
 func (d *DB) RemovePlaylistItem(playlistID, itemID int64) error {

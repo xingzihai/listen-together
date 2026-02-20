@@ -267,7 +267,7 @@ func (h *LibraryHandlers) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	diskPath := filepath.Join(h.DataDir, "library", strconv.FormatInt(user.UserID, 10), af.Filename)
+	diskPath := filepath.Join(h.DataDir, "library", strconv.FormatInt(af.OwnerID, 10), af.Filename)
 	os.RemoveAll(diskPath)
 
 	jsonOK(w, map[string]string{"message": "ok"})
@@ -577,14 +577,11 @@ func (h *PlaylistHandlers) GetOrCreatePlaylist(w http.ResponseWriter, r *http.Re
 	}
 
 	if r.Method == http.MethodPost {
-		// Create or get
-		pl, err := h.DB.GetPlaylistByRoom(code)
+		// Create or get (atomic: INSERT OR IGNORE + SELECT)
+		pl, err := h.DB.GetOrCreatePlaylist(code, user.UserID)
 		if err != nil {
-			pl, err = h.DB.CreatePlaylist(code, user.UserID)
-			if err != nil {
-				jsonError(w, "创建播放列表失败", 500)
-				return
-			}
+			jsonError(w, "创建播放列表失败", 500)
+			return
 		}
 		items, _ := h.DB.GetPlaylistItems(pl.ID)
 		if items == nil {
@@ -645,16 +642,11 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pl, err := h.DB.GetPlaylistByRoom(code)
+	pl, err := h.DB.GetOrCreatePlaylist(code, user.UserID)
 	if err != nil {
-		pl, err = h.DB.CreatePlaylist(code, user.UserID)
-		if err != nil {
-			jsonError(w, "创建播放列表失败", 500)
-			return
-		}
+		jsonError(w, "创建播放列表失败", 500)
+		return
 	}
-
-	pos, _ := h.DB.GetNextPlaylistPosition(pl.ID)
 
 	af, err := h.DB.GetAudioFileByID(req.AudioID)
 	if err != nil {
@@ -662,7 +654,7 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := h.DB.AddPlaylistItem(pl.ID, req.AudioID, pos)
+	item, err := h.DB.AddPlaylistItem(pl.ID, req.AudioID, 0)
 	if err != nil {
 		jsonError(w, "添加失败", 500)
 		return
