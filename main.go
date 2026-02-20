@@ -344,7 +344,7 @@ type wsConnTracker struct {
 
 var wsTracker = &wsConnTracker{conns: make(map[int64]int)}
 
-const maxWSConnsPerUser = 5
+const maxWSConnsPerUser = 9999 // TODO: restore to 5 after testing
 
 func (t *wsConnTracker) acquire(userID int64) bool {
 	t.mu.Lock()
@@ -459,9 +459,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// --- Per-connection message rate limiter (sliding window) ---
 	const (
 		msgRateWindow  = time.Second
-		msgRateLimit   = 10 // normal messages per second
-		pingRateLimit  = 5  // ping messages per second
-		totalRateLimit = 12 // all messages combined per second
+		msgRateLimit   = 9999 // TODO: restore to 10 after testing
+		pingRateLimit  = 9999 // TODO: restore to 5 after testing
+		totalRateLimit = 9999 // TODO: restore to 12 after testing
 	)
 	var (
 		msgTimes   = make([]time.Time, 0, msgRateLimit)

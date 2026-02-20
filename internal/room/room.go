@@ -10,9 +10,9 @@ import (
 
 // Configurable limits
 const (
-	MaxRooms          = 100 // global room count limit
-	MaxRoomsPerUser   = 3   // max rooms a single user can create
-	MaxClientsPerRoom = 50  // max users per room
+	MaxRooms          = 99999 // TODO: restore to 100 after testing
+	MaxRoomsPerUser   = 99999 // TODO: restore to 3 after testing
+	MaxClientsPerRoom = 99999 // TODO: restore to 50 after testing
 )
 
 var (
