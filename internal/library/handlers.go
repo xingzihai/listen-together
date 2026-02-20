@@ -69,7 +69,35 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	ext := filepath.Ext(header.Filename)
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+
+	// Extension whitelist
+	allowedExts := map[string]bool{
+		".mp3": true, ".flac": true, ".wav": true, ".m4a": true, ".ogg": true,
+		".aac": true, ".wma": true, ".opus": true, ".ape": true, ".alac": true,
+	}
+	if !allowedExts[ext] {
+		jsonError(w, "不支持的文件格式", 400)
+		return
+	}
+
+	// MIME type check via magic bytes (auxiliary)
+	buf := make([]byte, 512)
+	n, err := file.Read(buf)
+	if err != nil && err != io.EOF {
+		jsonError(w, "读取文件失败", 400)
+		return
+	}
+	mimeType := http.DetectContentType(buf[:n])
+	if !strings.HasPrefix(mimeType, "audio/") && mimeType != "application/octet-stream" && mimeType != "video/ogg" {
+		jsonError(w, "不支持的文件格式", 400)
+		return
+	}
+	// Seek back to start after reading magic bytes
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		jsonError(w, "读取文件失败", 400)
+		return
+	}
 	audioID := uuid.New().String()
 	userDir := filepath.Join(h.DataDir, "library", strconv.FormatInt(user.UserID, 10))
 	audioDir := filepath.Join(userDir, audioID)
