@@ -411,7 +411,9 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	filePath := filepath.Join(h.DataDir, "library", userID, audioID, "segments_"+quality, filename)
+	// Use DB owner ID for path, not URL parameter (prevent path manipulation)
+	ownerIDStr := strconv.FormatInt(af.OwnerID, 10)
+	filePath := filepath.Join(h.DataDir, "library", ownerIDStr, audioID, "segments_"+quality, filename)
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
 	if quality == "lossless" {
 		w.Header().Set("Content-Type", "audio/flac")
