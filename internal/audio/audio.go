@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	ffprobeTimeout = 30 * time.Second
+	ffmpegTimeout  = 5 * time.Minute
 )
 
 const (
@@ -77,7 +84,9 @@ func sanitizeInputPath(path string) string {
 func ProbeAudio(inputPath string) (*ProbeResult, error) {
 	inputPath = sanitizeInputPath(inputPath)
 	// Get bitrate
-	cmdBr := exec.Command("ffprobe", "-v", "error",
+	ctxBr, cancelBr := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelBr()
+	cmdBr := exec.CommandContext(ctxBr, "ffprobe", "-v", "error",
 		"-select_streams", "a:0",
 		"-show_entries", "format=bit_rate",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -91,7 +100,9 @@ func ProbeAudio(inputPath string) (*ProbeResult, error) {
 	}
 
 	// Get codec name
-	cmdCodec := exec.Command("ffprobe", "-v", "error",
+	ctxCodec, cancelCodec := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelCodec()
+	cmdCodec := exec.CommandContext(ctxCodec, "ffprobe", "-v", "error",
 		"-select_streams", "a:0",
 		"-show_entries", "stream=codec_name",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -146,7 +157,9 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	args = append(args, "-segment_format", "flac")
 	args = append(args, "-y", pattern)
 
-	cmd := exec.Command("ffmpeg", args...)
+	ctxSeg, cancelSeg := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancelSeg()
+	cmd := exec.CommandContext(ctxSeg, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg (%s) failed: %w, output: %s", q.Name, err, string(out))
@@ -271,7 +284,9 @@ func ProcessAudio(inputPath, outputDir, filename string) (*Manifest, error) {
 	}
 
 	segmentPattern := filepath.Join(outputDir, "segment_%03d.m4a")
-	cmd := exec.Command("ffmpeg",
+	ctxLegacy, cancelLegacy := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancelLegacy()
+	cmd := exec.CommandContext(ctxLegacy, "ffmpeg",
 		"-i", inputPath,
 		"-vn",
 		"-c:a", "aac",
@@ -316,7 +331,9 @@ func ProcessAudio(inputPath, outputDir, filename string) (*Manifest, error) {
 
 func getAudioDuration(filePath string) (float64, error) {
 	filePath = sanitizeInputPath(filePath)
-	cmd := exec.Command("ffprobe",
+	ctxDur, cancelDur := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelDur()
+	cmd := exec.CommandContext(ctxDur, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",

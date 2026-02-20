@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/xingzihai/listen-together/internal/audio"
@@ -191,7 +193,9 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func getDuration(path string) float64 {
-	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1", path)
 	out, err := cmd.Output()
 	if err != nil {
