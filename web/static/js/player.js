@@ -424,11 +424,11 @@ class AudioPlayer {
                 const rtt = window.clockSync.rtt.toFixed(0);
                 const sam = window.clockSync.samples.length;
                 const syn = window.clockSync.synced ? 'Y' : 'N';
-                dbg.innerHTML = [
+                dbg.textContent = [
                     `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
                     `POS raw:${rawP} exp:${expP} cur:${curP} svrElapsed:${svrEl}s ctxElapsed:${ctxEl}s`,
                     `SEG idx:${segI} nextIn:${nst}s rate:${rate} driftOff:${driftAcc}ms lat:${lat}ms`,
-                ].join('<br>');
+                ].join('\n');
             }
         }
         const absDrift = Math.abs(drift);
