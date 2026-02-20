@@ -3,11 +3,11 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -93,17 +93,54 @@ func SetDB(d *db.DB) {
 }
 
 func InitJWT() {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		b := make([]byte, 32)
-		rand.Read(b)
-		secret = hex.EncodeToString(b)
-		log.Printf("JWT_SECRET not set, generated random secret")
+	// 1. Try JWT_SECRET env var
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		jwtSecret = []byte(secret)
+		log.Printf("[JWT] Secret loaded from environment variable")
+		padSecretIfNeeded()
+		return
 	}
-	jwtSecret = []byte(secret)
-	// Warn and pad if secret is too short
+
+	// 2. Determine data directory (same as SQLite DB location)
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	secretFile := filepath.Join(dataDir, ".jwt_secret")
+
+	// 3. Try reading from persisted file
+	if data, err := os.ReadFile(secretFile); err == nil && len(data) > 0 {
+		jwtSecret = data
+		log.Printf("[JWT] Secret loaded from file: %s", secretFile)
+		padSecretIfNeeded()
+		return
+	}
+
+	// 4. Generate new secret and persist to file
+	b := make([]byte, 32)
+	rand.Read(b)
+	jwtSecret = b
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Printf("[JWT] WARNING: failed to create data dir %s: %v (secret will not persist)", dataDir, err)
+		log.Printf("[JWT] Secret generated (not persisted)")
+		return
+	}
+
+	// Write secret file with 0600 permissions
+	if err := os.WriteFile(secretFile, jwtSecret, 0600); err != nil {
+		log.Printf("[JWT] WARNING: failed to write secret file %s: %v (secret will not persist)", secretFile, err)
+		log.Printf("[JWT] Secret generated (not persisted)")
+		return
+	}
+
+	log.Printf("[JWT] Secret generated and persisted to file: %s", secretFile)
+}
+
+func padSecretIfNeeded() {
 	if len(jwtSecret) < 32 {
-		log.Printf("WARNING: JWT_SECRET is %d bytes, minimum recommended is 32. Padding with random bytes.", len(jwtSecret))
+		log.Printf("[JWT] WARNING: secret is %d bytes, minimum recommended is 32. Padding with random bytes.", len(jwtSecret))
 		pad := make([]byte, 32-len(jwtSecret))
 		rand.Read(pad)
 		jwtSecret = append(jwtSecret, pad...)
