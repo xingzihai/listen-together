@@ -45,6 +45,54 @@ func (h *LibraryHandlers) requireAdmin(r *http.Request) *auth.UserInfo {
 	return u
 }
 
+// isAudioMagic checks file header bytes against known audio format signatures
+func isAudioMagic(buf []byte) bool {
+	if len(buf) < 4 {
+		return false
+	}
+	// ID3 tag (MP3 with metadata)
+	if buf[0] == 0x49 && buf[1] == 0x44 && buf[2] == 0x33 {
+		return true
+	}
+	// MP3 sync word (0xFFFB, 0xFFF3, 0xFFF2, 0xFFE3, etc.)
+	if buf[0] == 0xFF && (buf[1]&0xE0) == 0xE0 {
+		return true
+	}
+	// FLAC: "fLaC"
+	if buf[0] == 0x66 && buf[1] == 0x4C && buf[2] == 0x61 && buf[3] == 0x43 {
+		return true
+	}
+	// OGG: "OggS" (covers .ogg, .opus)
+	if buf[0] == 0x4F && buf[1] == 0x67 && buf[2] == 0x67 && buf[3] == 0x53 {
+		return true
+	}
+	// RIFF: WAV, AIF (RIFF....WAVE or RIFF....AVI)
+	if buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 {
+		return true
+	}
+	// AIFF: "FORM"
+	if buf[0] == 0x46 && buf[1] == 0x4F && buf[2] == 0x52 && buf[3] == 0x4D {
+		return true
+	}
+	// M4A/AAC in MP4 container: "ftyp" at offset 4
+	if len(buf) >= 8 && buf[4] == 0x66 && buf[5] == 0x74 && buf[6] == 0x79 && buf[7] == 0x70 {
+		return true
+	}
+	// APE: "MAC " (Monkey's Audio)
+	if buf[0] == 0x4D && buf[1] == 0x41 && buf[2] == 0x43 && buf[3] == 0x20 {
+		return true
+	}
+	// WMA: ASF header GUID (30 26 B2 75 8E 66 CF 11)
+	if len(buf) >= 8 && buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xB2 && buf[3] == 0x75 {
+		return true
+	}
+	// AAC ADTS raw: sync word 0xFFF1 or 0xFFF9
+	if buf[0] == 0xFF && (buf[1] == 0xF1 || buf[1] == 0xF9) {
+		return true
+	}
+	return false
+}
+
 func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		jsonError(w, "method not allowed", 405)
@@ -74,23 +122,22 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	// Extension whitelist
 	allowedExts := map[string]bool{
 		".mp3": true, ".flac": true, ".wav": true, ".m4a": true, ".ogg": true,
-		".aac": true, ".wma": true, ".opus": true, ".ape": true, ".alac": true,
+		".aac": true, ".wma": true, ".opus": true, ".ape": true, ".aif": true, ".aiff": true,
 	}
 	if !allowedExts[ext] {
 		jsonError(w, "不支持的文件格式", 400)
 		return
 	}
 
-	// MIME type check via magic bytes (auxiliary)
+	// Magic bytes validation (real check, not just http.DetectContentType)
 	buf := make([]byte, 512)
 	n, err := file.Read(buf)
 	if err != nil && err != io.EOF {
 		jsonError(w, "读取文件失败", 400)
 		return
 	}
-	mimeType := http.DetectContentType(buf[:n])
-	if !strings.HasPrefix(mimeType, "audio/") && mimeType != "application/octet-stream" && mimeType != "video/ogg" {
-		jsonError(w, "不支持的文件格式", 400)
+	if !isAudioMagic(buf[:n]) {
+		jsonError(w, "文件内容与音频格式不匹配", 400)
 		return
 	}
 	// Seek back to start after reading magic bytes
