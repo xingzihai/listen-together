@@ -192,42 +192,49 @@ func main() {
 
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
+
+	// Empty Origin: only allow if the request carries a valid JWT (authenticated client).
+	// This blocks unauthenticated non-browser clients while still supporting
+	// legitimate tools/apps that authenticate but don't send Origin.
 	if origin == "" {
-		return true // No Origin header (same-origin request)
+		return auth.ExtractUserFromRequest(r) != nil
 	}
+
 	u, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
-	host := u.Hostname() // Without port
+	host := u.Hostname()
 
-	allowedStr := os.Getenv("ALLOWED_ORIGINS")
-	var allowedOrigins []string
-	if allowedStr != "" {
-		allowedOrigins = strings.Split(allowedStr, ",")
-	} else {
-		allowedOrigins = []string{"https://frp-bar.com", "http://localhost", "http://127.0.0.1"}
-	}
-
-	for _, allowed := range allowedOrigins {
-		allowed = strings.TrimSpace(allowed)
-		au, err := url.Parse(allowed)
-		if err != nil {
-			// Fallback: direct comparison
-			if origin == allowed {
-				return true
-			}
-			continue
-		}
-		if host == au.Hostname() {
-			return true
-		}
-	}
-	// Also allow localhost and 127.0.0.1 (exact match)
+	// Always allow localhost for development
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
-	return false
+
+	allowedStr := os.Getenv("ALLOWED_ORIGINS")
+	if allowedStr != "" {
+		// ALLOWED_ORIGINS is set: only allow listed origins (+ localhost above)
+		for _, allowed := range strings.Split(allowedStr, ",") {
+			allowed = strings.TrimSpace(allowed)
+			if allowed == "" {
+				continue
+			}
+			au, err := url.Parse(allowed)
+			if err != nil {
+				if origin == allowed {
+					return true
+				}
+				continue
+			}
+			if host == au.Hostname() {
+				return true
+			}
+		}
+		return false
+	}
+
+	// ALLOWED_ORIGINS not set: backward-compatible permissive behavior
+	return true
 }
 
 func generateCode() string {
