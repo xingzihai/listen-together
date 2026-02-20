@@ -200,6 +200,15 @@ func (h *AuthHandlers) Logout(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", 405)
 		return
 	}
+	// Try to extract user from cookie token and invalidate server-side session.
+	// Logout route doesn't use AuthMiddleware, so we parse manually.
+	// If token is missing/invalid, we still clear the cookie and return ok.
+	if cookie, err := r.Cookie("token"); err == nil {
+		if claims, err := ValidateToken(cookie.Value); err == nil {
+			h.DB.BumpSessionVersion(claims.UserID)
+			GlobalRoleCache.Invalidate(claims.UserID)
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "token", Value: "", Path: "/",
 		HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteLaxMode,
