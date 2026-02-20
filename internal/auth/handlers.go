@@ -159,7 +159,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, user.SessionVersion)
 	setTokenCookieWithRequest(w, r, token)
-	jsonOK(w, map[string]interface{}{"user": user, "token": token})
+	jsonOK(w, map[string]interface{}{"user": user})
 }
 
 func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
@@ -191,10 +191,14 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	setTokenCookieWithRequest(w, r, token)
 	// Check if owner with default password
 	needChangePassword := user.Role == "owner" && CheckPassword(user.PasswordHash, "admin123")
-	jsonOK(w, map[string]interface{}{"user": user, "token": token, "needChangePassword": needChangePassword})
+	jsonOK(w, map[string]interface{}{"user": user, "needChangePassword": needChangePassword})
 }
 
 func (h *AuthHandlers) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", 405)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "token", Value: "", Path: "/",
 		HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteLaxMode,

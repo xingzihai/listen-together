@@ -208,7 +208,7 @@ func setTokenCookieWithRequest(w http.ResponseWriter, r *http.Request, token str
 }
 
 // tryAutoRenew checks if token needs renewal (< 2h remaining) and issues a new one
-func tryAutoRenew(w http.ResponseWriter, claims *Claims) {
+func tryAutoRenew(w http.ResponseWriter, r *http.Request, claims *Claims) {
 	if claims.ExpiresAt == nil {
 		return
 	}
@@ -218,7 +218,7 @@ func tryAutoRenew(w http.ResponseWriter, claims *Claims) {
 		if err != nil {
 			return
 		}
-		setTokenCookie(w, newToken)
+		setTokenCookieWithRequest(w, r, newToken)
 	}
 }
 
@@ -237,7 +237,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		if tokenStr != "" {
 			if claims, err := ValidateToken(tokenStr); err == nil {
 				if _, err := validateClaimsAgainstDB(claims); err == nil {
-					tryAutoRenew(w, claims)
+					tryAutoRenew(w, r, claims)
 					ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 						UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 					})
@@ -274,7 +274,7 @@ func RequireAuth(next http.Handler) http.Handler {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		tryAutoRenew(w, claims)
+		tryAutoRenew(w, r, claims)
 		ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 			UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 		})

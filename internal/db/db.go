@@ -321,6 +321,9 @@ func (d *DB) init() error {
 }
 
 func (d *DB) CreateUser(username, password, role string) (*User, error) {
+	if len([]byte(password)) > 72 {
+		return nil, fmt.Errorf("password too long")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	if err != nil {
 		return nil, err
@@ -390,6 +393,9 @@ func (d *DB) BumpSessionVersion(id int64) (int64, error) {
 }
 
 func (d *DB) UpdatePassword(id int64, newPassword string) error {
+	if len([]byte(newPassword)) > 72 {
+		return fmt.Errorf("password too long")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), 12)
 	if err != nil {
 		return err
