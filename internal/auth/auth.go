@@ -244,14 +244,26 @@ func setTokenCookieWithRequest(w http.ResponseWriter, r *http.Request, token str
 	})
 }
 
-// tryAutoRenew checks if token needs renewal (< 2h remaining) and issues a new one
+// tryAutoRenew checks if token needs renewal (< 2h remaining) and issues a new one.
+// It fetches the latest role/version from DB to prevent stale privilege in renewed tokens.
 func tryAutoRenew(w http.ResponseWriter, r *http.Request, claims *Claims) {
 	if claims.ExpiresAt == nil {
 		return
 	}
 	remaining := time.Until(claims.ExpiresAt.Time)
 	if remaining > 0 && remaining < 2*time.Hour {
-		newToken, err := GenerateToken(claims.UserID, claims.Username, claims.Role, claims.PasswordVersion, claims.SessionVersion)
+		// Fetch fresh role and versions from DB to avoid renewing with stale privileges
+		role, pwVer, sessVer := claims.Role, claims.PasswordVersion, claims.SessionVersion
+		if authDB != nil {
+			freshRole, freshPwVer, freshSessVer, err := authDB.GetUserRoleAndVersion(claims.UserID)
+			if err != nil {
+				// DB lookup failed; skip renewal, current request is unaffected
+				return
+			}
+			role, pwVer, sessVer = freshRole, freshPwVer, freshSessVer
+			GlobalRoleCache.Set(claims.UserID, role, pwVer, sessVer)
+		}
+		newToken, err := GenerateToken(claims.UserID, claims.Username, role, pwVer, sessVer)
 		if err != nil {
 			return
 		}
