@@ -145,6 +145,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "用户名需要3-20个字符，只能包含字母、数字和下划线", 400)
 		return
 	}
+	req.Username = strings.ToLower(req.Username)
 	if len(req.Password) < 6 {
 		jsonError(w, "密码至少6个字符", 400)
 		return
@@ -303,6 +304,7 @@ func (h *AuthHandlers) ChangeUsername(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "用户名需要3-20个字符，只能包含字母、数字和下划线", 400)
 		return
 	}
+	req.NewUsername = strings.ToLower(req.NewUsername)
 	dbUser, err := h.DB.GetUserByID(user.UserID)
 	if err != nil || !CheckPassword(dbUser.PasswordHash, req.Password) {
 		jsonError(w, "密码错误", 401)

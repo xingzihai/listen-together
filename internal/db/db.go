@@ -342,6 +342,7 @@ func (d *DB) init() error {
 }
 
 func (d *DB) CreateUser(username, password, role string) (*User, error) {
+	username = strings.ToLower(username)
 	if len([]byte(password)) > 72 {
 		return nil, fmt.Errorf("password too long")
 	}
@@ -397,6 +398,7 @@ func (d *DB) CreateUser(username, password, role string) (*User, error) {
 }
 
 func (d *DB) GetUserByUsername(username string) (*User, error) {
+	username = strings.ToLower(username)
 	u := &User{}
 	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,session_version,created_at FROM users WHERE username=?", username).
 		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
@@ -454,6 +456,7 @@ func (d *DB) UpdatePassword(id int64, newPassword string) error {
 }
 
 func (d *DB) UpdateUsername(id int64, newUsername string) error {
+	newUsername = strings.ToLower(newUsername)
 	_, err := d.conn.Exec("UPDATE users SET username=? WHERE id=?", newUsername, id)
 	return err
 }
