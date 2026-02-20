@@ -8,6 +8,13 @@ let trackLoading = false, pendingPlay = null;
 let trackChangeGen = 0;
 let deviceKicked = false;
 
+// Unified fetch wrapper: auto-handles 401 (session expired)
+async function authFetch(url, opts = {}) {
+    const res = await fetch(url, { ...opts, credentials: 'include' });
+    if (res.status === 401) { sessionExpired(); }
+    return res;
+}
+
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
@@ -402,7 +409,7 @@ $('copyInviteLink').onclick = () => {
 async function loadPlaylist() {
     if (!roomCode) return;
     try {
-        const res = await fetch(`/api/room/${roomCode}/playlist`, { method: 'POST', credentials:'include' });
+        const res = await authFetch(`/api/room/${roomCode}/playlist`, { method: 'POST' });
         const data = await res.json();
         playlist = data.playlist;
         playlistItems = data.items || [];
@@ -429,7 +436,7 @@ function renderPlaylist() {
         btn.onclick = async (e) => {
             e.stopPropagation();
             const id = btn.dataset.id;
-            await fetch(`/api/room/${roomCode}/playlist/${id}`, { method: 'DELETE', credentials:'include' });
+            await authFetch(`/api/room/${roomCode}/playlist/${id}`, { method: 'DELETE' });
         };
     });
     container.querySelectorAll('.playlist-item').forEach(el => {
@@ -453,10 +460,9 @@ $('playModeBtn').onclick = async () => {
     if (!isHost || !roomCode) return;
     const modes = ['sequential', 'shuffle', 'repeat_one'];
     const next = modes[(modes.indexOf(playMode) + 1) % modes.length];
-    await fetch(`/api/room/${roomCode}/playlist/mode`, {
+    await authFetch(`/api/room/${roomCode}/playlist/mode`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: next }),
-        credentials: 'include'
+        body: JSON.stringify({ mode: next })
     });
     playMode = next;
     updatePlayModeBtn();
@@ -486,7 +492,7 @@ async function handleTrackChange(msg, isJoinRestore) {
         : (qualities[qualities.length - 1] || 'medium');
 
     try {
-        const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`, {credentials:'include'});
+        const res = await authFetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`);
         if (gen !== trackChangeGen) return; // stale — newer track change in progress
         if (!res.ok) throw new Error('segments fetch failed: ' + res.status);
         const data = await res.json();
@@ -589,7 +595,7 @@ $('addFromLibBtn').onclick = async () => {
     list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted)">加载中...</div>';
     empty.style.display = 'none';
     try {
-        const res = await fetch('/api/library/files?accessible=true', {credentials:'include'});
+        const res = await authFetch('/api/library/files?accessible=true');
         const files = await res.json();
         if (!files || !files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
         list.innerHTML = files.map(f => `<div class="library-item"><div class="li-info"><div class="li-title">${escapeHtml(f.title)}</div><div class="li-meta">${escapeHtml(f.artist || '')} · ${formatTime(f.duration)}${f.owner_name ? ' · ' + escapeHtml(f.owner_name) : ''}</div></div><button class="btn-add" data-id="${f.id}">添加</button></div>`).join('');
@@ -597,10 +603,9 @@ $('addFromLibBtn').onclick = async () => {
             btn.onclick = async () => {
                 btn.disabled = true; btn.textContent = '...';
                 try {
-                    await fetch(`/api/room/${roomCode}/playlist/add`, {
+                    await authFetch(`/api/room/${roomCode}/playlist/add`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ audio_id: parseInt(btn.dataset.id) }),
-                        credentials: 'include'
+                        body: JSON.stringify({ audio_id: parseInt(btn.dataset.id) })
                     });
                     btn.textContent = '✓';
                 } catch { btn.textContent = '✗'; }

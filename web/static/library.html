@@ -68,8 +68,15 @@ const fmt = s => { if(!s||isNaN(s))return'0:00'; const m=Math.floor(s/60); retur
 const fmtSize = b => b>1048576?(b/1048576).toFixed(1)+'MB':(b/1024).toFixed(0)+'KB';
 const fmtDate = d => new Date(d).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
 
+// Check session on page load
+fetch('/api/auth/me', {credentials:'include'}).then(r => {
+    if (!r.ok) { window.location.href = '/'; }
+});
+
 async function loadFiles(){
-    const res=await fetch('/api/library/files'); const files=await res.json();
+    const res=await fetch('/api/library/files', {credentials:'include'});
+    if (res.status === 401) { window.location.href = '/'; return; }
+    const files=await res.json();
     const tb=document.getElementById('myFiles'); const empty=document.getElementById('myFilesEmpty');
     if(!files||!files.length){tb.innerHTML='';empty.style.display='block';return;}
     empty.style.display='none';
@@ -77,20 +84,24 @@ async function loadFiles(){
 }
 async function delFile(id){
     if(!confirm('确定删除？'))return;
-    await fetch('/api/library/files/'+id,{method:'DELETE'}); loadFiles();
+    const r=await fetch('/api/library/files/'+id,{method:'DELETE',credentials:'include'});
+    if(r.status===401){window.location.href='/';return;} loadFiles();
 }
 async function loadShares(){
-    const res=await fetch('/api/library/shares'); const data=await res.json();
+    const res=await fetch('/api/library/shares',{credentials:'include'});
+    if(res.status===401){window.location.href='/';return;} const data=await res.json();
     document.getElementById('myShares').innerHTML=(data.my_shares||[]).map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:13px;color:var(--text-secondary)">${escapeHtml(s.shared_name)} (UID:${s.shared_uid}) <button class="btn-del" onclick="unshare(${parseInt(s.shared_uid)})">✕</button></div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
     document.getElementById('sharedWithMe').innerHTML=(data.shared_with_me||[]).map(s=>`<div style="padding:4px 0;font-size:13px;color:var(--text-secondary)">${escapeHtml(s.owner_name)} (UID:${s.owner_uid})</div>`).join('')||'<div style="color:var(--text-muted);font-size:13px">无</div>';
 }
 async function unshare(uid){
-    await fetch('/api/library/share/'+uid,{method:'DELETE'}); loadShares();
+    const r=await fetch('/api/library/share/'+uid,{method:'DELETE',credentials:'include'});
+    if(r.status===401){window.location.href='/';return;} loadShares();
 }
 document.getElementById('shareBtn').onclick=async()=>{
     const uid=document.getElementById('shareUID').value.trim();
     if(!uid)return;
-    const res=await fetch('/api/library/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shared_with_uid:parseInt(uid)})});
+    const res=await fetch('/api/library/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shared_with_uid:parseInt(uid)}),credentials:'include'});
+    if(res.status===401){window.location.href='/';return;}
     const data=await res.json();
     if(!res.ok){alert(data.error);return;}
     document.getElementById('shareUID').value=''; loadShares();
