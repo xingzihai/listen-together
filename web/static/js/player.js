@@ -35,8 +35,9 @@ class AudioPlayer {
             this.gainNode.connect(this.ctx.destination);
         }
         if (this.ctx.state === 'suspended') this.ctx.resume();
-        // Cache hardware output latency for future use (not yet applied to scheduling)
+        // Hardware output latency — applied to scheduling for cross-device sync
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
+        console.log(`[sync] outputLatency: ${(this._outputLatency*1000).toFixed(1)}ms`);
     }
 
     async loadAudio(audioInfo, roomCode) {
@@ -207,9 +208,11 @@ class AudioPlayer {
         this.serverPlayPosition = position || 0;
 
         // Capture ctx↔wall clock relationship ONCE before any async work
-        // This avoids drift between the two clocks during preload
+        // Use both performance.now() and Date.now() at the same instant to avoid clock domain mixing
         const ctxSnap = this.ctx.currentTime;
-        const wallSnap = performance.now();
+        const perfSnap = performance.now();
+        const dateSnap = Date.now();
+        const latency = this._outputLatency || 0; // hardware output latency in seconds
 
         const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -219,20 +222,21 @@ class AudioPlayer {
         }
         if (!this.isPlaying) return;
 
-        // Use the snapshot to convert wall time → ctx time accurately
-        const ctxNow = ctxSnap + (performance.now() - wallSnap) / 1000;
+        // Convert elapsed perf time to ctx time (single clock domain, no Date.now mixing)
+        const ctxNow = ctxSnap + (performance.now() - perfSnap) / 1000;
 
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
+            // Use dateSnap (captured at same instant as perfSnap) to stay in one clock domain
             const localScheduled = scheduledAt - window.clockSync.offset;
-            const waitMs = localScheduled - Date.now();
+            const waitMs = localScheduled - dateSnap - (performance.now() - perfSnap);
             if (waitMs > 2 && waitMs < 3000) {
-                // Convert wait to ctx timeline
-                const ctxTarget = ctxNow + waitMs / 1000;
+                // Subtract outputLatency so audio reaches ears at the intended moment
+                const ctxTarget = ctxNow + waitMs / 1000 - latency;
                 this.startOffset = this.serverPlayPosition;
                 this.startTime = ctxTarget;
                 this._startLookahead(this.serverPlayPosition, ctxTarget);
-                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${((this._outputLatency||0)*1000).toFixed(1)}ms`);
+                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${(latency*1000).toFixed(1)}ms`);
                 return;
             }
         }
@@ -241,8 +245,9 @@ class AudioPlayer {
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
         this.startOffset = actualPos;
-        this.startTime = ctxNow;
-        this._startLookahead(actualPos, ctxNow);
+        // Subtract outputLatency so audio reaches ears sooner to compensate for hardware delay
+        this.startTime = ctxNow - latency;
+        this._startLookahead(actualPos, ctxNow - latency);
     }
 
     // === Lookahead Scheduler ===

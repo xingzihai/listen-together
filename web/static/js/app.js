@@ -178,7 +178,11 @@ async function handleMessage(msg) {
         case 'syncTick':
             // Server-authoritative position sync — bypasses per-client offset differences
             if (window.audioPlayer.isPlaying && msg.position != null) {
-                window.audioPlayer.serverPlayTime = msg.serverTime;
+                // Compensate for message transmission delay (RTT/2)
+                // serverPlayTime is when the server sent the message; by the time we receive it,
+                // RTT/2 has passed, so we advance the anchor to avoid systematic drift
+                const halfRtt = (window.clockSync.rtt || 0) / 2;
+                window.audioPlayer.serverPlayTime = msg.serverTime + halfRtt;
                 window.audioPlayer.serverPlayPosition = msg.position;
                 // Immediate drift check after anchor update
                 const drift = window.audioPlayer.correctDrift();
