@@ -39,6 +39,7 @@ type rateLimiter struct {
 
 var regLimiter = &rateLimiter{records: make(map[string][]time.Time)}
 var loginLimiter = &rateLimiter{records: make(map[string][]time.Time)}
+var usernameLoginLimiter = &rateLimiter{records: make(map[string][]time.Time)}
 
 func (rl *rateLimiter) allow(ip string, maxCount int, window time.Duration) bool {
 	rl.mu.Lock()
@@ -169,15 +170,22 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", 405)
 		return
 	}
+	// Decode request body first (body can only be read once)
+	var req authRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", 400)
+		return
+	}
 	// Rate limit: 5 per minute per IP
 	ip := GetClientIP(r)
 	if !loginLimiter.allow(ip, 5, time.Minute) {
 		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
 		return
 	}
-	var req authRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, "invalid request", 400)
+	// Rate limit: 5 per minute per username (prevents brute force on single account via multiple IPs)
+	username := strings.ToLower(req.Username)
+	if username != "" && !usernameLoginLimiter.allow(username, 5, time.Minute) {
+		jsonError(w, "该账户登录尝试过于频繁，请稍后再试", 429)
 		return
 	}
 	user, err := h.DB.GetUserByUsername(req.Username)
