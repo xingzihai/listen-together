@@ -1,5 +1,7 @@
 const $ = id => document.getElementById(id);
 let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
+let reconnectAttempts = 0, reconnectDelay = 3000;
+const MAX_RECONNECT_ATTEMPTS = 10, MAX_RECONNECT_DELAY = 60000;
 let roomUsers = [], myClientID = null;
 let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
 let trackLoading = false, pendingPlay = null;
@@ -57,27 +59,33 @@ function formatTime(s) {
 function connect(onOpen) {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
-    ws.onopen = () => { console.log('WS connected'); if (onOpen) onOpen(); };
+    ws.onopen = () => { console.log('WS connected'); reconnectAttempts = 0; reconnectDelay = 3000; if (onOpen) onOpen(); };
     ws.onmessage = e => handleMessage(JSON.parse(e.data));
     ws.onclose = (ev) => {
         if (deviceKicked) return;
-        // 1006 = abnormal close (server rejected, e.g. 401)
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            $('syncStatus').textContent = '连接已断开，请刷新页面重试';
+            console.warn('WS max reconnect attempts reached');
+            return;
+        }
+        reconnectAttempts++;
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+        console.log(`WS closed, reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms`);
         // Check if session is still valid before reconnecting
         fetch('/api/auth/me', {credentials:'include'}).then(r => {
             if (!r.ok) {
-                // JWT invalid — kicked by new login on another device
                 sessionExpired();
             } else {
                 setTimeout(() => connect(() => {
-                    // Rejoin room after reconnect
                     if (roomCode) {
                         ws.send(JSON.stringify({ type: 'join', roomCode }));
                     }
-                }), 3000);
+                }), delay);
             }
         }).catch(() => setTimeout(() => connect(() => {
             if (roomCode) ws.send(JSON.stringify({ type: 'join', roomCode }));
-        }), 3000));
+        }), delay));
     };
     ws.onerror = e => console.error('WS error', e);
 }
