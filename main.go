@@ -506,6 +506,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: createErr.Error()})
 				continue
 			}
+			// Leave old room before joining new one to prevent client leak
+			if currentRoom != nil {
+				empty := currentRoom.RemoveClient(clientID)
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
+					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
+				}
+			}
 			currentRoom = newRoom
 			currentRoom.OwnerID = userID
 			currentRoom.OwnerName = username
@@ -523,11 +533,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
 				continue
 			}
-			currentRoom = manager.GetRoom(msg.RoomCode)
-			if currentRoom == nil {
+			joinRoom := manager.GetRoom(msg.RoomCode)
+			if joinRoom == nil {
 				safeWrite(WSResponse{Type: "error", Error: "Room not found"})
 				continue
 			}
+			// Leave old room before joining new one to prevent client leak
+			if currentRoom != nil {
+				empty := currentRoom.RemoveClient(clientID)
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
+					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
+				}
+			}
+			currentRoom = joinRoom
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
 			if err := currentRoom.AddClient(client); err != nil {
 				safeWrite(WSResponse{Type: "error", Error: err.Error()})
