@@ -504,7 +504,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if state == room.StatePlaying {
 					elapsed := time.Since(startT).Seconds()
 					currentPos := pos + elapsed
-					scheduledTime := syncpkg.GetServerTime() + 500
+					scheduledTime := syncpkg.GetServerTime() + 800
 					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
 				}
 			}
@@ -521,7 +521,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Play(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 500
+			scheduledTime := syncpkg.GetServerTime() + 800
 
 			// Include trackAudio so listeners who missed trackChange can load
 			currentRoom.Mu.RLock()
@@ -553,7 +553,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Seek(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 500
+			scheduledTime := syncpkg.GetServerTime() + 800
 			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime}, "")
 
 		case "kick":

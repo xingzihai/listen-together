@@ -271,11 +271,23 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
-    driftInterval = setInterval(() => { // every 1s
+    // Aggressive initial sync: check every 200ms for first 5s, then every 1s
+    let driftChecks = 0;
+    const driftCheck = () => {
         if (!window.audioPlayer.isPlaying) return;
         const drift = window.audioPlayer.correctDrift();
         if (drift) console.log('Drift corrected:', drift, 'ms');
-    }, 1000);
+        driftChecks++;
+    };
+    // Fast phase: 200ms interval for first 25 checks (~5s)
+    driftInterval = setInterval(() => {
+        driftCheck();
+        if (driftChecks >= 25 && driftInterval) {
+            clearInterval(driftInterval);
+            // Switch to steady-state 1s interval
+            driftInterval = setInterval(driftCheck, 1000);
+        }
+    }, 200);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }

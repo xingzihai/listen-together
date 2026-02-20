@@ -204,6 +204,16 @@ class AudioPlayer {
         this._softCorrectionTotal = 0;
         this._resyncGen++;
         this._rateStartTime = 0;
+
+        // Wait for ClockSync to have at least 3 samples (max 800ms wait)
+        if (!window.clockSync.synced) {
+            const syncStart = performance.now();
+            while (!window.clockSync.synced && performance.now() - syncStart < 800) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+            if (!window.clockSync.synced) console.warn('[sync] clock not synced, proceeding anyway');
+        }
+
         this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
 
@@ -349,9 +359,9 @@ class AudioPlayer {
             console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
         }
 
-        // Debounce: max 4 corrections per second
+        // Debounce: max 10 corrections per second
         const now = performance.now();
-        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 250) return 0;
+        if (this._lastCorrectionTime && now - this._lastCorrectionTime < 100) return 0;
         this._lastCorrectionTime = now;
 
         const serverNow = window.clockSync.getServerTime();
@@ -413,22 +423,22 @@ class AudioPlayer {
             this._driftOffset += drift;
             // Don't update _softCorrectionTotal — correction affects future scheduling,
             // not current position. getCurrentTime() stays pure measurement.
-            this._resyncBackoff = 1500;
+            this._resyncBackoff = 500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 2-3 seconds
+        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 1-2 seconds
         if (absDrift > 0.05 && absDrift <= 0.3) {
-            // Dynamic rate based on drift magnitude:
-            // 50-100ms: ±2%, 100-200ms: ±3%, 200-300ms: ±5%
+            // Aggressive rate based on drift magnitude:
+            // 50-100ms: ±4%, 100-200ms: ±6%, 200-300ms: ±8%
             let rateOffset;
-            if (absDrift <= 0.1) rateOffset = 0.02;
-            else if (absDrift <= 0.2) rateOffset = 0.03;
-            else rateOffset = 0.05;
+            if (absDrift <= 0.1) rateOffset = 0.04;
+            else if (absDrift <= 0.2) rateOffset = 0.06;
+            else rateOffset = 0.08;
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const neededCatchUp = absDrift;
-            const adjustedDuration = Math.min(3, neededCatchUp / rateOffset);
+            const adjustedDuration = Math.min(2, neededCatchUp / rateOffset);
 
             console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
 
@@ -446,17 +456,17 @@ class AudioPlayer {
             if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
             this._rateCorrectionTimer = null;
 
-            this._resyncBackoff = 1500;
+            this._resyncBackoff = 500;
             return Math.round(drift * 1000);
         }
 
-        // Tier 3: Hard resync (>300ms) — stop and restart with exponential backoff
+        // Tier 3: Hard resync (>300ms) — stop and restart with minimal backoff
         if (absDrift > 0.3) {
-            const backoff = this._resyncBackoff || 1500;
+            const backoff = this._resyncBackoff || 500;
             if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
             console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
             this._lastResync = Date.now();
-            this._resyncBackoff = Math.min(backoff * 2, 10000);
+            this._resyncBackoff = Math.min(backoff * 1.5, 5000);
             if (!this._resyncing) {
                 this._resyncing = true;
                 this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
