@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -98,7 +99,10 @@ func (rl *rateLimiter) cleanOldestEntries() {
 // Only trusts RemoteAddr to prevent X-Forwarded-For spoofing that bypasses rate limiting.
 // If behind a trusted reverse proxy, configure TRUSTED_PROXIES env var (comma-separated CIDRs).
 func GetClientIP(r *http.Request) string {
-	remoteIP := strings.Split(r.RemoteAddr, ":")[0]
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteIP = r.RemoteAddr
+	}
 
 	// If trusted proxies are configured, allow XFF from those sources
 	if trusted := os.Getenv("TRUSTED_PROXIES"); trusted != "" {
