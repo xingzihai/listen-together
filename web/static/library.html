@@ -98,7 +98,8 @@ document.getElementById('shareBtn').onclick=async()=>{
 function uploadFile(file) {
     const list = document.getElementById('uploadList');
     const item = document.createElement('div'); item.className = 'upload-item';
-    const name = file.name.length > 30 ? file.name.slice(0,27)+'...' : file.name;
+    const rawName = file.name.length > 30 ? file.name.slice(0,27)+'...' : file.name;
+    const name = rawName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     item.innerHTML = `<span style="min-width:120px">${name}</span><div class="bar"><div class="bar-fill"></div></div><span class="info">0%</span>`;
     list.appendChild(item);
     const fill = item.querySelector('.bar-fill');

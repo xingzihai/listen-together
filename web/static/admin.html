@@ -65,8 +65,6 @@
         function fmtTime(t) { return new Date(t).toLocaleString('zh-CN'); }
         async function api(url, opts) {
             const res = await fetch(url, opts);
-            const nt = res.headers.get('X-New-Token');
-            if (nt) localStorage.setItem('token', nt);
             return res;
         }
         async function load() {
