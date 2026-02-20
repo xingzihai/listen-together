@@ -3,6 +3,7 @@ let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
 let roomUsers = [], myClientID = null;
 let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
 let trackLoading = false, pendingPlay = null;
+let trackChangeGen = 0;
 let deviceKicked = false;
 
 function escapeHtml(text) {
@@ -458,6 +459,9 @@ async function handleTrackChange(msg, isJoinRestore) {
     const ta = msg.trackAudio;
     if (!ta) return;
 
+    // Increment generation counter to invalidate any in-flight async from previous calls
+    const gen = ++trackChangeGen;
+
     // Stop current playback
     if (window.audioPlayer) window.audioPlayer.stop();
     stopUIUpdate();
@@ -475,8 +479,10 @@ async function handleTrackChange(msg, isJoinRestore) {
 
     try {
         const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`, {credentials:'include'});
+        if (gen !== trackChangeGen) return; // stale — newer track change in progress
         if (!res.ok) throw new Error('segments fetch failed: ' + res.status);
         const data = await res.json();
+        if (gen !== trackChangeGen) return; // stale
         audioInfo = {
             filename: ta.filename,
             duration: data.duration || ta.duration,
@@ -490,6 +496,7 @@ async function handleTrackChange(msg, isJoinRestore) {
         };
         window.audioPlayer._trackSegBase = null;
         await setupAudio();
+        if (gen !== trackChangeGen) return; // stale
         updateQualitySelector();
         trackLoading = false;
 
@@ -507,6 +514,7 @@ async function handleTrackChange(msg, isJoinRestore) {
         //     window.audioPlayer._upgradeQuality(preferredQ);
         // }
     } catch (e) {
+        if (gen !== trackChangeGen) return; // stale, don't touch state
         console.error('handleTrackChange:', e);
         trackLoading = false;
     }
