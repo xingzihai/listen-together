@@ -667,6 +667,50 @@
     }, 3000);
 })();
 
+// === Client Status Report: report playback state to server every 2s ===
+(function() {
+    setInterval(function() {
+        var ap = window.audioPlayer;
+        if (!ap || !ap.isPlaying) return;
+        if (typeof ws === 'undefined' || !ws || ws.readyState !== 1) return;
+        var pos = 0;
+        try { pos = ap.getCurrentTime(); } catch(e) { return; }
+        var idx = typeof currentTrackIndex !== 'undefined' ? currentTrackIndex : 0;
+        ws.send(JSON.stringify({ type: 'statusReport', position: pos, trackIndex: idx }));
+    }, 2000);
+
+    // Intercept WS messages for forceTrack/forceResync
+    var origOnMsg = null;
+    var checkInterval = setInterval(function() {
+        if (typeof ws === 'undefined' || !ws) return;
+        if (origOnMsg) return;
+        origOnMsg = ws.onmessage;
+        ws.onmessage = function(e) {
+            try {
+                var msg = JSON.parse(e.data);
+                if (msg.type === 'forceResync') {
+                    console.warn('[forceResync] server drift correction, pos=' + msg.position);
+                    var ap = window.audioPlayer;
+                    if (ap && ap.isPlaying) {
+                        ap._resyncing = false;
+                        ap._resyncBackoff = 500;
+                        ap.playAtPosition(msg.position, msg.serverTime);
+                    }
+                    return;
+                }
+                if (msg.type === 'forceTrack') {
+                    console.warn('[forceTrack] wrong track, switching to ' + msg.trackIndex);
+                    // Let app.js handle it as a trackChange
+                    msg.type = 'trackChange';
+                    e = new MessageEvent('message', { data: JSON.stringify(msg) });
+                }
+            } catch(ex) {}
+            if (origOnMsg) origOnMsg.call(ws, e);
+        };
+        clearInterval(checkInterval);
+    }, 500);
+})();
+
 // === Volume Fill Bar Sync ===
 (function() {
     var vs = document.getElementById('volumeSlider');

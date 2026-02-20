@@ -688,6 +688,65 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			scheduledTime := nowMs + 800
 			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs, ScheduledAt: scheduledTime}, "")
 
+		case "statusReport":
+			// Client reports its actual playback state for server-side validation
+			if currentRoom == nil {
+				continue
+			}
+			currentRoom.Mu.RLock()
+			serverTrackIdx := currentRoom.CurrentTrack
+			serverState := currentRoom.State
+			serverPos := currentRoom.Position
+			serverStart := currentRoom.StartTime
+			duration := 0.0
+			if currentRoom.TrackAudio != nil {
+				duration = currentRoom.TrackAudio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+
+			// Check track index mismatch
+			if msg.TrackIndex != serverTrackIdx {
+				// Client is on wrong track — force correct
+				log.Printf("[sync] client %s on track %d, server on %d — forcing correction", clientID, msg.TrackIndex, serverTrackIdx)
+				currentRoom.Mu.RLock()
+				ta := currentRoom.TrackAudio
+				currentRoom.Mu.RUnlock()
+				correction := map[string]interface{}{
+					"type":       "forceTrack",
+					"trackIndex": serverTrackIdx,
+					"position":   serverPos,
+					"serverTime": syncpkg.GetServerTime(),
+				}
+				if ta != nil {
+					correction["trackAudio"] = ta
+				}
+				myClient.Send(correction)
+				continue
+			}
+
+			// Check position drift (only when playing)
+			if serverState == room.StatePlaying {
+				elapsed := time.Since(serverStart).Seconds()
+				expectedPos := serverPos + elapsed
+				if duration > 0 && expectedPos > duration {
+					expectedPos = duration
+				}
+				clientPos := msg.Position
+				drift := clientPos - expectedPos
+				if drift < 0 {
+					drift = -drift
+				}
+				// If drift > 400ms, force resync
+				if drift > 0.4 {
+					log.Printf("[sync] client %s drift %.0fms — forcing resync", clientID, drift*1000)
+					myClient.Send(map[string]interface{}{
+						"type":       "forceResync",
+						"position":   expectedPos,
+						"serverTime": syncpkg.GetServerTime(),
+					})
+				}
+			}
+
 		case "kick":
 			if currentRoom == nil {
 				continue
