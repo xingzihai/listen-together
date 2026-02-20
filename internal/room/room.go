@@ -186,6 +186,27 @@ func (m *Manager) SendToUserByUsername(username string, msg interface{}) {
 	}
 }
 
+// IsUserInRoomWithAudio checks if a user is in any room that is currently playing
+// the given audio file (by audio_id). Used for segment access control.
+func (m *Manager) IsUserInRoomWithAudio(userID int64, audioID int64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, rm := range m.rooms {
+		rm.Mu.RLock()
+		ta := rm.TrackAudio
+		if ta != nil && ta.AudioID == audioID {
+			for _, c := range rm.Clients {
+				if c.UID == userID {
+					rm.Mu.RUnlock()
+					return true
+				}
+			}
+		}
+		rm.Mu.RUnlock()
+	}
+	return false
+}
+
 func (m *Manager) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()

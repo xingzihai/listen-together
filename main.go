@@ -86,7 +86,7 @@ func main() {
 	authHandlers.RegisterRoutes(mux)
 
 	// Library handlers
-	libHandlers := &library.LibraryHandlers{DB: database, DataDir: "./data"}
+	libHandlers := &library.LibraryHandlers{DB: database, DataDir: "./data", Manager: manager}
 	libHandlers.RegisterRoutes(mux)
 
 	// Playlist handlers

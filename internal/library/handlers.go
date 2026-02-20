@@ -23,6 +23,7 @@ const maxUploadSize = 50 << 20 // 50MB
 type LibraryHandlers struct {
 	DB      *db.DB
 	DataDir string
+	Manager *room.Manager
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -315,11 +316,16 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 	}
 	quality := parts[2]
 
-	// Any logged-in user can access segments (needed for room playback sync)
-
 	af, err := h.DB.GetAudioFileByID(id)
 	if err != nil {
 		jsonError(w, "not found", 404)
+		return
+	}
+
+	// Access control: owner, shared, or in a room playing this audio
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, id)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, id)) {
+		jsonError(w, "forbidden", 403)
 		return
 	}
 
@@ -391,6 +397,18 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 			http.NotFound(w, r)
 			return
 		}
+	}
+
+	// Access control: look up audio file by UUID, verify permission
+	af, err := h.DB.GetAudioFileByUUID(audioID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
 	}
 
 	filePath := filepath.Join(h.DataDir, "library", userID, audioID, "segments_"+quality, filename)

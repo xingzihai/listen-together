@@ -631,6 +631,16 @@ func (d *DB) GetAudioFileByID(id int64) (*AudioFile, error) {
 	return f, nil
 }
 
+func (d *DB) GetAudioFileByUUID(uuid string) (*AudioFile, error) {
+	f := &AudioFile{}
+	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE filename=?", uuid).
+		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 func (d *DB) DeleteAudioFile(id, ownerID int64) error {
 	// Remove from any playlists first
 	d.conn.Exec("DELETE FROM playlist_items WHERE audio_id=?", id)
