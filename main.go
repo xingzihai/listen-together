@@ -501,11 +501,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			code := generateCode()
-			currentRoom = manager.CreateRoom(code)
+			newRoom, createErr := manager.CreateRoom(code, userID)
+			if createErr != nil {
+				safeWrite(WSResponse{Type: "error", Error: createErr.Error()})
+				continue
+			}
+			currentRoom = newRoom
 			currentRoom.OwnerID = userID
 			currentRoom.OwnerName = username
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
-			currentRoom.AddClient(client)
+			if err := currentRoom.AddClient(client); err != nil {
+				safeWrite(WSResponse{Type: "error", Error: err.Error()})
+				continue
+			}
 			myClient = client
 			safeWrite(WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
 
@@ -521,7 +529,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
-			currentRoom.AddClient(client)
+			if err := currentRoom.AddClient(client); err != nil {
+				safeWrite(WSResponse{Type: "error", Error: err.Error()})
+				currentRoom = nil
+				continue
+			}
 			myClient = client
 			isHost := currentRoom.IsHost(clientID)
 			currentRoom.Mu.RLock()

@@ -1,10 +1,24 @@
 package room
 
 import (
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// Configurable limits
+const (
+	MaxRooms          = 100 // global room count limit
+	MaxRoomsPerUser   = 3   // max rooms a single user can create
+	MaxClientsPerRoom = 50  // max users per room
+)
+
+var (
+	ErrMaxRoomsReached    = errors.New("已达到全局房间上限")
+	ErrUserMaxRooms       = errors.New("您已达到创建房间数量上限")
+	ErrRoomFull           = errors.New("房间已满，无法加入")
 )
 
 type PlayState int
@@ -91,9 +105,27 @@ func NewManager() *Manager {
 	return m
 }
 
-func (m *Manager) CreateRoom(code string) *Room {
+func (m *Manager) CreateRoom(code string, ownerID int64) (*Room, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Global room limit
+	if len(m.rooms) >= MaxRooms {
+		return nil, ErrMaxRoomsReached
+	}
+
+	// Per-user room limit
+	count := 0
+	for _, r := range m.rooms {
+		r.Mu.RLock()
+		if r.OwnerID == ownerID {
+			count++
+		}
+		r.Mu.RUnlock()
+	}
+	if count >= MaxRoomsPerUser {
+		return nil, ErrUserMaxRooms
+	}
 
 	room := &Room{
 		Code:       code,
@@ -102,7 +134,7 @@ func (m *Manager) CreateRoom(code string) *Room {
 		LastActive: time.Now(),
 	}
 	m.rooms[code] = room
-	return room
+	return room, nil
 }
 
 func (m *Manager) GetRoom(code string) *Room {
@@ -251,9 +283,12 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-func (r *Room) AddClient(client *Client) {
+func (r *Room) AddClient(client *Client) error {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
+	if len(r.Clients) >= MaxClientsPerRoom {
+		return ErrRoomFull
+	}
 	r.Clients[client.ID] = client
 	if r.Host == nil {
 		r.Host = client
@@ -268,6 +303,7 @@ func (r *Room) AddClient(client *Client) {
 		client.IsHost = true
 	}
 	r.LastActive = time.Now()
+	return nil
 }
 
 func (r *Room) RemoveClient(clientID string) bool {
