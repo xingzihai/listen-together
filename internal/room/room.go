@@ -398,8 +398,13 @@ func (r *Room) IsHost(clientID string) bool {
 func (r *Room) GetClientList() []ClientInfo {
 	r.Mu.RLock()
 	defer r.Mu.RUnlock()
+	seen := make(map[int64]bool)
 	list := make([]ClientInfo, 0, len(r.Clients))
 	for _, c := range r.Clients {
+		if seen[c.UID] {
+			continue
+		}
+		seen[c.UID] = true
 		list = append(list, ClientInfo{
 			ClientID: c.ID,
 			Username: c.Username,
