@@ -521,7 +521,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Play(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 800
+			nowMs := syncpkg.GetServerTime()
+			scheduledTime := nowMs + 800
 
 			// Include trackAudio so listeners who missed trackChange can load
 			currentRoom.Mu.RLock()
@@ -531,7 +532,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			broadcast(currentRoom, WSResponse{
 				Type: "play", Position: msg.Position,
-				ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime,
+				ServerTime: nowMs, ScheduledAt: scheduledTime,
 				TrackAudio: ta, TrackIndex: ti,
 			}, "")
 

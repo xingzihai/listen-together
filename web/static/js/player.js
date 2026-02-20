@@ -147,6 +147,10 @@ class AudioPlayer {
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
                 this._driftOffset = 0;
+                this._pendingDriftCorrection = 0;
+                // Update sync anchors so correctDrift doesn't see a false jump
+                this.serverPlayTime = window.clockSync.getServerTime();
+                this.serverPlayPosition = resumePos;
                 this._startLookahead(resumePos, this.ctx.currentTime);
             }
         } catch (e) { console.error('_upgradeQuality failed:', e);
