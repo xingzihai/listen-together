@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -364,6 +365,21 @@ func (t *wsConnTracker) release(userID int64) {
 	}
 }
 
+// validatePosition checks that pos is a finite non-negative number and
+// optionally within duration. Returns an error string or "".
+func validatePosition(pos float64, duration float64) string {
+	if math.IsNaN(pos) || math.IsInf(pos, 0) {
+		return "position 值无效"
+	}
+	if pos < 0 {
+		return "position 不能为负数"
+	}
+	if duration > 0 && pos > duration {
+		return "position 超出音频时长"
+	}
+	return ""
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// --- Fix #1: Reject unauthenticated WebSocket connections ---
 	userInfo := auth.ExtractUserFromRequest(r)
@@ -608,6 +624,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.OwnerID != userID {
 				continue
 			}
+			// Validate position
+			currentRoom.Mu.RLock()
+			dur := 0.0
+			if currentRoom.TrackAudio != nil {
+				dur = currentRoom.TrackAudio.Duration
+			} else if currentRoom.Audio != nil {
+				dur = currentRoom.Audio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+			if errMsg := validatePosition(msg.Position, dur); errMsg != "" {
+				safeWrite(WSResponse{Type: "error", Error: errMsg})
+				continue
+			}
 			currentRoom.Play(msg.Position)
 			nowMs := syncpkg.GetServerTime()
 			scheduledTime := nowMs + 800
@@ -639,6 +668,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if currentRoom.OwnerID != userID {
+				continue
+			}
+			// Validate position
+			currentRoom.Mu.RLock()
+			dur := 0.0
+			if currentRoom.TrackAudio != nil {
+				dur = currentRoom.TrackAudio.Duration
+			} else if currentRoom.Audio != nil {
+				dur = currentRoom.Audio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+			if errMsg := validatePosition(msg.Position, dur); errMsg != "" {
+				safeWrite(WSResponse{Type: "error", Error: errMsg})
 				continue
 			}
 			currentRoom.Seek(msg.Position)
