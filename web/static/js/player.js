@@ -430,14 +430,13 @@ class AudioPlayer {
             return Math.round(drift * 1000);
         }
 
-        // Tier 2: playbackRate correction (50-300ms) — gradual catch-up over 1-2 seconds
-        if (absDrift > 0.05 && absDrift <= 0.3) {
-            // Aggressive rate based on drift magnitude:
-            // 50-100ms: ±4%, 100-200ms: ±6%, 200-300ms: ±8%
+        // Tier 2: playbackRate correction (50-200ms) — gradual catch-up over 1-2 seconds
+        // Keep ±2-3% to avoid audible pitch shift (human threshold ~±1-2%)
+        if (absDrift > 0.05 && absDrift <= 0.2) {
+            // 50-100ms: ±2%, 100-200ms: ±3%
             let rateOffset;
-            if (absDrift <= 0.1) rateOffset = 0.04;
-            else if (absDrift <= 0.2) rateOffset = 0.06;
-            else rateOffset = 0.08;
+            if (absDrift <= 0.1) rateOffset = 0.02;
+            else rateOffset = 0.03;
             // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
             const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
             const neededCatchUp = absDrift;
@@ -463,8 +462,8 @@ class AudioPlayer {
             return Math.round(drift * 1000);
         }
 
-        // Tier 3: Hard resync (>300ms) — stop and restart with minimal backoff
-        if (absDrift > 0.3) {
+        // Tier 3: Hard resync (>200ms) — stop and restart with minimal backoff
+        if (absDrift > 0.2) {
             const backoff = this._resyncBackoff || 500;
             if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
             console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
