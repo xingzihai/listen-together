@@ -241,11 +241,14 @@ class AudioPlayer {
             const localScheduled = scheduledAt - window.clockSync.offset;
             const waitMs = localScheduled - dateSnap - (performance.now() - perfSnap);
             if (waitMs > 2 && waitMs < 3000) {
-                // Subtract outputLatency so audio reaches ears at the intended moment
-                const ctxTarget = ctxNow + waitMs / 1000 - latency;
+                // Schedule segment earlier by outputLatency so sound reaches ears on time
+                // But keep startTime as the logical anchor (without latency offset)
+                // so getCurrentTime() position tracking stays correct
+                const ctxTarget = ctxNow + waitMs / 1000;
+                const scheduleTarget = ctxTarget - latency;
                 this.startOffset = this.serverPlayPosition;
-                this.startTime = ctxTarget;
-                this._startLookahead(this.serverPlayPosition, ctxTarget);
+                this.startTime = ctxTarget; // logical anchor, no latency bias
+                this._startLookahead(this.serverPlayPosition, scheduleTarget);
                 console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${(latency*1000).toFixed(1)}ms`);
                 return;
             }
@@ -255,8 +258,8 @@ class AudioPlayer {
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
         this.startOffset = actualPos;
-        // Subtract outputLatency so audio reaches ears sooner to compensate for hardware delay
-        this.startTime = ctxNow - latency;
+        // Schedule earlier by outputLatency, but keep startTime as logical anchor
+        this.startTime = ctxNow; // logical anchor, no latency bias
         this._startLookahead(actualPos, ctxNow - latency);
     }
 
