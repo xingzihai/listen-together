@@ -93,6 +93,7 @@ func main() {
 	plHandlers := &library.PlaylistHandlers{
 		DB:      database,
 		DataDir: "./data",
+		Manager: manager,
 		OnPlaylistUpdate: func(roomCode string) {
 			rm := manager.GetRoom(roomCode)
 			if rm == nil {
@@ -327,6 +328,35 @@ func (rl *rateLimiter) cleanOldestEntries() {
 
 var joinLimiter = newRateLimiter()
 
+// --- Per-user WebSocket connection limiter ---
+type wsConnTracker struct {
+	mu    sync.Mutex
+	conns map[int64]int // userID -> active connection count
+}
+
+var wsTracker = &wsConnTracker{conns: make(map[int64]int)}
+
+const maxWSConnsPerUser = 5
+
+func (t *wsConnTracker) acquire(userID int64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conns[userID] >= maxWSConnsPerUser {
+		return false
+	}
+	t.conns[userID]++
+	return true
+}
+
+func (t *wsConnTracker) release(userID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.conns[userID]--
+	if t.conns[userID] <= 0 {
+		delete(t.conns, userID)
+	}
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// --- Fix #1: Reject unauthenticated WebSocket connections ---
 	userInfo := auth.ExtractUserFromRequest(r)
@@ -337,6 +367,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	username := userInfo.Username
 	userRole := userInfo.Role
 	userID := userInfo.UserID
+
+	// --- Per-user connection limit ---
+	if !wsTracker.acquire(userID) {
+		http.Error(w, "Too many connections", http.StatusTooManyRequests)
+		return
+	}
+	defer wsTracker.release(userID)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {

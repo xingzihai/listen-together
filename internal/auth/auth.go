@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -160,12 +161,20 @@ func validateClaimsAgainstDB(claims *Claims) (string, error) {
 	return role, nil
 }
 
+const maxPasswordBytes = 72 // bcrypt silently truncates beyond this
+
 func HashPassword(password string) (string, error) {
+	if len([]byte(password)) > maxPasswordBytes {
+		return "", fmt.Errorf("password too long (max %d bytes)", maxPasswordBytes)
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	return string(hash), err
 }
 
 func CheckPassword(hash, password string) bool {
+	if len([]byte(password)) > maxPasswordBytes {
+		return false
+	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
@@ -210,7 +219,6 @@ func tryAutoRenew(w http.ResponseWriter, claims *Claims) {
 			return
 		}
 		setTokenCookie(w, newToken)
-		w.Header().Set("X-New-Token", newToken)
 	}
 }
 

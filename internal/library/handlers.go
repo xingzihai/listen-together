@@ -15,6 +15,7 @@ import (
 	"github.com/xingzihai/listen-together/internal/audio"
 	"github.com/xingzihai/listen-together/internal/auth"
 	"github.com/xingzihai/listen-together/internal/db"
+	"github.com/xingzihai/listen-together/internal/room"
 )
 
 const maxUploadSize = 50 << 20 // 50MB
@@ -442,7 +443,23 @@ func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
 type PlaylistHandlers struct {
 	DB      *db.DB
 	DataDir string
+	Manager *room.Manager
 	OnPlaylistUpdate func(roomCode string)
+}
+
+// isRoomOwner checks if the user is the owner of the room with the given code.
+// Returns true if the room exists and the user is its owner.
+func (h *PlaylistHandlers) isRoomOwner(userID int64, code string) bool {
+	if h.Manager == nil {
+		return true // fallback: no manager means no check (shouldn't happen)
+	}
+	rm := h.Manager.GetRoom(code)
+	if rm == nil {
+		return false
+	}
+	rm.Mu.RLock()
+	defer rm.Mu.RUnlock()
+	return rm.OwnerID == userID
 }
 
 func (h *PlaylistHandlers) GetOrCreatePlaylist(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +522,12 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := extractRoomCodeFromAdd(r.URL.Path)
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
 
 	var req struct {
 		AudioID int64 `json:"audio_id"`
@@ -574,6 +597,13 @@ func (h *PlaylistHandlers) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
+
 	itemID, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		jsonError(w, "invalid item id", 400)
@@ -612,6 +642,12 @@ func (h *PlaylistHandlers) UpdateMode(w http.ResponseWriter, r *http.Request) {
 	// Path: /api/room/{code}/playlist/mode
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/room/"), "/")
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
 
 	var req struct {
 		Mode string `json:"mode"`
@@ -656,6 +692,12 @@ func (h *PlaylistHandlers) Reorder(w http.ResponseWriter, r *http.Request) {
 
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/room/"), "/")
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
 
 	var req struct {
 		Items []int64 `json:"items"`

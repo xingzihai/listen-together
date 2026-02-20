@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -92,17 +93,24 @@ func (rl *rateLimiter) cleanOldestEntries() {
 }
 
 // GetClientIP extracts the client IP from the request.
-// Priority: X-Forwarded-For (first IP) > X-Real-IP > RemoteAddr
+// Only trusts RemoteAddr to prevent X-Forwarded-For spoofing that bypasses rate limiting.
+// If behind a trusted reverse proxy, configure TRUSTED_PROXIES env var (comma-separated CIDRs).
 func GetClientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.Split(fwd, ",")
-		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
-		return strings.TrimSpace(parts[0])
+	remoteIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// If trusted proxies are configured, allow XFF from those sources
+	if trusted := os.Getenv("TRUSTED_PROXIES"); trusted != "" {
+		for _, proxy := range strings.Split(trusted, ",") {
+			if strings.TrimSpace(proxy) == remoteIP {
+				if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+					parts := strings.Split(fwd, ",")
+					return strings.TrimSpace(parts[0])
+				}
+			}
+		}
 	}
-	if real := r.Header.Get("X-Real-IP"); real != "" {
-		return real
-	}
-	return strings.Split(r.RemoteAddr, ":")[0]
+
+	return remoteIP
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -138,6 +146,10 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Password) < 6 {
 		jsonError(w, "密码至少6个字符", 400)
+		return
+	}
+	if len([]byte(req.Password)) > 72 {
+		jsonError(w, "密码过长（最多72字节）", 400)
 		return
 	}
 	user, err := h.DB.CreateUser(req.Username, req.Password, "user")
@@ -227,6 +239,10 @@ func (h *AuthHandlers) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.NewPassword) < 6 {
 		jsonError(w, "新密码至少6个字符", 400)
+		return
+	}
+	if len([]byte(req.NewPassword)) > 72 {
+		jsonError(w, "新密码过长（最多72字节）", 400)
 		return
 	}
 	dbUser, err := h.DB.GetUserByID(user.UserID)
