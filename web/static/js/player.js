@@ -228,55 +228,38 @@ class AudioPlayer {
 
         if (!this.isPlaying) return;
 
-        // === Hardware-level anchored playback ===
+        // === Direct serverTime→ctx mapping (single conversion, no perfTime intermediate) ===
         //
         // Server says: "at serverTime, position was P"
-        // We need to figure out: at what ctx.currentTime moment was serverTime?
+        // clockSync.serverTimeToCtx() gives us the EXACT ctx.currentTime that corresponds
+        // to serverTime, using a direct anchor calibrated during ping/pong.
         //
-        // Step 1: Map serverTime to local performance.now() domain
+        // No performance.now()↔ctx.currentTime conversion at playback time.
+        // Both clocks were sampled simultaneously during calibration.
+        
         const cs = window.clockSync;
-        const serverPerfTime = cs.anchorPerfTime + (this.serverPlayTime - cs.anchorServerTime);
+        const ctxAtServerTime = cs.serverTimeToCtx(this.serverPlayTime);
         
-        // Step 2: Capture ctx↔perf relationship at this instant
-        const perfNow = performance.now();
+        // Current position: how far past serverTime are we in ctx time?
         const ctxNow = this.ctx.currentTime;
-        
-        // Step 3: Map serverTime's perfTime to ctx domain
-        // ctxAtServerTime = ctxNow - (perfNow - serverPerfTime) / 1000
-        // This is the ctx.currentTime that corresponded to serverTime (in the past)
-        const ctxAtServerTime = ctxNow - (perfNow - serverPerfTime) / 1000;
-        
-        // Step 4: The song position at any ctx moment is:
-        //   songPos(ctxT) = position + (ctxT - ctxAtServerTime)
-        // So at ctxNow: songPos = position + (ctxNow - ctxAtServerTime)
-        // This equals the elapsed model but anchored to hardware clock
         const currentPos = this.serverPlayPosition + (ctxNow - ctxAtServerTime);
         const actualPos = Math.max(0, currentPos);
         
-        // Step 5: Find the next segment boundary and schedule precisely
-        // The segment at actualPos starts at segStart in song time
+        // Find current segment and offset within it
         const segIdx2 = Math.floor(actualPos / this.segmentTime);
         const segStart = segIdx2 * this.segmentTime;
         const offsetInSeg = actualPos - segStart;
         
-        // The ctx time when this segment's start was "playing" is:
-        // ctxAtSegStart = ctxAtServerTime + (segStart - position)
-        // So the ctx time for actualPos is:
-        // ctxAtActualPos = ctxAtServerTime + (actualPos - position)
-        // Which equals ctxNow (by construction). Good.
-        
-        // For scheduling: we want source.start(ctxTime, offsetInSeg)
-        // where ctxTime is when the segment began (in the past for current segment)
+        // Calculate the precise ctx time when this segment's start "was playing"
         const ctxSegStart = ctxAtServerTime + (segStart - this.serverPlayPosition);
         
         // Set anchors for getCurrentTime() tracking
         // getCurrentTime() = startOffset + (ctx.currentTime - startTime)
-        // At ctxAtServerTime: should return position
-        // So: startOffset = position, startTime = ctxAtServerTime
+        // At ctxAtServerTime: returns position. Correct.
         this.startOffset = this.serverPlayPosition;
         this.startTime = ctxAtServerTime;
         
-        // Start lookahead from the current segment, with precise ctx timing
+        // Start lookahead with precise ctx timing
         this._startLookaheadAnchored(segIdx2, offsetInSeg, ctxSegStart);
     }
     

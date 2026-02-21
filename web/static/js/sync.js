@@ -1,19 +1,28 @@
-// Clock sync — performance.now() anchor model for microsecond-stable server time
+// Clock sync — direct serverTime↔ctxTime anchor for hardware-level playback precision
 //
-// Core idea: calibrate a (anchorServerTime, anchorPerfTime) pair via NTP-like ping-pong.
-// Between calibrations, derive server time as:
-//   serverTime = anchorServerTime + (performance.now() - anchorPerfTime)
+// Architecture: THREE anchors calibrated simultaneously during each ping/pong:
+//   1. anchorServerTime (ms) — server's clock at midpoint
+//   2. anchorPerfTime (ms)   — performance.now() at midpoint  
+//   3. anchorCtxTime (s)     — AudioContext.currentTime at midpoint
 //
-// performance.now() is monotonic, microsecond-precision, immune to NTP jumps and sleep.
-// This eliminates Date.now() instability as a drift source.
+// All three captured at the same instant, eliminating cross-clock-domain conversion errors.
+//
+// APIs:
+//   getServerTime()  → current server time (ms), via perfTime anchor
+//   serverTimeToCtx(serverTimeMs) → ctx.currentTime value, via direct anchor
+//
+// The key insight: performance.now() and ctx.currentTime use DIFFERENT hardware clocks.
+// Converting between them at playback time introduces error that grows with elapsed time.
+// By calibrating both against serverTime simultaneously, we get a direct mapping.
 
 class ClockSync {
     constructor() {
-        // Anchor pair: the foundation of all server time calculations
+        // Triple anchor: all three captured at the same instant
         this.anchorServerTime = 0;  // server time (ms) at anchor moment
         this.anchorPerfTime = 0;    // performance.now() (ms) at anchor moment
+        this.anchorCtxTime = 0;     // AudioContext.currentTime (seconds) at anchor moment
 
-        // Legacy compat (some code reads .offset)
+        // Legacy compat
         this.offset = 0;
         this.rtt = Infinity;
         this.synced = false;
@@ -29,9 +38,10 @@ class ClockSync {
         this._initialCount = 0;
         this._initialTarget = 10;
 
-        // Pending ping state — use performance.now() exclusively
+        // Pending ping state
         this._pending = null;       // performance.now() when ping sent
-        this._pendingWall = 0;      // Date.now() when ping sent (for server protocol compat)
+        this._pendingCtx = 0;       // ctx.currentTime when ping sent
+        this._pendingWall = 0;      // Date.now() when ping sent (protocol compat)
     }
 
     start(ws) {
@@ -42,7 +52,6 @@ class ClockSync {
         this._initialCount = 0;
         this._pending = null;
 
-        // Initial burst: 10 rapid pings at 200ms for fast convergence
         for (let i = 0; i < this._initialTarget; i++) {
             setTimeout(() => this.ping(), i * 200);
         }
@@ -53,11 +62,11 @@ class ClockSync {
         if (this._timer) clearTimeout(this._timer);
         let interval;
         if (this._initialCount < this._initialTarget) {
-            interval = 200;     // fast phase: 200ms
+            interval = 200;
         } else if (!this.synced) {
-            interval = 300;     // not yet synced: 300ms
+            interval = 300;
         } else {
-            interval = 10000;   // steady state: 10s (anchor is stable between calibrations)
+            interval = 10000;
         }
         this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
     }
@@ -66,7 +75,6 @@ class ClockSync {
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     }
 
-    // Burst mode: 8 rapid pings for quick re-calibration (visibility restore, network change)
     burst() {
         for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 100);
     }
@@ -74,13 +82,15 @@ class ClockSync {
     ping() {
         if (!this.ws || this.ws.readyState !== 1) return;
 
-        // Clear stale pending ping (pong lost/timeout > 2s)
         if (this._pending && performance.now() - this._pending > 2000) {
             this._pending = null;
         }
         if (this._pending) return;
 
-        // Record both clocks at the same instant
+        // Capture ALL clocks at the same instant
+        // Order matters: ctx first (least volatile), then perf, then wall
+        const ctx = window.audioPlayer && window.audioPlayer.ctx;
+        this._pendingCtx = ctx ? ctx.currentTime : 0;
         this._pending = performance.now();
         this._pendingWall = Date.now();
         this.ws.send(JSON.stringify({ type: 'ping', clientTime: this._pendingWall }));
@@ -89,12 +99,16 @@ class ClockSync {
     handlePong(msg) {
         if (!this._pending) return;
 
+        // Capture clocks at pong receipt — same order as ping
+        const ctx = window.audioPlayer && window.audioPlayer.ctx;
+        const ctxNow = ctx ? ctx.currentTime : 0;
         const perfNow = performance.now();
         const rtt = perfNow - this._pending;
         const perfAtSend = this._pending;
+        const ctxAtSend = this._pendingCtx;
         this._pending = null;
 
-        // Network change detection — reset samples on network switch
+        // Network change detection
         if (navigator.connection) {
             const net = (navigator.connection.type || '') + '/' + (navigator.connection.effectiveType || '');
             if (this._lastNetType && net !== this._lastNetType) {
@@ -107,30 +121,33 @@ class ClockSync {
             this._lastNetType = net;
         }
 
-        // Reject outliers: RTT > 1s or > 2.5x best known RTT
+        // Reject outliers
         if (rtt > 1000) return;
         if (this.rtt < Infinity && rtt > this.rtt * 2.5) return;
 
-        // Calculate server time at the midpoint of the ping-pong exchange
-        // midpoint in performance.now() domain = perfAtSend + rtt/2
+        // Midpoint calculation
         const perfMidpoint = perfAtSend + rtt / 2;
-        const serverTimeAtMidpoint = msg.serverTime; // server stamped its time at ~midpoint
+        const serverTimeAtMidpoint = msg.serverTime;
+
+        // ctx midpoint: interpolate between send and receive ctx times
+        // ctx.currentTime advances linearly, so linear interpolation is exact
+        const ctxMidpoint = ctxAtSend + (ctxNow - ctxAtSend) / 2;
 
         this.samples.push({
             serverTime: serverTimeAtMidpoint,
             perfTime: perfMidpoint,
+            ctxTime: ctxMidpoint,
             rtt: rtt,
             ts: perfNow
         });
         if (this.samples.length > this.maxSamples) this.samples.shift();
         this._initialCount++;
 
-        // Transition from initial to steady-state
         if (this._initialCount === this._initialTarget) {
             this._scheduleNext();
         }
 
-        // Expire old samples: 15s when unsynced, 60s when stable
+        // Expire old samples
         const expiry = this.synced ? 60000 : 15000;
         const cutoff = perfNow - expiry;
         this.samples = this.samples.filter(s => s.ts > cutoff);
@@ -141,55 +158,54 @@ class ClockSync {
             return;
         }
 
-        // === Anchor calibration via weighted-median filtering ===
-        // 1. Sort by RTT (lower RTT = more symmetric = more accurate)
+        // === Triple anchor calibration via weighted-median filtering ===
         const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
-
-        // 2. Keep best 70% (drop high-RTT outliers)
         const keepN = Math.max(3, Math.ceil(byRtt.length * 0.7));
         const kept = byRtt.slice(0, keepN);
 
-        // 3. Weighted average: weight = 1/RTT (lower RTT = higher weight)
-        //    Calculate the offset = serverTime - perfTime for each sample
-        //    Then derive anchor from weighted average offset
-        let weightSum = 0, offsetSum = 0;
+        // Weighted average of offsets: serverTime-perfTime and serverTime-ctxTime
+        let weightSum = 0, perfOffsetSum = 0, ctxOffsetSum = 0;
         for (let i = 0; i < kept.length; i++) {
             const w = 1 / Math.max(kept[i].rtt, 1);
-            const sampleOffset = kept[i].serverTime - kept[i].perfTime;
             weightSum += w;
-            offsetSum += sampleOffset * w;
+            perfOffsetSum += (kept[i].serverTime - kept[i].perfTime) * w;
+            // ctxTime is in seconds, serverTime in ms — store offset in ms for consistency
+            ctxOffsetSum += (kept[i].serverTime - kept[i].ctxTime * 1000) * w;
         }
-        const bestOffset = offsetSum / weightSum; // serverTime = perfTime + bestOffset
+        const bestPerfOffset = perfOffsetSum / weightSum;
+        const bestCtxOffset = ctxOffsetSum / weightSum;
 
-        // 4. Set anchor: pick the best (lowest RTT) sample's perfTime as anchor point
-        //    Then calculate anchorServerTime from the weighted offset
-        const bestSample = kept[0]; // lowest RTT
-        const newAnchorPerf = bestSample.perfTime;
-        const newAnchorServer = newAnchorPerf + bestOffset;
+        // Anchor point: use best (lowest RTT) sample's times
+        const best = kept[0];
+        const newAnchorPerf = best.perfTime;
+        const newAnchorServer = newAnchorPerf + bestPerfOffset;
+        const newAnchorCtx = (newAnchorServer - bestCtxOffset) / 1000; // convert back to seconds
 
-        // 5. Smooth update: small changes (<5ms) blend via EMA, large jumps apply immediately
+        // Smooth update
         if (this.synced && this.anchorPerfTime > 0) {
             const currentEstimate = this.anchorServerTime + (newAnchorPerf - this.anchorPerfTime);
             const delta = Math.abs(newAnchorServer - currentEstimate);
             if (delta < 5) {
-                // Small drift: blend 70/30 to avoid jitter
                 const blendedServer = 0.7 * currentEstimate + 0.3 * newAnchorServer;
+                // Maintain consistent ctx anchor: apply same blend ratio
+                const currentCtxEstimate = this.anchorCtxTime + (newAnchorPerf - this.anchorPerfTime) / 1000;
+                const blendedCtx = 0.7 * currentCtxEstimate + 0.3 * newAnchorCtx;
                 this.anchorServerTime = blendedServer;
                 this.anchorPerfTime = newAnchorPerf;
+                this.anchorCtxTime = blendedCtx;
             } else {
-                // Large jump: apply immediately
                 this.anchorServerTime = newAnchorServer;
                 this.anchorPerfTime = newAnchorPerf;
+                this.anchorCtxTime = newAnchorCtx;
             }
         } else {
-            // First calibration
             this.anchorServerTime = newAnchorServer;
             this.anchorPerfTime = newAnchorPerf;
+            this.anchorCtxTime = newAnchorCtx;
         }
 
-        // Update legacy fields
-        this.rtt = bestSample.rtt;
-        this.offset = this.anchorServerTime - this.anchorPerfTime; // compat: offset ≈ serverTime - perfTime
+        this.rtt = best.rtt;
+        this.offset = this.anchorServerTime - this.anchorPerfTime;
         this.synced = true;
         this.updateUI();
     }
@@ -197,19 +213,32 @@ class ClockSync {
     updateUI() {
         const el = document.getElementById('syncStatus');
         if (!el) return;
-        const off = this.getServerTime() - Date.now(); // display offset relative to wall clock
+        const off = this.getServerTime() - Date.now();
         const sign = off >= 0 ? '+' : '';
         el.textContent = `RTT: ${Math.round(this.rtt)}ms | Offset: ${sign}${off.toFixed(1)}ms | Samples: ${this.samples.length}`;
     }
 
-    // Core API: get current server time using performance.now() anchor
-    // Monotonic, microsecond-stable, immune to NTP/sleep jumps
+    // Get current server time via performance.now() anchor (for non-audio use)
     getServerTime() {
         if (!this.synced || this.anchorPerfTime === 0) {
-            // Fallback before first calibration: use Date.now() + offset
             return Date.now() + this.offset;
         }
         return this.anchorServerTime + (performance.now() - this.anchorPerfTime);
+    }
+
+    // Direct serverTime→ctx.currentTime mapping (for audio scheduling)
+    // ONE conversion, no intermediate clock domain
+    serverTimeToCtx(serverTimeMs) {
+        if (!this.synced || this.anchorCtxTime === 0) {
+            // Fallback: use perf-based conversion (less precise)
+            const perfTarget = this.anchorPerfTime + (serverTimeMs - this.anchorServerTime);
+            const perfNow = performance.now();
+            const ctx = window.audioPlayer && window.audioPlayer.ctx;
+            const ctxNow = ctx ? ctx.currentTime : 0;
+            return ctxNow - (perfNow - perfTarget) / 1000;
+        }
+        // Direct mapping: no perfTime intermediate
+        return this.anchorCtxTime + (serverTimeMs - this.anchorServerTime) / 1000;
     }
 }
 
