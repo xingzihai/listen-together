@@ -228,52 +228,20 @@ class AudioPlayer {
 
         if (!this.isPlaying) return;
 
-        // === Direct serverTime→ctx mapping (single conversion, no perfTime intermediate) ===
-        //
+        // === Direct elapsed model with clockSync ===
         // Server says: "at serverTime, position was P"
-        // clockSync.serverTimeToCtx() gives us the EXACT ctx.currentTime that corresponds
-        // to serverTime, using a direct anchor calibrated during ping/pong.
-        //
-        // No performance.now()↔ctx.currentTime conversion at playback time.
-        // Both clocks were sampled simultaneously during calibration.
-        
-        const cs = window.clockSync;
-        const ctxAtServerTime = cs.serverTimeToCtx(this.serverPlayTime);
-        
-        // Current position: how far past serverTime are we in ctx time?
+        // Calculate where we should be RIGHT NOW using clockSync
+        const now = window.clockSync.getServerTime();
+        const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
+        const actualPos = this.serverPlayPosition + elapsed;
+
+        // Snap ctx time and start playback immediately
         const ctxNow = this.ctx.currentTime;
-        const currentPos = this.serverPlayPosition + (ctxNow - ctxAtServerTime);
-        const actualPos = Math.max(0, currentPos);
-        
-        // Find current segment and offset within it
-        const segIdx2 = Math.floor(actualPos / this.segmentTime);
-        const segStart = segIdx2 * this.segmentTime;
-        const offsetInSeg = actualPos - segStart;
-        
-        // Calculate the precise ctx time when this segment's start "was playing"
-        const ctxSegStart = ctxAtServerTime + (segStart - this.serverPlayPosition);
-        
-        // Set anchors for getCurrentTime() tracking
-        // getCurrentTime() = startOffset + (ctx.currentTime - startTime)
-        // At ctxAtServerTime: returns position. Correct.
-        this.startOffset = this.serverPlayPosition;
-        this.startTime = ctxAtServerTime;
-        
-        // Start lookahead with precise ctx timing
-        this._startLookaheadAnchored(segIdx2, offsetInSeg, ctxSegStart);
+        this.startOffset = actualPos;
+        this.startTime = ctxNow;
+        this._startLookahead(actualPos, ctxNow);
     }
     
-    // Hardware-anchored lookahead: schedule segments with precise ctx timing
-    _startLookaheadAnchored(startSegIdx, firstSegOffset, ctxSegStart) {
-        this._stopLookahead();
-        this._nextSegIdx = startSegIdx;
-        this._nextSegTime = ctxSegStart;
-        this._firstSegOffset = firstSegOffset;
-        this._isFirstSeg = true;
-        this._scheduleAhead();
-        this._lookaheadTimer = setInterval(() => this._scheduleAhead(), 200);
-    }
-
     // === Lookahead Scheduler ===
     // Instead of scheduling all segments at once, schedule 2-3 ahead
     // and use setInterval to keep feeding the queue.
