@@ -141,7 +141,6 @@
                     <i class="fas fa-music text-7xl text-emerald-300 opacity-40"></i>
                 </div>
                 <img id="coverImage" class="w-full h-full object-cover absolute inset-0" alt="cover" style="display:none">
-                <div id="syncDebugOverlay" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999;font-size:28px;font-weight:bold;color:#000;font-family:monospace;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 6px #fff;pointer-events:none;white-space:nowrap"></div>
                 <div id="vinylCenter" class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 transition-opacity duration-700 z-10">
                     <div class="rounded-full bg-white/90 shadow-inner border-2 border-black/5" style="width:15%;height:15%"></div>
                 </div>
@@ -200,7 +199,6 @@
         <div class="mp-cover-wrap">
             <div id="mpCover" class="mp-cover">
                 <div class="mp-cover-placeholder"><i class="fas fa-music"></i></div>
-                <div id="syncDebugOverlayMobile" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999;font-size:24px;font-weight:bold;color:#000;font-family:monospace;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 6px #fff;pointer-events:none;white-space:nowrap"></div>
             </div>
         </div>
         <!-- Lyrics area -->
@@ -239,6 +237,7 @@
         <div id="syncStatus" class="text-xs text-emerald-600"></div>
         <div id="driftStatus" class="text-xs text-gray-400"></div>
         <div id="syncDebug" class="text-[10px] text-gray-400 font-mono whitespace-pre mt-0.5"></div>
+        <div id="serverTimeDisplay" class="text-xs text-blue-500 font-mono mt-0.5"></div>
     </div>
     <!-- Row 1: Progress Bar -->
     <div class="w-full flex items-center gap-2 text-xs text-gray-500 font-mono">
@@ -802,25 +801,18 @@
 
 // === Sync Debug Overlay ===
 (function() {
-    var el = document.getElementById('syncDebugOverlay');
-    var elM = document.getElementById('syncDebugOverlayMobile');
+    var el = document.getElementById('serverTimeDisplay');
+    if (!el) return;
     function update() {
         var cs = window.clockSync;
-        if (!cs || !cs.synced) {
-            var txt = '--:--:--.---';
-            if (el) el.textContent = txt;
-            if (elM) elM.textContent = txt;
-            requestAnimationFrame(update); return;
-        }
+        if (!cs || !cs.synced) { el.textContent = 'SvrTime: --:--:--.---'; requestAnimationFrame(update); return; }
         var t = cs.getServerTime();
         var d = new Date(t);
         var h = String(d.getUTCHours()).padStart(2,'0');
         var m = String(d.getUTCMinutes()).padStart(2,'0');
         var s = String(d.getUTCSeconds()).padStart(2,'0');
         var ms = String(d.getUTCMilliseconds()).padStart(3,'0');
-        var txt = h + ':' + m + ':' + s + '.' + ms;
-        if (el) el.textContent = txt;
-        if (elM) elM.textContent = txt;
+        el.textContent = 'SvrTime: ' + h + ':' + m + ':' + s + '.' + ms + ' UTC';
         requestAnimationFrame(update);
     }
     requestAnimationFrame(update);
