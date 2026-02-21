@@ -325,8 +325,6 @@ async function handleMessage(msg) {
                 if (ap._postResetVerify) ap._postResetVerify = false; // reset succeeded
             }
 
-            // D1: Save drift for segment boundary micro-adjustment
-            ap._lastDrift = drift;
             break;
         }
         case 'forceResync': {

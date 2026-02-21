@@ -786,16 +786,7 @@
         ws.onmessage = function(e) {
             try {
                 var msg = JSON.parse(e.data);
-                if (msg.type === 'forceResync') {
-                    console.warn('[forceResync] server drift correction, pos=' + msg.position);
-                    var ap = window.audioPlayer;
-                    if (ap && ap.isPlaying) {
-                        ap._driftCount = 0;
-                        ap._lastResetTime = performance.now();
-                        ap.playAtPosition(msg.position, msg.serverTime);
-                    }
-                    return;
-                }
+                // Only intercept forceTrack; forceResync/syncTick pass through to app.js
                 if (msg.type === 'forceTrack') {
                     console.warn('[forceTrack] wrong track, switching to ' + msg.trackIndex);
                     msg.type = 'trackChange';

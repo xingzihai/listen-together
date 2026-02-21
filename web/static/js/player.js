@@ -23,7 +23,7 @@ class AudioPlayer {
         this._DRIFT_THRESHOLD = 0.15;   // 150ms
         this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
         this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
-        this._lastDrift = 0;            // latest drift from syncTick (seconds, positive=ahead)
+        // _lastDrift removed: no segment-level micro-adjustment, rely on syncTick hard reset only
     }
 
     init() {
@@ -318,15 +318,7 @@ class AudioPlayer {
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            // D1: Segment boundary micro-adjustment for small persistent drift
-            // Only apply to non-first segments; correct 50% of drift per segment to avoid overshoot
-            let schedTime = t;
-            if (!this._isFirstSeg && i > 0) {
-                const ld = this._lastDrift;
-                if (Math.abs(ld) > 0.03 && Math.abs(ld) < this._DRIFT_THRESHOLD) {
-                    schedTime = t - ld * 0.5; // ahead→delay, behind→advance
-                }
-            }
+            const schedTime = t;
             // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
