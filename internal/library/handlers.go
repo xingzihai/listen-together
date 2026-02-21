@@ -541,8 +541,8 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Playback lock: non-owner in room can only fetch segments for the current track
-	if !canAccess && inRoom {
+	// Playback lock: anyone in a room can only fetch segments for the current track
+	if inRoom && h.Manager != nil {
 		if !h.Manager.IsCurrentTrackInRoom(user.UserID, af.ID) {
 			w.Header().Set("Content-Type", "text/plain")
 			http.Error(w, "Track changed", http.StatusConflict)

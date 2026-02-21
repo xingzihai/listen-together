@@ -556,7 +556,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		case "join":
 			// Fix #3: Rate limit join attempts (5 per minute per IP)
-			if !joinLimiter.allow(auth.GetClientIP(r), 5, time.Minute) {
+			if !joinLimiter.allow(auth.GetClientIP(r), 30, time.Minute) {
 				safeWrite(WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
 				continue
 			}
