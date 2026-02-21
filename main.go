@@ -673,7 +673,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			currentRoom.Play(msg.Position)
 			nowMs := syncpkg.GetServerTime()
-			scheduledTime := nowMs + 400
 
 			// Include trackAudio so listeners who missed trackChange can load
 			currentRoom.Mu.RLock()
@@ -683,7 +682,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			broadcast(currentRoom, WSResponse{
 				Type: "play", Position: msg.Position,
-				ServerTime: nowMs, ScheduledAt: scheduledTime,
+				ServerTime: nowMs,
 				TrackAudio: ta, TrackIndex: ti,
 			}, "")
 
@@ -735,8 +734,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			currentRoom.Seek(msg.Position)
 			nowMs := syncpkg.GetServerTime()
-			scheduledTime := nowMs + 400
-			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs, ScheduledAt: scheduledTime}, "")
+			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs}, "")
 
 		case "statusReport":
 			// Client reports its actual playback state for server-side validation
@@ -812,16 +810,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					lastForceResyncSent = now
 					log.Printf("[sync] client drift %.0fms — forcing resync", drift*1000)
 					nowResync := syncpkg.GetServerTime()
-					// Position must be what it WILL BE at scheduledAt
-					scheduledPos := expectedPos + 0.4
-					if duration > 0 && scheduledPos > duration {
-						scheduledPos = duration
-					}
 					myClient.Send(map[string]interface{}{
 						"type":        "forceResync",
-						"position":    scheduledPos,
+						"position":    expectedPos,
 						"serverTime":  nowResync,
-						"scheduledAt": nowResync + 400,
 					})
 				}
 			}
@@ -850,18 +842,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			currentRoom.Mu.Unlock()
 
 			nowMs := syncpkg.GetServerTime()
-			scheduledAt := nowMs + 400 // 400ms lead time for hardware scheduling
-			// Position must be what it WILL BE at scheduledAt, not what it is now
-			// Otherwise clients start 400ms behind
-			scheduledPos := currentPos + 0.4
-			if dur > 0 && scheduledPos > dur {
-				scheduledPos = dur
-			}
 			resyncMsg := map[string]interface{}{
-				"type":        "forceResync",
-				"position":    scheduledPos,
-				"serverTime":  nowMs,
-				"scheduledAt": scheduledAt,
+				"type":       "forceResync",
+				"position":   currentPos,
+				"serverTime": nowMs,
 			}
 			// Pre-serialize once, broadcast to all clients
 			jsonBytes, err := json.Marshal(resyncMsg)
@@ -871,7 +855,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					c.Send(raw)
 				}
 			}
-			log.Printf("[sync] server-coordinated resync: pos=%.2f, scheduledAt=%d", currentPos, int64(scheduledAt))
+			log.Printf("[sync] server-coordinated resync: pos=%.2f", currentPos)
 
 		case "kick":
 			if currentRoom == nil {

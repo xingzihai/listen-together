@@ -198,11 +198,10 @@ class AudioPlayer {
     }
 
     // === Core: playAtPosition ===
-    async playAtPosition(position, serverTime, scheduledAt) {
+    async playAtPosition(position, serverTime) {
         this.init();
 
-        // C2: Preload target segments BEFORE stopping current playback
-        // preloadSegments only fills this.buffers Map, doesn't affect playing sources
+        // Preload target segments BEFORE stopping current playback
         const prePosition = position || 0;
         const segIdx = Math.floor(prePosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -211,69 +210,36 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
 
-        // Now stop old playback (segments already cached)
+        // Stop old playback (segments already cached)
         this.stop();
         this.isPlaying = true;
         this._driftCount = 0;
 
-        // Wait for ClockSync to have at least 3 samples (max 800ms wait)
+        // Wait for ClockSync (max 800ms)
         if (!window.clockSync.synced) {
             const syncStart = performance.now();
             while (!window.clockSync.synced && performance.now() - syncStart < 800) {
                 await new Promise(r => setTimeout(r, 50));
             }
-            if (!window.clockSync.synced) console.warn('[sync] clock not synced, proceeding anyway');
         }
 
-        this.serverPlayTime = scheduledAt || serverTime || window.clockSync.getServerTime();
+        this.serverPlayTime = serverTime || window.clockSync.getServerTime();
         this.serverPlayPosition = position || 0;
 
-        // Capture ctx↔wall clock relationship ONCE before any async work
-        // Use both performance.now() and Date.now() at the same instant to avoid clock domain mixing
-        const ctxSnap = this.ctx.currentTime;
-        const perfSnap = performance.now();
-        const dateSnap = Date.now();
-        const latency = this._outputLatency || 0; // hardware output latency in seconds
-
-        // Segments already preloaded above (before stop), no need to preload again
         if (!this.isPlaying) return;
 
-        // Convert elapsed perf time to ctx time (single clock domain, no Date.now mixing)
-        const ctxNow = ctxSnap + (performance.now() - perfSnap) / 1000;
-
-        // Try hardware-level scheduling if scheduledAt is still in the future
-        if (scheduledAt) {
-            // Convert scheduledAt (server time ms) to local performance.now() domain
-            // Using anchor model: perfTime = anchorPerfTime + (serverTime - anchorServerTime)
-            // Then waitMs = targetPerfTime - currentPerfTime
-            const cs = window.clockSync;
-            const targetPerf = cs.synced && cs.anchorPerfTime > 0
-                ? cs.anchorPerfTime + (scheduledAt - cs.anchorServerTime)
-                : perfSnap + (scheduledAt - (dateSnap + cs.offset)); // fallback before calibration
-            const waitMs = targetPerf - performance.now();
-            if (waitMs > 2 && waitMs < 3000) {
-                // Schedule segment earlier by outputLatency so sound reaches ears on time
-                // But keep startTime as the logical anchor (without latency offset)
-                // so getCurrentTime() position tracking stays correct
-                const ctxTarget = ctxNow + waitMs / 1000;
-                const scheduleTarget = ctxTarget - latency;
-                this.startOffset = this.serverPlayPosition;
-                this.startTime = ctxTarget; // logical anchor, no latency bias
-                this._startLookahead(this.serverPlayPosition, scheduleTarget);
-                console.log(`[sync] scheduled play: wait=${waitMs.toFixed(0)}ms, outputLatency=${(latency*1000).toFixed(1)}ms`);
-                return;
-            }
-        }
-        // Fallback: calculate how much time has passed since scheduledAt/serverTime
+        // Simple elapsed model: calculate where we should be RIGHT NOW
+        // serverTime is when the server recorded the position
+        // clockSync.getServerTime() is our best estimate of current server time (~20ms accuracy)
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
+
+        // Snap ctx time and start playback immediately
+        const ctxNow = this.ctx.currentTime;
         this.startOffset = actualPos;
-        // Schedule earlier by outputLatency, but keep startTime as logical anchor
-        this.startTime = ctxNow; // logical anchor, no latency bias
-        // Ensure schedule target is not in the past
-        const schedFallback = Math.max(ctxNow - latency, this.ctx.currentTime);
-        this._startLookahead(actualPos, schedFallback);
+        this.startTime = ctxNow;
+        this._startLookahead(actualPos, ctxNow);
     }
 
     // === Lookahead Scheduler ===

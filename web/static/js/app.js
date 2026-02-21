@@ -211,9 +211,9 @@ async function handleMessage(msg) {
             // If play carries trackAudio and we don't have audio loaded, load it first
             if (msg.trackAudio && !audioInfo) {
                 await handleTrackChange(msg, true); // join restore, don't re-broadcast play
-                if (!pendingPlay) await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+                if (!pendingPlay) await doPlay(msg.position, msg.serverTime);
             } else {
-                await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+                await doPlay(msg.position, msg.serverTime);
             }
             break;
         case 'pause':
@@ -222,7 +222,7 @@ async function handleMessage(msg) {
         case 'seek':
             window.audioPlayer._driftCount = 0;
             if (window.audioPlayer.isPlaying) {
-                await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
+                await doPlay(msg.position, msg.serverTime);
             } else {
                 pausedPosition = msg.position;
                 window.audioPlayer.lastPosition = msg.position;
@@ -277,6 +277,7 @@ async function handleMessage(msg) {
             const serverPos = msg.position + networkDelay;
 
             const drift = actualPos - serverPos;
+            ap._lastMeasuredDrift = drift;
             const absDrift = Math.abs(drift);
 
             // Debug panel update
@@ -335,7 +336,7 @@ async function handleMessage(msg) {
                 ap._lastResetTime = performance.now();
                 ap._postResetVerify = true;
                 ap._postResetTime = performance.now();
-                ap.playAtPosition(msg.position, msg.serverTime, msg.scheduledAt);
+                ap.playAtPosition(msg.position, msg.serverTime);
             }
             break;
         }
@@ -390,10 +391,9 @@ async function setupAudio() {
     $('syncStatus').textContent = 'Ready';
 }
 
-async function doPlay(position, serverTime, scheduledAt) {
+async function doPlay(position, serverTime) {
     if (trackLoading) {
-        // Track still loading from nextTrack — queue this play for when it's ready
-        pendingPlay = { position, serverTime, scheduledAt };
+        pendingPlay = { position, serverTime };
         return;
     }
     if (!audioInfo) return;
@@ -401,7 +401,7 @@ async function doPlay(position, serverTime, scheduledAt) {
     updatePlayButton(true);
     startUIUpdate();
     window.audioPlayer.init();
-    await window.audioPlayer.playAtPosition(position || 0, serverTime, scheduledAt);
+    await window.audioPlayer.playAtPosition(position || 0, serverTime);
 }
 
 function doPause() {
@@ -651,7 +651,7 @@ async function handleTrackChange(msg, isJoinRestore) {
         // If there's a pending play (non-host received play before track loaded), execute it
         if (pendingPlay) {
             const pp = pendingPlay; pendingPlay = null;
-            await doPlay(pp.position, pp.serverTime, pp.scheduledAt);
+            await doPlay(pp.position, pp.serverTime);
         } else if (isHost && ws && !isJoinRestore) {
             // Host: track loaded, send play to server (only for active track change, not join restore)
             ws.send(JSON.stringify({ type: 'play', position: 0 }));
