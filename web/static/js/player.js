@@ -449,6 +449,10 @@ class AudioPlayer {
             }
             // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
             // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
+            // Skip if there's already a pending correction in the same direction (avoid repeat-counting)
+            if (Math.abs(this._pendingDriftCorrection) > 0.003 && Math.sign(this._pendingDriftCorrection) === Math.sign(drift)) {
+                return Math.round(drift * 1000);
+            }
             this._nextSegTime += drift;
             // Don't update _driftOffset here — the actual audio hasn't changed yet.
             // _driftOffset is updated in _scheduleAhead when the corrected segment is actually scheduled.
@@ -538,9 +542,9 @@ class AudioPlayer {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
-        // Reflect accumulated + pending Tier 1 soft corrections in reported position
-        // Include _pendingDriftCorrection so drift measurement doesn't repeat-count
-        pos -= (this._driftOffset + (this._pendingDriftCorrection || 0));
+        // Only reflect consumed drift corrections, not pending ones
+        // _pendingDriftCorrection hasn't taken effect in audio scheduling yet
+        pos -= this._driftOffset;
         // Compensate for playbackRate during Tier 2 correction
         if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
             const rateElapsed = this.ctx.currentTime - this._rateStartTime;

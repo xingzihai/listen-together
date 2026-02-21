@@ -646,10 +646,17 @@
     setInterval(function() {
         var ap = window.audioPlayer;
         if (!ap || !ap.isPlaying) return;
-        // Reset stuck _resyncing flag
+        // Reset stuck _resyncing flag (only after >5s to avoid interrupting normal resync)
         if (ap._resyncing) {
-            ap._resyncing = false;
-            console.log('[watchdog] reset stuck _resyncing');
+            if (!ap._resyncingSince) {
+                ap._resyncingSince = Date.now();
+            } else if (Date.now() - ap._resyncingSince > 5000) {
+                ap._resyncing = false;
+                ap._resyncingSince = 0;
+                console.log('[watchdog] reset stuck _resyncing (>5s)');
+            }
+        } else {
+            ap._resyncingSince = 0;
         }
         // Reset stuck playbackRate correction
         if (ap._rateCorrectingUntil && ap.ctx && ap.ctx.currentTime > ap._rateCorrectingUntil + 2) {
@@ -659,9 +666,9 @@
             ap.sources.forEach(function(s) { if (s.playbackRate) s.playbackRate.value = 1.0; });
             console.log('[watchdog] reset stuck playbackRate');
         }
-        // Reset excessive backoff
-        if (ap._resyncBackoff > 2000) {
-            ap._resyncBackoff = 500;
+        // Reset excessive backoff (raised threshold from 2000 to 5000)
+        if (ap._resyncBackoff > 5000) {
+            ap._resyncBackoff = 2000;
             console.log('[watchdog] reset excessive backoff');
         }
     }, 3000);
@@ -680,11 +687,13 @@
     }, 2000);
 
     // Intercept WS messages for forceTrack/forceResync
-    var origOnMsg = null;
-    var checkInterval = setInterval(function() {
-        if (typeof ws === 'undefined' || !ws) return;
-        if (origOnMsg) return;
-        origOnMsg = ws.onmessage;
+    // Persistent check: re-patch whenever ws object changes (e.g. after reconnect)
+    var lastWs = null;
+    setInterval(function() {
+        if (typeof ws === 'undefined' || !ws || ws.readyState !== 1) return;
+        if (ws === lastWs) return;  // same ws object, no need to re-patch
+        lastWs = ws;
+        var origOnMsg = ws.onmessage;  // capture current ws's handler
         ws.onmessage = function(e) {
             try {
                 var msg = JSON.parse(e.data);
@@ -700,14 +709,12 @@
                 }
                 if (msg.type === 'forceTrack') {
                     console.warn('[forceTrack] wrong track, switching to ' + msg.trackIndex);
-                    // Let app.js handle it as a trackChange
                     msg.type = 'trackChange';
                     e = new MessageEvent('message', { data: JSON.stringify(msg) });
                 }
             } catch(ex) {}
             if (origOnMsg) origOnMsg.call(ws, e);
         };
-        clearInterval(checkInterval);
     }, 500);
 })();
 

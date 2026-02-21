@@ -608,6 +608,7 @@ async function handleTrackChange(msg, isJoinRestore) {
         if (gen !== trackChangeGen) return; // stale, don't touch state
         console.error('handleTrackChange:', e);
         trackLoading = false;
+        pendingPlay = null;
     }
 }
 

@@ -158,8 +158,12 @@ func main() {
 					duration = rm.Audio.Duration
 				}
 				var clients []*room.Client
+				hostID := ""
 				// Only broadcast to multi-client rooms
 				if state == room.StatePlaying && clientCount > 1 {
+					if rm.Host != nil {
+						hostID = rm.Host.ID
+					}
 					clients = make([]*room.Client, 0, clientCount)
 					for _, c := range rm.Clients {
 						clients = append(clients, c)
@@ -181,6 +185,9 @@ func main() {
 					"serverTime": syncpkg.GetServerTime(),
 				}
 				for _, c := range clients {
+					if c.ID == hostID {
+						continue // host is the time source, skip syncTick
+					}
 					c.Send(msg)
 				}
 			}
