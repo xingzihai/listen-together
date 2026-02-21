@@ -27,7 +27,7 @@
 <body class="bg-gray-50 min-h-screen font-sans text-gray-800 style-vinyl">
 
 <!-- Version Tag -->
-<div id="versionTag" class="fixed top-2 left-2 text-xs text-gray-400/60 z-10">v0.7.1</div>
+<div id="versionTag" class="fixed top-2 left-2 text-xs text-gray-400/60 z-10">v0.7.2</div>
 
 <!-- User Bar -->
 <div id="userBar" class="fixed top-0 right-0 px-4 py-2 flex items-center gap-3 z-[70] bg-gradient-to-b from-white/80 to-transparent hidden">
@@ -135,16 +135,17 @@
     <div id="playerMain" class="player-main flex items-center py-[5vh] md:py-[8vh] w-full min-h-[60vh] transition-all duration-700" style="flex-direction:column;justify-content:center;padding:5vh 3vw">
         <!-- Left: Cover Art (vinyl disc) -->
         <div id="coverWrapper" class="cover-wrapper cover-idle flex-shrink-0 flex items-center justify-center transition-all duration-700">
+            <div id="mobileFlipBox" class="mobile-flip-container">
             <div id="coverContainer" class="cover-disc relative overflow-hidden shadow-2xl ring-1 ring-black/5 transition-all duration-700" style="width:min(80vw,20rem);height:min(80vw,20rem);border-radius:1rem">
                 <div id="coverPlaceholder" class="w-full h-full flex items-center justify-center bg-gradient-to-br from-emerald-100 via-gray-100 to-rose-100">
                     <i class="fas fa-music text-7xl text-emerald-300 opacity-40"></i>
                 </div>
                 <img id="coverImage" class="w-full h-full object-cover absolute inset-0" alt="cover" style="display:none">
-                <!-- Vinyl center hole (inside disc, rotates with it) -->
                 <div id="vinylCenter" class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 transition-opacity duration-700 z-10">
                     <div class="rounded-full bg-white/90 shadow-inner border-2 border-black/5" style="width:15%;height:15%"></div>
                 </div>
             </div>
+            </div><!-- /mobileFlipBox -->
         </div>
         <!-- Right: Track Info + Lyrics -->
         <div id="trackInfoPanel" class="track-info-panel flex-1 min-w-0 flex flex-col items-center md:items-start gap-[2vh] w-full opacity-0 pointer-events-none transition-all duration-700 max-h-0 overflow-hidden" style="padding-top:2.5rem">
@@ -187,6 +188,10 @@
     <div id="playlistPanel" class="hidden"></div>
 </div>
 
+    <!-- Mobile: fullscreen lyrics overlay -->
+    <div id="mobileLyricsOverlay" class="mobile-lyrics-overlay hidden">
+        <div id="mobileLyricsBack" class="mobile-lyrics-content"></div>
+    </div>
 </div><!-- /mainContainer -->
 
 <!-- ==================== Bottom Player Bar (lxserver style) ==================== -->
@@ -1177,6 +1182,72 @@ document.addEventListener('click', function(e) {
     }
 
     requestAnimationFrame(animateBackground);
+})();
+
+// === Mobile: tap cover → flip-out → fullscreen lyrics ===
+(function() {
+    var isMobile = function() { return window.innerWidth <= 639; };
+    var cover = document.getElementById('coverContainer');
+    var overlay = document.getElementById('mobileLyricsOverlay');
+    var lyricsBack = document.getElementById('mobileLyricsBack');
+    var trackInfo = document.getElementById('trackInfoPanel');
+    if (!cover || !overlay || !lyricsBack) return;
+    var animating = false;
+
+    // Tap cover → flip out cover, flip in lyrics
+    cover.addEventListener('click', function() {
+        if (!isMobile() || animating) return;
+        animating = true;
+        syncLyrics();
+        cover.classList.remove('flip-in');
+        cover.classList.add('flip-out');
+        // At halfway point, show lyrics with flip-in
+        setTimeout(function() {
+            overlay.classList.remove('hidden', 'flip-out');
+            overlay.classList.add('flip-in');
+            if (trackInfo) trackInfo.classList.add('mobile-hidden');
+        }, 200);
+        setTimeout(function() { animating = false; }, 550);
+    });
+
+    // Tap lyrics → flip out lyrics, flip in cover
+    overlay.addEventListener('click', function() {
+        if (!isMobile() || animating) return;
+        animating = true;
+        overlay.classList.remove('flip-in');
+        overlay.classList.add('flip-out');
+        setTimeout(function() {
+            overlay.classList.add('hidden');
+            overlay.classList.remove('flip-out');
+            cover.classList.remove('flip-out');
+            cover.classList.add('flip-in');
+            if (trackInfo) trackInfo.classList.remove('mobile-hidden');
+        }, 200);
+        setTimeout(function() {
+            cover.classList.remove('flip-in');
+            animating = false;
+        }, 550);
+    });
+
+    var syncLyrics = function() {
+        if (!isMobile()) return;
+        var src = document.getElementById('lyricsContent');
+        if (!src) return;
+        var lines = src.querySelectorAll('.lyric-line');
+        var html = '';
+        for (var i = 0; i < lines.length; i++) {
+            var isCurrent = lines[i].classList.contains('active');
+            html += '<p class="' + (isCurrent ? 'current-line' : '') + '">' + lines[i].textContent + '</p>';
+        }
+        if (!html) html = '<p style="color:rgba(255,255,255,0.3)">暂无歌词</p>';
+        lyricsBack.innerHTML = html;
+        var cur = lyricsBack.querySelector('.current-line');
+        if (cur) cur.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    };
+
+    var lc = document.getElementById('lyricsContent');
+    if (lc) new MutationObserver(syncLyrics).observe(lc, { childList: true, subtree: true, attributes: true });
+    setInterval(syncLyrics, 1000);
 })();
 </script>
 </body>
