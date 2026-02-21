@@ -17,16 +17,12 @@ class AudioPlayer {
         this._lookaheadTimer = null;
         this._nextSegIdx = 0;       // next segment to schedule
         this._nextSegTime = 0;      // AudioContext time for next segment
-        this._driftOffset = 0;      // accumulated soft drift correction (seconds)
-        this._pendingDriftCorrection = 0; // pending correction waiting for segment schedule
-        this._softCorrectionTotal = 0; // total soft correction for UI display (seconds)
-        this._lastResync = 0;
-        this._resyncGen = 0;        // generation counter: incremented on each playAtPosition
-        // playbackRate correction state
-        this._rateCorrectingUntil = 0; // ctx.currentTime when rate correction ends
-        this._rateCorrectionTimer = null;
-        this._currentPlaybackRate = 1.0; // current playbackRate for new sources
-        this._rateStartTime = 0;      // ctx.currentTime when rate correction started
+        // Server-authority sync: simple drift detection + hard reset
+        this._driftCount = 0;           // consecutive over-threshold count
+        this._lastResetTime = 0;        // last forced reset timestamp (performance.now())
+        this._DRIFT_THRESHOLD = 0.15;   // 150ms
+        this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
+        this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
     }
 
     init() {
@@ -146,9 +142,8 @@ class AudioPlayer {
                 this.isPlaying = true;
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
-                this._driftOffset = 0;
-                this._pendingDriftCorrection = 0;
-                // Update sync anchors so correctDrift doesn't see a false jump
+                this._driftCount = 0;
+                // Update sync anchors
                 this.serverPlayTime = window.clockSync.getServerTime();
                 this.serverPlayPosition = resumePos;
                 this._startLookahead(resumePos, this.ctx.currentTime);
@@ -205,11 +200,7 @@ class AudioPlayer {
     async playAtPosition(position, serverTime, scheduledAt) {
         this.init(); this.stop();
         this.isPlaying = true;
-        this._driftOffset = 0;
-        this._softCorrectionTotal = 0;
-        this._pendingDriftCorrection = 0;
-        this._resyncGen++;
-        this._rateStartTime = 0;
+        this._driftCount = 0;
 
         // Wait for ClockSync to have at least 3 samples (max 800ms wait)
         if (!window.clockSync.synced) {
@@ -297,21 +288,8 @@ class AudioPlayer {
         if (!this.isPlaying || this._scheduling) return;
         this._scheduling = true;
         try {
-        // Check if rate correction period has ended (backup for setTimeout throttling)
-        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
-            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
-            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
-            this.startOffset += extraPlayed;
-            this._currentPlaybackRate = 1.0;
-            this._rateStartTime = 0;
-            this.sources.forEach(source => {
-                if (source.playbackRate) source.playbackRate.value = 1.0;
-            });
-            this._rateCorrectingUntil = 0;
-            console.log('[sync] playbackRate restored to 1.0 (via scheduler)');
-        }
         const LOOKAHEAD = this._actualQuality === 'lossless' ? 3.0 : 1.5;
-        const preloadCount = this._actualQuality === 'lossless' ? 3 : 3;
+        const preloadCount = 3;
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
             const i = this._nextSegIdx;
@@ -325,18 +303,12 @@ class AudioPlayer {
             if (!buffer) break;
             const source = this.ctx.createBufferSource();
             source.buffer = buffer;
-            // Per-segment gain for crossfade at boundaries
             const segGain = this.ctx.createGain();
             segGain.connect(this.gainNode);
             source.connect(segGain);
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            const effectiveRate = (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) ? this._currentPlaybackRate : 1.0;
-            const effectiveDur = dur / effectiveRate;
-            if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0) {
-                source.playbackRate.value = this._currentPlaybackRate;
-            }
             // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
@@ -344,170 +316,22 @@ class AudioPlayer {
                 segGain.gain.linearRampToValueAtTime(1, t + fadeTime);
             }
             if (i < this.segments.length - 1) {
-                const fadeOutStart = t + effectiveDur - fadeTime;
+                const fadeOutStart = t + dur - fadeTime;
                 segGain.gain.setValueAtTime(1, fadeOutStart);
-                segGain.gain.linearRampToValueAtTime(0, t + effectiveDur);
+                segGain.gain.linearRampToValueAtTime(0, t + dur);
             }
             source.start(t, off);
-            // Transfer pending drift correction now that the corrected segment is actually scheduled
-            if (this._pendingDriftCorrection) {
-                this._driftOffset += this._pendingDriftCorrection;
-                this._pendingDriftCorrection = 0;
-            }
-            // Clean up ended sources
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
                 if (idx > -1) this.sources.splice(idx, 1);
             };
             this.sources.push(source);
-            this._nextSegTime = t + effectiveDur;
+            this._nextSegTime = t + dur;
             this._nextSegIdx = i + 1;
             this._isFirstSeg = false;
-            // Preload upcoming segments
             if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
         }
         } finally { this._scheduling = false; }
-    }
-
-    // === Drift Correction ===
-    // Three-tier correction: soft (15-50ms), playbackRate (50-300ms), hard (>300ms)
-    correctDrift(skipDebounce) {
-        if (!this.isPlaying || !this.serverPlayTime || this._resyncing) return 0;
-        // Skip correction during playbackRate adjustment
-        if (this._rateCorrectingUntil && this.ctx.currentTime < this._rateCorrectingUntil) return 0;
-        // Check if rate correction period has ended (backup recovery)
-        if (this._currentPlaybackRate !== 1.0 && this._rateCorrectingUntil && this.ctx.currentTime >= this._rateCorrectingUntil) {
-            const actualRateTime = this.ctx.currentTime - this._rateStartTime;
-            const extraPlayed = actualRateTime * (this._currentPlaybackRate - 1.0);
-            this.startOffset += extraPlayed;
-            this._currentPlaybackRate = 1.0;
-            this._rateStartTime = 0;
-            this.sources.forEach(source => {
-                if (source.playbackRate) source.playbackRate.value = 1.0;
-            });
-            this._rateCorrectingUntil = 0;
-            console.log('[sync] playbackRate restored to 1.0 (via correctDrift)');
-        }
-
-        // Debounce: max 10 corrections per second (skip for syncTick with fresh anchor)
-        const now = performance.now();
-        if (!skipDebounce && this._lastCorrectionTime && now - this._lastCorrectionTime < 100) return 0;
-        this._lastCorrectionTime = now;
-
-        const serverNow = window.clockSync.getServerTime();
-        const expectedPos = this.serverPlayPosition + (serverNow - this.serverPlayTime) / 1000;
-        // Use getCurrentTime() which includes _driftOffset compensation
-        // This way, once a soft correction is applied and takes effect at the next segment,
-        // the drift measurement will reflect the correction
-        const actualPos = this.getCurrentTime();
-        const drift = actualPos - expectedPos;
-        // Debug display
-        const driftEl = document.getElementById('driftStatus');
-        if (driftEl) {
-            const ctxElapsed = (this.ctx.currentTime - this.startTime).toFixed(3);
-            const driftAcc = (this._driftOffset * 1000).toFixed(1);
-            driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | accum: ${driftAcc}ms`;
-            // Detailed debug panel
-            const dbg = document.getElementById('syncDebug');
-            if (dbg) {
-                const ctxEl = (this.ctx.currentTime - this.startTime).toFixed(3);
-                const svrEl = ((serverNow - this.serverPlayTime) / 1000).toFixed(3);
-                const elapsed_ = this.ctx.currentTime - this.startTime;
-                const rawP = (this.startOffset + Math.max(0, elapsed_)).toFixed(3);
-                const expP = expectedPos.toFixed(3);
-                const curP = this.getCurrentTime().toFixed(3);
-                const segI = this._nextSegIdx;
-                const nst = (this._nextSegTime - this.ctx.currentTime).toFixed(3);
-                const rate = this._currentPlaybackRate || 1.0;
-                const lat = ((this._outputLatency||0)*1000).toFixed(0);
-                const off = window.clockSync.offset.toFixed(1);
-                const rtt = window.clockSync.rtt.toFixed(0);
-                const sam = window.clockSync.samples.length;
-                const syn = window.clockSync.synced ? 'Y' : 'N';
-                dbg.textContent = [
-                    `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
-                    `POS raw:${rawP} exp:${expP} cur:${curP} svrElapsed:${svrEl}s ctxElapsed:${ctxEl}s`,
-                    `SEG idx:${segI} nextIn:${nst}s rate:${rate} driftOff:${driftAcc}ms lat:${lat}ms`,
-                ].join('\n');
-            }
-        }
-        const absDrift = Math.abs(drift);
-
-        // Tier 1: Soft correction (5-50ms) — adjust _nextSegTime only, don't touch startTime
-        if (absDrift > 0.005 && absDrift <= 0.05) {
-            // Cap accumulated drift correction at ±500ms; beyond that, force hard resync
-            if (Math.abs(this._driftOffset + drift) > 0.5) {
-                console.warn(`[sync] soft correction capped: accumulated ${(this._driftOffset*1000).toFixed(0)}ms, forcing hard resync`);
-                // 直接执行硬重置，不依赖 fall-through
-                this._driftOffset = 0;
-                if (!this._resyncing) {
-                    this._resyncing = true;
-                    this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
-                        .finally(() => { this._resyncing = false; });
-                }
-                return Math.round(drift * 1000);
-            }
-            // drift>0 means ahead (too fast) → push _nextSegTime later to slow down
-            // drift<0 means behind (too slow) → pull _nextSegTime earlier to speed up
-            // Skip if there's already a pending correction in the same direction (avoid repeat-counting)
-            if (Math.abs(this._pendingDriftCorrection) > 0.003 && Math.sign(this._pendingDriftCorrection) === Math.sign(drift)) {
-                return Math.round(drift * 1000);
-            }
-            this._nextSegTime += drift;
-            // Don't update _driftOffset here — the actual audio hasn't changed yet.
-            // _driftOffset is updated in _scheduleAhead when the corrected segment is actually scheduled.
-            this._pendingDriftCorrection = (this._pendingDriftCorrection || 0) + drift;
-            this._resyncBackoff = 500;
-            return Math.round(drift * 1000);
-        }
-
-        // Tier 2: playbackRate correction (50-200ms) — gradual catch-up over 1-2 seconds
-        // Keep ±2-3% to avoid audible pitch shift (human threshold ~±1-2%)
-        if (absDrift > 0.05 && absDrift <= 0.2) {
-            // 50-100ms: ±2%, 100-200ms: ±3%
-            let rateOffset;
-            if (absDrift <= 0.1) rateOffset = 0.02;
-            else rateOffset = 0.03;
-            // If behind (drift < 0), speed up; if ahead (drift > 0), slow down
-            const rate = drift < 0 ? (1 + rateOffset) : (1 - rateOffset);
-            const neededCatchUp = absDrift;
-            const adjustedDuration = Math.min(5, neededCatchUp / rateOffset);
-
-            console.log(`[sync] playbackRate correction: drift=${(drift*1000).toFixed(0)}ms, rate=${rate}, duration=${adjustedDuration.toFixed(1)}s`);
-
-            // Record start time for offset compensation
-            this._rateStartTime = this.ctx.currentTime;
-
-            // Set playbackRate on all active AudioBufferSourceNodes
-            this._currentPlaybackRate = rate;
-            this.sources.forEach(source => {
-                if (source.playbackRate) source.playbackRate.value = rate;
-            });
-            this._rateCorrectingUntil = this.ctx.currentTime + adjustedDuration;
-
-            // Clear any existing timer (keep for cleanup, but recovery is via scheduler)
-            if (this._rateCorrectionTimer) clearTimeout(this._rateCorrectionTimer);
-            this._rateCorrectionTimer = null;
-
-            this._resyncBackoff = 500;
-            return Math.round(drift * 1000);
-        }
-
-        // Tier 3: Hard resync (>200ms) — stop and restart with minimal backoff
-        if (absDrift > 0.2) {
-            const backoff = this._resyncBackoff || 500;
-            if (this._lastResync && Date.now() - this._lastResync < backoff) return 0;
-            console.warn(`[sync] hard resync: drift=${(drift*1000).toFixed(0)}ms, backoff=${backoff}ms`);
-            this._lastResync = Date.now();
-            this._resyncBackoff = Math.min(backoff * 1.5, 5000);
-            if (!this._resyncing) {
-                this._resyncing = true;
-                this.playAtPosition(this.serverPlayPosition, this.serverPlayTime)
-                    .finally(() => { this._resyncing = false; });
-            }
-            return Math.round(drift * 1000);
-        }
-        return Math.round(drift * 1000);
     }
 
     stop() {
@@ -516,10 +340,7 @@ class AudioPlayer {
         this._stopLookahead();
         this._upgrading = false;
         this._scheduling = false;
-        if (this._rateCorrectionTimer) { clearTimeout(this._rateCorrectionTimer); this._rateCorrectionTimer = null; }
-        this._rateCorrectingUntil = 0;
-        this._currentPlaybackRate = 1.0;
-        this._rateStartTime = 0;
+        this._driftCount = 0;
         // Fade out to avoid click/pop, then stop sources
         if (this.gainNode && this.ctx) {
             const now = this.ctx.currentTime;
@@ -530,27 +351,14 @@ class AudioPlayer {
         this.sources = [];
         setTimeout(() => {
             oldSources.forEach(s => { try { s.stop(); s.disconnect(); } catch {} });
-            // Restore gain for next playback
             if (this.gainNode) this.gainNode.gain.value = 1.0;
         }, 10);
-        this._driftOffset = 0;
-        this._softCorrectionTotal = 0;
-        this._pendingDriftCorrection = 0;
     }
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
-        // Only reflect consumed drift corrections, not pending ones
-        // _pendingDriftCorrection hasn't taken effect in audio scheduling yet
-        pos -= this._driftOffset;
-        // Compensate for playbackRate during Tier 2 correction
-        if (this._currentPlaybackRate && this._currentPlaybackRate !== 1.0 && this._rateStartTime) {
-            const rateElapsed = this.ctx.currentTime - this._rateStartTime;
-            pos += rateElapsed * (this._currentPlaybackRate - 1.0);
-        }
-        // Clamp to duration
         if (this.duration > 0 && pos > this.duration) pos = this.duration;
         return pos;
     }

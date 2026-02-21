@@ -217,8 +217,10 @@ async function handleMessage(msg) {
             }
             break;
         case 'pause':
+            window.audioPlayer._driftCount = 0;
             doPause(); break;
         case 'seek':
+            window.audioPlayer._driftCount = 0;
             if (window.audioPlayer.isPlaying) {
                 await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
             } else {
@@ -254,16 +256,73 @@ async function handleMessage(msg) {
             showScreen('home');
             break;
         case 'pong': window.clockSync.handlePong(msg); break;
-        case 'syncTick':
-            // Server-authoritative position sync — bypasses per-client offset differences
-            if (window.audioPlayer.isPlaying && msg.position != null) {
-                window.audioPlayer.serverPlayTime = msg.serverTime;
-                window.audioPlayer.serverPlayPosition = msg.position;
-                // Immediate drift check after anchor update (skip debounce)
-                const drift = window.audioPlayer.correctDrift(true);
-                if (drift) console.log('syncTick drift corrected:', drift, 'ms');
+        case 'syncTick': {
+            const ap = window.audioPlayer;
+            if (!ap.isPlaying || typeof msg.position !== 'number' || typeof msg.serverTime !== 'number') break;
+            if (msg.position < 0 || msg.position > 86400 || msg.serverTime < 1e12) break;
+
+            // Update server anchor (kept for elapsed calculations)
+            ap.serverPlayTime = msg.serverTime;
+            ap.serverPlayPosition = msg.position;
+
+            // Drift detection using raw AudioContext time
+            const ctxElapsed = ap.ctx.currentTime - ap.startTime;
+            const actualPos = ap.startOffset + Math.max(0, ctxElapsed);
+
+            // Server position with network delay compensation
+            const networkDelay = (window.clockSync.getServerTime() - msg.serverTime) / 1000;
+            const serverPos = msg.position + networkDelay;
+
+            const drift = actualPos - serverPos;
+            const absDrift = Math.abs(drift);
+
+            // Debug panel update
+            const driftEl = document.getElementById('driftStatus');
+            if (driftEl) {
+                driftEl.textContent = `Drift: ${(drift*1000).toFixed(1)}ms | count: ${ap._driftCount}/${ap._DRIFT_COUNT_LIMIT}`;
+                const dbg = document.getElementById('syncDebug');
+                if (dbg) {
+                    const off = window.clockSync.offset.toFixed(1);
+                    const rtt = window.clockSync.rtt.toFixed(0);
+                    const sam = window.clockSync.samples.length;
+                    const syn = window.clockSync.synced ? 'Y' : 'N';
+                    const lat = ((ap._outputLatency||0)*1000).toFixed(0);
+                    dbg.textContent = [
+                        `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
+                        `POS actual:${actualPos.toFixed(3)} server:${serverPos.toFixed(3)} netDelay:${(networkDelay*1000).toFixed(0)}ms`,
+                        `SEG idx:${ap._nextSegIdx} lat:${lat}ms cooldown:${ap._lastResetTime ? Math.max(0, ap._RESET_COOLDOWN - (performance.now() - ap._lastResetTime)).toFixed(0) : '0'}ms`,
+                    ].join('\n');
+                }
+            }
+
+            // Drift counter logic
+            if (absDrift > ap._DRIFT_THRESHOLD) {
+                if (ap._lastResetTime && performance.now() - ap._lastResetTime < ap._RESET_COOLDOWN) {
+                    console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms ignored (cooldown)`);
+                } else {
+                    ap._driftCount++;
+                    console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms, count=${ap._driftCount}/${ap._DRIFT_COUNT_LIMIT}`);
+                    if (ap._driftCount >= ap._DRIFT_COUNT_LIMIT) {
+                        ap._driftCount = 0;
+                        ap._lastResetTime = performance.now();
+                        console.warn(`[sync] forcing reset: drift=${(drift*1000).toFixed(0)}ms`);
+                        ap.playAtPosition(serverPos, msg.serverTime);
+                    }
+                }
+            } else {
+                ap._driftCount = 0;
             }
             break;
+        }
+        case 'forceResync': {
+            const ap = window.audioPlayer;
+            if (ap && ap.isPlaying && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
+                ap._driftCount = 0;
+                ap._lastResetTime = performance.now();
+                ap.playAtPosition(msg.position, msg.serverTime, msg.scheduledAt);
+            }
+            break;
+        }
         case 'deviceKick':
             deviceKicked = true;
             if (window.audioPlayer) window.audioPlayer.stop();
@@ -336,7 +395,7 @@ function doPause() {
     stopUIUpdate();
 }
 
-let uiInterval = null, driftInterval = null;
+let uiInterval = null;
 function startUIUpdate() {
     stopUIUpdate();
     uiInterval = setInterval(() => {
@@ -346,27 +405,9 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
-    // Aggressive initial sync: check every 200ms for first 5s, then every 1s
-    let driftChecks = 0;
-    const driftCheck = () => {
-        if (!window.audioPlayer.isPlaying) return;
-        const drift = window.audioPlayer.correctDrift();
-        if (drift) console.log('Drift corrected:', drift, 'ms');
-        driftChecks++;
-    };
-    // Fast phase: 200ms interval for first 25 checks (~5s)
-    driftInterval = setInterval(() => {
-        driftCheck();
-        if (driftChecks >= 25 && driftInterval) {
-            clearInterval(driftInterval);
-            // Switch to steady-state 1s interval
-            driftInterval = setInterval(driftCheck, 1000);
-        }
-    }, 200);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
-    if (driftInterval) { clearInterval(driftInterval); driftInterval = null; }
 }
 
 function updatePlayButton(playing) {
@@ -699,13 +740,16 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && window.clockSync && window.audioPlayer.isPlaying) {
         console.log('[sync] page visible, triggering burst re-sync');
         window.clockSync.burst();
-        // Immediately catch up on segment scheduling that was throttled in background
-        if (window.audioPlayer._scheduleAhead) window.audioPlayer._scheduleAhead();
+        // Force reset after clockSync burst completes (600ms)
         setTimeout(() => {
-            if (window.audioPlayer.isPlaying) {
-                const drift = window.audioPlayer.correctDrift();
-                if (drift) console.log('[sync] post-visibility drift corrected:', drift, 'ms');
-            }
-        }, 500);
+            if (!window.audioPlayer.isPlaying) return;
+            const ap = window.audioPlayer;
+            const now = window.clockSync.getServerTime();
+            const expectedPos = ap.serverPlayPosition + (now - ap.serverPlayTime) / 1000;
+            ap._driftCount = 0;
+            ap._lastResetTime = performance.now();
+            ap.playAtPosition(expectedPos, now);
+            console.log('[sync] visibility restore: forced reset to', expectedPos.toFixed(2));
+        }, 600);
     }
 });
