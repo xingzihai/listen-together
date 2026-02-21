@@ -191,11 +191,17 @@ func main() {
 					"position":   currentPos,
 					"serverTime": syncpkg.GetServerTime(),
 				}
+				// Pre-serialize once, reuse for all clients
+				jsonBytes, err := json.Marshal(msg)
+				if err != nil {
+					continue
+				}
+				raw := json.RawMessage(jsonBytes)
 				for _, c := range clients {
 					if c.ID == hostID {
 						continue // host is the time source, skip syncTick
 					}
-					c.Send(msg)
+					c.Send(raw)
 				}
 			}
 		}
@@ -478,9 +484,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		totalRateLimit = 9999 // TODO: restore to 12 after testing
 	)
 	var (
-		msgTimes   = make([]time.Time, 0, msgRateLimit)
-		pingTimes  = make([]time.Time, 0, pingRateLimit)
-		totalTimes = make([]time.Time, 0, totalRateLimit)
+		msgTimes            = make([]time.Time, 0, msgRateLimit)
+		pingTimes           = make([]time.Time, 0, pingRateLimit)
+		totalTimes          = make([]time.Time, 0, totalRateLimit)
+		lastStatusReport    time.Time // per-client: max 1/sec
+		lastForceResyncSent time.Time // per-client: max 1/5sec
 	)
 	checkRate := func(times *[]time.Time, limit int) bool {
 		now := time.Now()
@@ -741,6 +749,20 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom == nil {
 				continue
 			}
+
+			// Rate limit: max 1 statusReport per second per client
+			now := time.Now()
+			if !lastStatusReport.IsZero() && now.Sub(lastStatusReport) < time.Second {
+				continue
+			}
+			lastStatusReport = now
+
+			// Input validation
+			if math.IsNaN(msg.Position) || math.IsInf(msg.Position, 0) || msg.Position < 0 {
+				continue
+			}
+
+			// Single lock acquisition to read all needed room state
 			currentRoom.Mu.RLock()
 			serverTrackIdx := currentRoom.CurrentTrack
 			serverState := currentRoom.State
@@ -750,15 +772,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.TrackAudio != nil {
 				duration = currentRoom.TrackAudio.Duration
 			}
+			ta := currentRoom.TrackAudio
 			currentRoom.Mu.RUnlock()
+
+			// Clamp client position to duration
+			clientPos := msg.Position
+			if duration > 0 && clientPos > duration {
+				clientPos = duration
+			}
 
 			// Check track index mismatch
 			if msg.TrackIndex != serverTrackIdx {
 				// Client is on wrong track — force correct
-				log.Printf("[sync] client %s on track %d, server on %d — forcing correction", clientID, msg.TrackIndex, serverTrackIdx)
-				currentRoom.Mu.RLock()
-				ta := currentRoom.TrackAudio
-				currentRoom.Mu.RUnlock()
+				log.Printf("[sync] client on track %d, server on %d — forcing correction", msg.TrackIndex, serverTrackIdx)
 				correction := map[string]interface{}{
 					"type":       "forceTrack",
 					"trackIndex": serverTrackIdx,
@@ -779,14 +805,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if duration > 0 && expectedPos > duration {
 					expectedPos = duration
 				}
-				clientPos := msg.Position
 				drift := clientPos - expectedPos
 				if drift < 0 {
 					drift = -drift
 				}
-				// If drift > 400ms, force resync
-				if drift > 0.4 {
-					log.Printf("[sync] client %s drift %.0fms — forcing resync", clientID, drift*1000)
+				// If drift > 500ms, force resync (server is backstop; client handles 150-500ms itself)
+				if drift > 0.5 {
+					// Rate limit forceResync: max once per 5 seconds per client
+					if !lastForceResyncSent.IsZero() && now.Sub(lastForceResyncSent) < 5*time.Second {
+						continue
+					}
+					lastForceResyncSent = now
+					log.Printf("[sync] client drift %.0fms — forcing resync", drift*1000)
 					myClient.Send(map[string]interface{}{
 						"type":       "forceResync",
 						"position":   expectedPos,
