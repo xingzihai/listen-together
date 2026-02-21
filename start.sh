@@ -20,7 +20,7 @@ echo "ListenTogether started on :8080 (PID $LT_PID)"
 sleep 1
 frpc -f 6k7fkea9qyimx6a36ob9pith1nblhmgf:25995194 > /tmp/frpc.log 2>&1 &
 FRPC_PID=$!
-echo "SakuraFrp tunnel started: frp-bar.com:45956 (PID $FRPC_PID)"
+echo "SakuraFrp tunnel started: frp-fan.com:45956 (PID $FRPC_PID)"
 
 # 退出时清理子进程
 trap "kill $LT_PID $FRPC_PID 2>/dev/null; wait" EXIT

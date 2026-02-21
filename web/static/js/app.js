@@ -298,17 +298,16 @@ async function handleMessage(msg) {
                 }
             }
 
-            // Drift counter logic
+            // Drift counter logic — client requests server-coordinated resync (never resets itself)
             if (absDrift > ap._DRIFT_THRESHOLD) {
                 if (ap._lastResetTime && performance.now() - ap._lastResetTime < ap._RESET_COOLDOWN) {
                     // C3: Post-reset verification — if >500ms since reset, check once
                     if (ap._postResetVerify && performance.now() - ap._postResetTime > 500) {
                         ap._postResetVerify = false;
-                        console.warn(`[sync] post-reset verify failed: drift=${(drift*1000).toFixed(0)}ms, re-resetting`);
+                        console.warn(`[sync] post-reset verify failed: drift=${(drift*1000).toFixed(0)}ms, requesting server resync`);
                         ap._driftCount = 0;
                         ap._lastResetTime = performance.now();
-                        const resetScheduledAt = window.clockSync.getServerTime() + 300;
-                        ap.playAtPosition(serverPos, msg.serverTime, resetScheduledAt);
+                        ws.send(JSON.stringify({ type: 'requestResync' }));
                     } else {
                         console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms ignored (cooldown)`);
                     }
@@ -318,11 +317,8 @@ async function handleMessage(msg) {
                     if (ap._driftCount >= ap._DRIFT_COUNT_LIMIT) {
                         ap._driftCount = 0;
                         ap._lastResetTime = performance.now();
-                        ap._postResetVerify = true;
-                        ap._postResetTime = performance.now();
-                        console.warn(`[sync] forcing reset: drift=${(drift*1000).toFixed(0)}ms`);
-                        const resetScheduledAt = window.clockSync.getServerTime() + 300;
-                        ap.playAtPosition(serverPos, msg.serverTime, resetScheduledAt);
+                        console.warn(`[sync] requesting server resync: drift=${(drift*1000).toFixed(0)}ms`);
+                        ws.send(JSON.stringify({ type: 'requestResync' }));
                     }
                 }
             } else {
@@ -760,16 +756,15 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && window.clockSync && window.audioPlayer.isPlaying) {
         console.log('[sync] page visible, triggering burst re-sync');
         window.clockSync.burst();
-        // Force reset after clockSync burst completes (600ms)
+        // Request server-coordinated resync after clockSync burst completes (600ms)
         setTimeout(() => {
             if (!window.audioPlayer.isPlaying) return;
-            const ap = window.audioPlayer;
-            const now = window.clockSync.getServerTime();
-            const expectedPos = ap.serverPlayPosition + (now - ap.serverPlayTime) / 1000;
-            ap._driftCount = 0;
-            ap._lastResetTime = performance.now();
-            ap.playAtPosition(expectedPos, now);
-            console.log('[sync] visibility restore: forced reset to', expectedPos.toFixed(2));
+            if (typeof ws !== 'undefined' && ws && ws.readyState === 1) {
+                window.audioPlayer._driftCount = 0;
+                window.audioPlayer._lastResetTime = performance.now();
+                ws.send(JSON.stringify({ type: 'requestResync' }));
+                console.log('[sync] visibility restore: requested server resync');
+            }
         }, 600);
     }
 });

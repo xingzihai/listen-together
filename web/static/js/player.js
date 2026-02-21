@@ -20,7 +20,7 @@ class AudioPlayer {
         // Server-authority sync: simple drift detection + hard reset
         this._driftCount = 0;           // consecutive over-threshold count
         this._lastResetTime = 0;        // last forced reset timestamp (performance.now())
-        this._DRIFT_THRESHOLD = 0.15;   // 150ms
+        this._DRIFT_THRESHOLD = 0.20;   // 200ms
         this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
         this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
         // _lastDrift removed: no segment-level micro-adjustment, rely on syncTick hard reset only

@@ -64,7 +64,7 @@ SKILL.md里写的路径是错的，绕了一大圈才找到正确路径。教训
 | 维度 | 状态 |
 |------|------|
 | 版本 | v0.7.0 |
-| 线上 | frp-bar.com:45956 ✅ |
+| 线上 | frp-fan.com:45956 ✅ |
 | GitHub | exp/overlap-encoding 已push |
 | 同步 | 三级纠正 + watchdog + 客户端上报 + 服务端校验（opus审查中） |
 | UI | vinyl/card双样式 + 布局编辑器 + 动态背景 |

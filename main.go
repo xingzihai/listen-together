@@ -821,6 +821,47 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+		case "requestResync":
+			if currentRoom == nil {
+				continue
+			}
+			// Room-level rate limit: max once per 5 seconds
+			now := time.Now()
+			currentRoom.Mu.Lock()
+			if !currentRoom.LastResyncTime.IsZero() && now.Sub(currentRoom.LastResyncTime) < 5*time.Second {
+				currentRoom.Mu.Unlock()
+				continue
+			}
+			currentRoom.LastResyncTime = now
+			// Compute authoritative position under lock
+			currentPos := currentRoom.Position + time.Since(currentRoom.StartTime).Seconds()
+			dur := 0.0
+			if currentRoom.TrackAudio != nil {
+				dur = currentRoom.TrackAudio.Duration
+			}
+			if dur > 0 && currentPos > dur {
+				currentPos = dur
+			}
+			currentRoom.Mu.Unlock()
+
+			nowMs := syncpkg.GetServerTime()
+			scheduledAt := nowMs + 400 // 400ms lead time for hardware scheduling
+			resyncMsg := map[string]interface{}{
+				"type":        "forceResync",
+				"position":    currentPos,
+				"serverTime":  nowMs,
+				"scheduledAt": scheduledAt,
+			}
+			// Pre-serialize once, broadcast to all clients
+			jsonBytes, err := json.Marshal(resyncMsg)
+			if err == nil {
+				raw := json.RawMessage(jsonBytes)
+				for _, c := range currentRoom.GetClients() {
+					c.Send(raw)
+				}
+			}
+			log.Printf("[sync] server-coordinated resync: pos=%.2f, scheduledAt=%d", currentPos, int64(scheduledAt))
+
 		case "kick":
 			if currentRoom == nil {
 				continue

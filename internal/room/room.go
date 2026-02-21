@@ -91,8 +91,9 @@ type Room struct {
 	LastActive   time.Time
 	OwnerID      int64
 	OwnerName    string
-	CurrentTrack int
-	Mu         sync.RWMutex
+	CurrentTrack   int
+	LastResyncTime time.Time // Room-level resync cooldown
+	Mu             sync.RWMutex
 }
 
 type Manager struct {
