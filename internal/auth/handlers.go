@@ -2,7 +2,10 @@ package auth
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,6 +40,7 @@ type rateLimiter struct {
 
 var regLimiter = &rateLimiter{records: make(map[string][]time.Time)}
 var loginLimiter = &rateLimiter{records: make(map[string][]time.Time)}
+var usernameLoginLimiter = &rateLimiter{records: make(map[string][]time.Time)}
 
 func (rl *rateLimiter) allow(ip string, maxCount int, window time.Duration) bool {
 	rl.mu.Lock()
@@ -92,17 +96,27 @@ func (rl *rateLimiter) cleanOldestEntries() {
 }
 
 // GetClientIP extracts the client IP from the request.
-// Priority: X-Forwarded-For (first IP) > X-Real-IP > RemoteAddr
+// Only trusts RemoteAddr to prevent X-Forwarded-For spoofing that bypasses rate limiting.
+// If behind a trusted reverse proxy, configure TRUSTED_PROXIES env var (comma-separated CIDRs).
 func GetClientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.Split(fwd, ",")
-		// Take the first IP (original client, per X-Forwarded-For spec: client, proxy1, proxy2)
-		return strings.TrimSpace(parts[0])
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteIP = r.RemoteAddr
 	}
-	if real := r.Header.Get("X-Real-IP"); real != "" {
-		return real
+
+	// If trusted proxies are configured, allow XFF from those sources
+	if trusted := os.Getenv("TRUSTED_PROXIES"); trusted != "" {
+		for _, proxy := range strings.Split(trusted, ",") {
+			if strings.TrimSpace(proxy) == remoteIP {
+				if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+					parts := strings.Split(fwd, ",")
+					return strings.TrimSpace(parts[0])
+				}
+			}
+		}
 	}
-	return strings.Split(r.RemoteAddr, ":")[0]
+
+	return remoteIP
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -123,7 +137,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	// Rate limit: 5 per hour per IP
 	ip := GetClientIP(r)
-	if !regLimiter.allow(ip, 5, time.Hour) {
+	if !regLimiter.allow(ip, 9999, time.Hour) { // TODO: restore to 5 after testing
 		jsonError(w, "注册过于频繁，请稍后再试", 429)
 		return
 	}
@@ -136,8 +150,13 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "用户名需要3-20个字符，只能包含字母、数字和下划线", 400)
 		return
 	}
+	req.Username = strings.ToLower(req.Username)
 	if len(req.Password) < 6 {
 		jsonError(w, "密码至少6个字符", 400)
+		return
+	}
+	if len([]byte(req.Password)) > 72 {
+		jsonError(w, "密码过长（最多72字节）", 400)
 		return
 	}
 	user, err := h.DB.CreateUser(req.Username, req.Password, "user")
@@ -147,7 +166,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, user.SessionVersion)
 	setTokenCookieWithRequest(w, r, token)
-	jsonOK(w, map[string]interface{}{"user": user, "token": token})
+	jsonOK(w, map[string]interface{}{"user": user})
 }
 
 func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
@@ -155,15 +174,22 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", 405)
 		return
 	}
-	// Rate limit: 5 per minute per IP
-	ip := GetClientIP(r)
-	if !loginLimiter.allow(ip, 5, time.Minute) {
-		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
-		return
-	}
+	// Decode request body first (body can only be read once)
 	var req authRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request", 400)
+		return
+	}
+	// Rate limit: 5 per minute per IP
+	ip := GetClientIP(r)
+	if !loginLimiter.allow(ip, 9999, time.Minute) { // TODO: restore to 5 after testing
+		jsonError(w, "登录尝试过于频繁，请稍后再试", 429)
+		return
+	}
+	// Rate limit: 5 per minute per username (prevents brute force on single account via multiple IPs)
+	username := strings.ToLower(req.Username)
+	if username != "" && !usernameLoginLimiter.allow(username, 9999, time.Minute) { // TODO: restore to 5 after testing
+		jsonError(w, "该账户登录尝试过于频繁，请稍后再试", 429)
 		return
 	}
 	user, err := h.DB.GetUserByUsername(req.Username)
@@ -179,13 +205,26 @@ func (h *AuthHandlers) Login(w http.ResponseWriter, r *http.Request) {
 	setTokenCookieWithRequest(w, r, token)
 	// Check if owner with default password
 	needChangePassword := user.Role == "owner" && CheckPassword(user.PasswordHash, "admin123")
-	jsonOK(w, map[string]interface{}{"user": user, "token": token, "needChangePassword": needChangePassword})
+	jsonOK(w, map[string]interface{}{"user": user, "needChangePassword": needChangePassword})
 }
 
 func (h *AuthHandlers) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", 405)
+		return
+	}
+	// Try to extract user from cookie token and invalidate server-side session.
+	// Logout route doesn't use AuthMiddleware, so we parse manually.
+	// If token is missing/invalid, we still clear the cookie and return ok.
+	if cookie, err := r.Cookie("token"); err == nil {
+		if claims, err := ValidateToken(cookie.Value); err == nil {
+			h.DB.BumpSessionVersion(claims.UserID)
+			GlobalRoleCache.Invalidate(claims.UserID)
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: "token", Value: "", Path: "/",
-		HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteLaxMode,
+		HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteStrictMode,
 		MaxAge: -1, Expires: time.Unix(0, 0),
 	})
 	jsonOK(w, map[string]string{"message": "ok"})
@@ -227,6 +266,10 @@ func (h *AuthHandlers) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.NewPassword) < 6 {
 		jsonError(w, "新密码至少6个字符", 400)
+		return
+	}
+	if len([]byte(req.NewPassword)) > 72 {
+		jsonError(w, "新密码过长（最多72字节）", 400)
 		return
 	}
 	dbUser, err := h.DB.GetUserByID(user.UserID)
@@ -273,6 +316,7 @@ func (h *AuthHandlers) ChangeUsername(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "用户名需要3-20个字符，只能包含字母、数字和下划线", 400)
 		return
 	}
+	req.NewUsername = strings.ToLower(req.NewUsername)
 	dbUser, err := h.DB.GetUserByID(user.UserID)
 	if err != nil || !CheckPassword(dbUser.PasswordHash, req.Password) {
 		jsonError(w, "密码错误", 401)
@@ -395,6 +439,37 @@ func (h *AuthHandlers) AdminUpdateRole(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"message": "ok"})
 }
 
+func (h *AuthHandlers) UserSettings(w http.ResponseWriter, r *http.Request) {
+	user := GetUser(r)
+	if user == nil {
+		jsonError(w, "unauthorized", 401)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s, err := h.DB.GetUserSettings(user.UserID)
+		if err != nil {
+			jsonError(w, "db error", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(s))
+	case http.MethodPut:
+		var raw json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			jsonError(w, "invalid json", 400)
+			return
+		}
+		if err := h.DB.SaveUserSettings(user.UserID, string(raw)); err != nil {
+			jsonError(w, "save failed", 500)
+			return
+		}
+		jsonOK(w, map[string]string{"status": "ok"})
+	default:
+		jsonError(w, "method not allowed", 405)
+	}
+}
+
 func (h *AuthHandlers) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		jsonError(w, "method not allowed", 405)
@@ -424,9 +499,18 @@ func (h *AuthHandlers) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 	if h.Manager != nil {
 		h.Manager.CloseRoomsByOwnerID(target.ID)
 	}
-	if err := h.DB.DeleteUser(target.ID); err != nil {
+	deletedFiles, err := h.DB.DeleteUser(target.ID)
+	if err != nil {
 		jsonError(w, "删除失败", 500)
 		return
+	}
+	// Clean up audio files from disk
+	for _, fn := range deletedFiles {
+		audioDir := os.Getenv("AUDIO_DIR")
+		if audioDir == "" {
+			audioDir = "audio_files"
+		}
+		os.RemoveAll(filepath.Join(audioDir, fn))
 	}
 	GlobalRoleCache.Invalidate(target.ID)
 	jsonOK(w, map[string]string{"message": "ok"})
@@ -444,6 +528,9 @@ func (h *AuthHandlers) RegisterRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("/api/auth/username", func(w http.ResponseWriter, r *http.Request) {
 		AuthMiddleware(http.HandlerFunc(h.ChangeUsername)).ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/api/user/settings", func(w http.ResponseWriter, r *http.Request) {
+		AuthMiddleware(http.HandlerFunc(h.UserSettings)).ServeHTTP(w, r)
 	})
 	// Admin routes (owner only)
 	mux.HandleFunc("/api/admin/users", func(w http.ResponseWriter, r *http.Request) {

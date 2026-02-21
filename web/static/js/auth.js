@@ -2,12 +2,9 @@
 const Auth = {
     user: null,
 
-    // Check response for auto-renewed token
+    // Check response for auto-renewed token (cookie-only, no localStorage)
     _checkTokenRenewal(res) {
-        const newToken = res.headers.get('X-New-Token');
-        if (newToken) {
-            localStorage.setItem('token', newToken);
-        }
+        // Token renewal is handled via HttpOnly cookie automatically
     },
 
     async init() {

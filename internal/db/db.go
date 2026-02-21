@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const maxRetries = 3
 
 // AudioFile represents a file in a user's audio library
 type AudioFile struct {
@@ -19,6 +22,11 @@ type AudioFile struct {
 	OriginalName    string    `json:"original_name"`
 	Title           string    `json:"title"`
 	Artist          string    `json:"artist"`
+	Album           string    `json:"album"`
+	Genre           string    `json:"genre"`
+	Year            string    `json:"year"`
+	Lyrics          string    `json:"lyrics,omitempty"`
+	CoverArt        string    `json:"cover_art"`
 	Duration        float64   `json:"duration"`
 	Size            int64     `json:"size"`
 	OriginalFormat  string    `json:"original_format"`
@@ -96,18 +104,36 @@ func Open(path string) (*DB, error) {
 
 func (d *DB) Close() error { return d.conn.Close() }
 
-func (d *DB) nextUID() (int64, error) {
+// isUniqueConstraintError checks if an error is a SQLite UNIQUE constraint violation.
+func isUniqueConstraintError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// nextUIDInTx returns the next UID within a transaction.
+// admin/owner UIDs start at 100, regular users at 10001.
+func nextUIDInTx(tx *sql.Tx, role string) (int64, error) {
 	var uid int64
-	err := d.conn.QueryRow("SELECT COALESCE(MAX(uid),0) FROM users").Scan(&uid)
+	err := tx.QueryRow("SELECT COALESCE(MAX(uid),0) FROM users").Scan(&uid)
 	if err != nil {
 		return 0, err
 	}
-	return uid + 1, nil
+	next := uid + 1
+	if role == "owner" || role == "admin" {
+		if next < 100 {
+			next = 100
+		}
+	} else {
+		if next < 10001 {
+			next = 10001
+		}
+	}
+	return next, nil
 }
 
-func (d *DB) nextSUID() (int64, error) {
+// nextSUIDInTx returns the next SUID within a transaction. SUIDs start at 1.
+func nextSUIDInTx(tx *sql.Tx) (int64, error) {
 	var suid int64
-	err := d.conn.QueryRow("SELECT COALESCE(MAX(suid),0) FROM users WHERE suid > 0").Scan(&suid)
+	err := tx.QueryRow("SELECT COALESCE(MAX(suid),0) FROM users WHERE suid > 0").Scan(&suid)
 	if err != nil {
 		return 0, err
 	}
@@ -264,6 +290,11 @@ func (d *DB) init() error {
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN original_format TEXT DEFAULT ''`)
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN original_bitrate INTEGER DEFAULT 0`)
 	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN qualities TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN album TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN cover_art TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN genre TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN year TEXT DEFAULT ''`)
+	d.conn.Exec(`ALTER TABLE audio_files ADD COLUMN lyrics TEXT DEFAULT ''`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS library_shares (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		owner_id INTEGER NOT NULL,
@@ -273,14 +304,22 @@ func (d *DB) init() error {
 		FOREIGN KEY(owner_id) REFERENCES users(id),
 		FOREIGN KEY(shared_with_id) REFERENCES users(id)
 	)`)
+	d.conn.Exec(`CREATE TABLE IF NOT EXISTS user_settings (
+		user_id INTEGER PRIMARY KEY,
+		settings_json TEXT NOT NULL DEFAULT '{}',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(uid)
+	)`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS playlists (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		room_code TEXT NOT NULL,
+		room_code TEXT NOT NULL UNIQUE,
 		created_by INTEGER NOT NULL,
 		play_mode TEXT NOT NULL DEFAULT 'sequential',
 		current_index INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
+	// Migrate: add unique index if table already existed without it
+	d.conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_room_code ON playlists(room_code)`)
 	d.conn.Exec(`CREATE TABLE IF NOT EXISTS playlist_items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		playlist_id INTEGER NOT NULL,
@@ -321,30 +360,63 @@ func (d *DB) init() error {
 }
 
 func (d *DB) CreateUser(username, password, role string) (*User, error) {
+	username = strings.ToLower(username)
+	if len([]byte(password)) > 72 {
+		return nil, fmt.Errorf("password too long")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	if err != nil {
 		return nil, err
 	}
-	uid, err := d.nextUID()
-	if err != nil {
-		return nil, fmt.Errorf("generate uid: %w", err)
-	}
-	var suid int64
-	if role == "owner" || role == "admin" {
-		suid, err = d.nextSUID()
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		tx, err := d.conn.Begin()
 		if err != nil {
-			return nil, fmt.Errorf("generate suid: %w", err)
+			return nil, fmt.Errorf("begin tx: %w", err)
 		}
+
+		uid, err := nextUIDInTx(tx, role)
+		if err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("generate uid: %w", err)
+		}
+
+		var suid int64
+		if role == "owner" || role == "admin" {
+			suid, err = nextSUIDInTx(tx)
+			if err != nil {
+				tx.Rollback()
+				return nil, fmt.Errorf("generate suid: %w", err)
+			}
+		}
+
+		res, err := tx.Exec("INSERT INTO users(uid,suid,username,password_hash,role) VALUES(?,?,?,?,?)", uid, suid, username, string(hash), role)
+		if err != nil {
+			tx.Rollback()
+			if isUniqueConstraintError(err) && !strings.Contains(err.Error(), "username") {
+				lastErr = err
+				continue // retry on uid/suid conflict
+			}
+			return nil, err
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("commit: %w", err)
+		}
+
+		id, _ := res.LastInsertId()
+		return &User{ID: id, UID: uid, SUID: suid, Username: username, Role: role, PasswordVersion: 1, CreatedAt: time.Now()}, nil
 	}
-	res, err := d.conn.Exec("INSERT INTO users(uid,suid,username,password_hash,role) VALUES(?,?,?,?,?)", uid, suid, username, string(hash), role)
-	if err != nil {
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return &User{ID: id, UID: uid, SUID: suid, Username: username, Role: role, PasswordVersion: 1, CreatedAt: time.Now()}, nil
+	return nil, fmt.Errorf("create user failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func (d *DB) GetUserByUsername(username string) (*User, error) {
+	username = strings.ToLower(username)
 	u := &User{}
 	err := d.conn.QueryRow("SELECT id,uid,suid,username,password_hash,role,password_version,session_version,created_at FROM users WHERE username=?", username).
 		Scan(&u.ID, &u.UID, &u.SUID, &u.Username, &u.PasswordHash, &u.Role, &u.PasswordVersion, &u.SessionVersion, &u.CreatedAt)
@@ -390,6 +462,9 @@ func (d *DB) BumpSessionVersion(id int64) (int64, error) {
 }
 
 func (d *DB) UpdatePassword(id int64, newPassword string) error {
+	if len([]byte(newPassword)) > 72 {
+		return fmt.Errorf("password too long")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), 12)
 	if err != nil {
 		return err
@@ -399,26 +474,108 @@ func (d *DB) UpdatePassword(id int64, newPassword string) error {
 }
 
 func (d *DB) UpdateUsername(id int64, newUsername string) error {
+	newUsername = strings.ToLower(newUsername)
 	_, err := d.conn.Exec("UPDATE users SET username=? WHERE id=?", newUsername, id)
 	return err
 }
 
 func (d *DB) UpdateUserRole(id int64, role string) error {
-	var suid int64
-	if role == "owner" || role == "admin" {
-		// Check if user already has a suid
-		d.conn.QueryRow("SELECT suid FROM users WHERE id=?", id).Scan(&suid)
-		if suid == 0 {
-			suid, _ = d.nextSUID()
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		tx, err := d.conn.Begin()
+		if err != nil {
+			return fmt.Errorf("begin tx: %w", err)
 		}
+
+		var suid int64
+		if role == "owner" || role == "admin" {
+			tx.QueryRow("SELECT suid FROM users WHERE id=?", id).Scan(&suid)
+			if suid == 0 {
+				suid, err = nextSUIDInTx(tx)
+				if err != nil {
+					tx.Rollback()
+					return fmt.Errorf("generate suid: %w", err)
+				}
+			}
+		}
+
+		_, err = tx.Exec("UPDATE users SET role=?, suid=? WHERE id=?", role, suid, id)
+		if err != nil {
+			tx.Rollback()
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isUniqueConstraintError(err) {
+				lastErr = err
+				continue
+			}
+			return fmt.Errorf("commit: %w", err)
+		}
+		return nil
 	}
-	_, err := d.conn.Exec("UPDATE users SET role=?, suid=? WHERE id=?", role, suid, id)
-	return err
+	return fmt.Errorf("update user role failed after %d retries: %w", maxRetries, lastErr)
 }
 
-func (d *DB) DeleteUser(id int64) error {
-	_, err := d.conn.Exec("DELETE FROM users WHERE id=?", id)
-	return err
+// DeleteUser removes a user and all associated data in a transaction.
+// Returns the list of audio filenames that were owned by the user so the
+// caller can clean up the files on disk.
+func (d *DB) DeleteUser(id int64) ([]string, error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+
+	// 1. Collect audio filenames for disk cleanup
+	rows, err := tx.Query("SELECT filename FROM audio_files WHERE owner_id=?", id)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("query audio files: %w", err)
+	}
+	var filenames []string
+	for rows.Next() {
+		var fn string
+		if err := rows.Scan(&fn); err != nil {
+			rows.Close()
+			tx.Rollback()
+			return nil, fmt.Errorf("scan filename: %w", err)
+		}
+		filenames = append(filenames, fn)
+	}
+	rows.Close()
+
+	// 2. Delete library_shares where user is owner or recipient
+	if _, err := tx.Exec("DELETE FROM library_shares WHERE owner_id=? OR shared_with_id=?", id, id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete library_shares: %w", err)
+	}
+
+	// 3. Delete playlist_items that reference this user's audio files
+	if _, err := tx.Exec("DELETE FROM playlist_items WHERE audio_id IN (SELECT id FROM audio_files WHERE owner_id=?)", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete playlist_items: %w", err)
+	}
+
+	// 4. Delete audio files
+	if _, err := tx.Exec("DELETE FROM audio_files WHERE owner_id=?", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete audio_files: %w", err)
+	}
+
+	// 5. Delete the user record
+	if _, err := tx.Exec("DELETE FROM users WHERE id=?", id); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("delete user: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return filenames, nil
 }
 
 func (d *DB) ListUsersPaged(page, pageSize int) ([]*User, int, error) {
@@ -457,18 +614,18 @@ func (d *DB) ListUsers() ([]*User, error) {
 
 // --- Audio Library CRUD ---
 
-func (d *DB) AddAudioFile(ownerID int64, filename, originalName, title, artist string, duration float64, size int64, originalFormat string, originalBitrate int, qualities string) (*AudioFile, error) {
-	res, err := d.conn.Exec("INSERT INTO audio_files(owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities) VALUES(?,?,?,?,?,?,?,?,?,?)",
-		ownerID, filename, originalName, title, artist, duration, size, originalFormat, originalBitrate, qualities)
+func (d *DB) AddAudioFile(ownerID int64, filename, originalName, title, artist, album, genre, year, lyrics string, duration float64, size int64, originalFormat string, originalBitrate int, qualities, coverArt string) (*AudioFile, error) {
+	res, err := d.conn.Exec("INSERT INTO audio_files(owner_id,filename,original_name,title,artist,album,genre,year,lyrics,duration,size,original_format,original_bitrate,qualities,cover_art) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		ownerID, filename, originalName, title, artist, album, genre, year, lyrics, duration, size, originalFormat, originalBitrate, qualities, coverArt)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
-	return &AudioFile{ID: id, OwnerID: ownerID, Filename: filename, OriginalName: originalName, Title: title, Artist: artist, Duration: duration, Size: size, OriginalFormat: originalFormat, OriginalBitrate: originalBitrate, Qualities: qualities, CreatedAt: time.Now()}, nil
+	return &AudioFile{ID: id, OwnerID: ownerID, Filename: filename, OriginalName: originalName, Title: title, Artist: artist, Album: album, Genre: genre, Year: year, Lyrics: lyrics, Duration: duration, Size: size, OriginalFormat: originalFormat, OriginalBitrate: originalBitrate, Qualities: qualities, CoverArt: coverArt, CreatedAt: time.Now()}, nil
 }
 
 func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
-	rows, err := d.conn.Query("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE owner_id=? ORDER BY created_at DESC", ownerID)
+	rows, err := d.conn.Query("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE owner_id=? ORDER BY created_at DESC", ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +633,7 @@ func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
 	var files []*AudioFile
 	for rows.Next() {
 		f := &AudioFile{}
-		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
 		files = append(files, f)
 	}
 	return files, nil
@@ -484,8 +641,18 @@ func (d *DB) GetAudioFilesByOwner(ownerID int64) ([]*AudioFile, error) {
 
 func (d *DB) GetAudioFileByID(id int64) (*AudioFile, error) {
 	f := &AudioFile{}
-	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE id=?", id).
-		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE id=?", id).
+		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func (d *DB) GetAudioFileByUUID(uuid string) (*AudioFile, error) {
+	f := &AudioFile{}
+	err := d.conn.QueryRow("SELECT id,owner_id,filename,original_name,title,artist,album,genre,year,lyrics,cover_art,duration,size,original_format,original_bitrate,qualities,created_at FROM audio_files WHERE filename=?", uuid).
+		Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -493,15 +660,26 @@ func (d *DB) GetAudioFileByID(id int64) (*AudioFile, error) {
 }
 
 func (d *DB) DeleteAudioFile(id, ownerID int64) error {
-	// Remove from any playlists first
-	d.conn.Exec("DELETE FROM playlist_items WHERE audio_id=?", id)
-	res, err := d.conn.Exec("DELETE FROM audio_files WHERE id=? AND owner_id=?", id, ownerID)
+	tx, err := d.conn.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM playlist_items WHERE audio_id=?", id); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete playlist_items: %w", err)
+	}
+	res, err := tx.Exec("DELETE FROM audio_files WHERE id=? AND owner_id=?", id, ownerID)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("delete audio_file: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		tx.Rollback()
 		return fmt.Errorf("not found or not owner")
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
@@ -551,7 +729,7 @@ func (d *DB) GetMyShares(ownerID int64) ([]*LibraryShare, error) {
 }
 
 func (d *DB) GetAccessibleAudioFiles(userID int64) ([]*AudioFile, error) {
-	rows, err := d.conn.Query(`SELECT a.id,a.owner_id,a.filename,a.original_name,a.title,a.artist,a.duration,a.size,a.original_format,a.original_bitrate,a.qualities,a.created_at,u.username
+	rows, err := d.conn.Query(`SELECT a.id,a.owner_id,a.filename,a.original_name,a.title,a.artist,a.album,a.genre,a.year,a.lyrics,a.cover_art,a.duration,a.size,a.original_format,a.original_bitrate,a.qualities,a.created_at,u.username
 		FROM audio_files a JOIN users u ON u.id=a.owner_id
 		WHERE a.owner_id=? OR a.owner_id IN (SELECT owner_id FROM library_shares WHERE shared_with_id=?)
 		ORDER BY a.created_at DESC`, userID, userID)
@@ -562,7 +740,7 @@ func (d *DB) GetAccessibleAudioFiles(userID int64) ([]*AudioFile, error) {
 	var files []*AudioFile
 	for rows.Next() {
 		f := &AudioFile{}
-		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt, &f.OwnerName)
+		rows.Scan(&f.ID, &f.OwnerID, &f.Filename, &f.OriginalName, &f.Title, &f.Artist, &f.Album, &f.Genre, &f.Year, &f.Lyrics, &f.CoverArt, &f.Duration, &f.Size, &f.OriginalFormat, &f.OriginalBitrate, &f.Qualities, &f.CreatedAt, &f.OwnerName)
 		files = append(files, f)
 	}
 	return files, nil
@@ -586,6 +764,17 @@ func (d *DB) CreatePlaylist(roomCode string, createdBy int64) (*Playlist, error)
 	return &Playlist{ID: id, RoomCode: roomCode, CreatedBy: createdBy, PlayMode: "sequential", CurrentIndex: 0, CreatedAt: time.Now()}, nil
 }
 
+func (d *DB) GetOrCreatePlaylist(roomCode string, createdBy int64) (*Playlist, error) {
+	d.conn.Exec("INSERT OR IGNORE INTO playlists(room_code,created_by) VALUES(?,?)", roomCode, createdBy)
+	p := &Playlist{}
+	err := d.conn.QueryRow("SELECT id,room_code,created_by,play_mode,current_index,created_at FROM playlists WHERE room_code=?", roomCode).
+		Scan(&p.ID, &p.RoomCode, &p.CreatedBy, &p.PlayMode, &p.CurrentIndex, &p.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 func (d *DB) GetPlaylistByRoom(roomCode string) (*Playlist, error) {
 	p := &Playlist{}
 	err := d.conn.QueryRow("SELECT id,room_code,created_by,play_mode,current_index,created_at FROM playlists WHERE room_code=?", roomCode).
@@ -596,13 +785,26 @@ func (d *DB) GetPlaylistByRoom(roomCode string) (*Playlist, error) {
 	return p, nil
 }
 
-func (d *DB) AddPlaylistItem(playlistID, audioID int64, position int) (*PlaylistItem, error) {
-	res, err := d.conn.Exec("INSERT INTO playlist_items(playlist_id,audio_id,position) VALUES(?,?,?)", playlistID, audioID, position)
+func (d *DB) AddPlaylistItem(playlistID, audioID int64, _ int) (*PlaylistItem, error) {
+	tx, err := d.conn.Begin()
 	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	var pos int
+	if err := tx.QueryRow("SELECT COALESCE(MAX(position),0)+1 FROM playlist_items WHERE playlist_id=?", playlistID).Scan(&pos); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("get next position: %w", err)
+	}
+	res, err := tx.Exec("INSERT INTO playlist_items(playlist_id,audio_id,position) VALUES(?,?,?)", playlistID, audioID, pos)
+	if err != nil {
+		tx.Rollback()
 		return nil, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
 	id, _ := res.LastInsertId()
-	return &PlaylistItem{ID: id, PlaylistID: playlistID, AudioID: audioID, Position: position}, nil
+	return &PlaylistItem{ID: id, PlaylistID: playlistID, AudioID: audioID, Position: pos}, nil
 }
 
 func (d *DB) RemovePlaylistItem(playlistID, itemID int64) error {
@@ -654,4 +856,19 @@ func (d *DB) ReorderPlaylistItems(playlistID int64, itemIDs []int64) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func (d *DB) GetUserSettings(userID int64) (string, error) {
+	var s string
+	err := d.conn.QueryRow("SELECT settings_json FROM user_settings WHERE user_id=?", userID).Scan(&s)
+	if err != nil {
+		return "{}", nil
+	}
+	return s, nil
+}
+
+func (d *DB) SaveUserSettings(userID int64, settingsJSON string) error {
+	_, err := d.conn.Exec(`INSERT INTO user_settings(user_id, settings_json, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(user_id) DO UPDATE SET settings_json=excluded.settings_json, updated_at=CURRENT_TIMESTAMP`, userID, settingsJSON)
+	return err
 }

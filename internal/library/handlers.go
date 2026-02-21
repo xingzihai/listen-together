@@ -1,6 +1,7 @@
 package library
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,11 +11,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/xingzihai/listen-together/internal/audio"
 	"github.com/xingzihai/listen-together/internal/auth"
 	"github.com/xingzihai/listen-together/internal/db"
+	"github.com/xingzihai/listen-together/internal/room"
 )
 
 const maxUploadSize = 50 << 20 // 50MB
@@ -22,6 +25,7 @@ const maxUploadSize = 50 << 20 // 50MB
 type LibraryHandlers struct {
 	DB      *db.DB
 	DataDir string
+	Manager *room.Manager
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -41,6 +45,56 @@ func (h *LibraryHandlers) requireAdmin(r *http.Request) *auth.UserInfo {
 		return nil
 	}
 	return u
+}
+
+// isAudioMagic checks file header bytes against known audio format signatures
+func isAudioMagic(buf []byte) bool {
+	if len(buf) < 4 {
+		return false
+	}
+	// ID3 tag (MP3 with metadata)
+	if buf[0] == 0x49 && buf[1] == 0x44 && buf[2] == 0x33 {
+		return true
+	}
+	// MP3 frame sync: 11 bits set + valid MPEG version + valid layer
+	if buf[0] == 0xFF && (buf[1]&0xE0) == 0xE0 {
+		version := (buf[1] >> 3) & 0x03
+		layer := (buf[1] >> 1) & 0x03
+		if version != 0x01 && layer != 0x00 {
+			return true
+		}
+	}
+	// FLAC: "fLaC"
+	if buf[0] == 0x66 && buf[1] == 0x4C && buf[2] == 0x61 && buf[3] == 0x43 {
+		return true
+	}
+	// OGG: "OggS" (covers .ogg, .opus)
+	if buf[0] == 0x4F && buf[1] == 0x67 && buf[2] == 0x67 && buf[3] == 0x53 {
+		return true
+	}
+	// WAV: RIFF....WAVE
+	if len(buf) >= 12 && buf[0] == 0x52 && buf[1] == 0x49 && buf[2] == 0x46 && buf[3] == 0x46 &&
+		buf[8] == 0x57 && buf[9] == 0x41 && buf[10] == 0x56 && buf[11] == 0x45 {
+		return true
+	}
+	// AIFF: FORM....AIFF or FORM....AIFC
+	if len(buf) >= 12 && buf[0] == 0x46 && buf[1] == 0x4F && buf[2] == 0x52 && buf[3] == 0x4D &&
+		buf[8] == 0x41 && buf[9] == 0x49 && buf[10] == 0x46 && (buf[11] == 0x46 || buf[11] == 0x43) {
+		return true
+	}
+	// M4A/AAC in MP4 container: "ftyp" at offset 4
+	if len(buf) >= 8 && buf[4] == 0x66 && buf[5] == 0x74 && buf[6] == 0x79 && buf[7] == 0x70 {
+		return true
+	}
+	// APE: "MAC " (Monkey's Audio)
+	if buf[0] == 0x4D && buf[1] == 0x41 && buf[2] == 0x43 && buf[3] == 0x20 {
+		return true
+	}
+	// WMA: ASF header GUID (30 26 B2 75 8E 66 CF 11)
+	if len(buf) >= 8 && buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xB2 && buf[3] == 0x75 {
+		return true
+	}
+	return false
 }
 
 func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +121,34 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	ext := filepath.Ext(header.Filename)
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+
+	// Extension whitelist
+	allowedExts := map[string]bool{
+		".mp3": true, ".flac": true, ".wav": true, ".m4a": true, ".ogg": true,
+		".aac": true, ".wma": true, ".opus": true, ".ape": true, ".aif": true, ".aiff": true,
+	}
+	if !allowedExts[ext] {
+		jsonError(w, "不支持的文件格式", 400)
+		return
+	}
+
+	// Magic bytes validation (real check, not just http.DetectContentType)
+	buf := make([]byte, 512)
+	n, err := file.Read(buf)
+	if err != nil && err != io.EOF {
+		jsonError(w, "读取文件失败", 400)
+		return
+	}
+	if !isAudioMagic(buf[:n]) {
+		jsonError(w, "文件内容与音频格式不匹配", 400)
+		return
+	}
+	// Seek back to start after reading magic bytes
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		jsonError(w, "读取文件失败", 400)
+		return
+	}
 	audioID := uuid.New().String()
 	userDir := filepath.Join(h.DataDir, "library", strconv.FormatInt(user.UserID, 10))
 	audioDir := filepath.Join(userDir, audioID)
@@ -101,8 +182,49 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 
 	title := strings.TrimSuffix(header.Filename, ext)
 	artist := r.FormValue("artist")
+	album := ""
+	genre := ""
+	year := ""
+	lyrics := ""
 
-	af, err := h.DB.AddAudioFile(user.UserID, audioID, header.Filename, title, artist, manifest.Duration, written, probe.Format, probe.Bitrate, string(qualitiesJSON))
+	// Extract metadata from audio file tags
+	meta, err := audio.ExtractMetadata(storedPath)
+	if err == nil {
+		if meta.Title != "" {
+			title = meta.Title
+		}
+		if meta.Artist != "" {
+			artist = meta.Artist
+		}
+		if meta.Album != "" {
+			album = meta.Album
+		}
+		if meta.Genre != "" {
+			genre = meta.Genre
+		}
+		if meta.Year != "" {
+			year = meta.Year
+		}
+		if meta.Lyrics != "" {
+			lyrics = meta.Lyrics
+		}
+	}
+
+	// If no lyrics from format tags, try stream tags
+	if lyrics == "" {
+		if lrc, err := audio.ExtractLyrics(storedPath); err == nil && lrc != "" {
+			lyrics = lrc
+		}
+	}
+
+	// Extract cover art
+	coverArt := ""
+	coverPath := filepath.Join(audioDir, "cover.jpg")
+	if err := audio.ExtractCoverArt(storedPath, coverPath); err == nil {
+		coverArt = "cover.jpg"
+	}
+
+	af, err := h.DB.AddAudioFile(user.UserID, audioID, header.Filename, title, artist, album, genre, year, lyrics, manifest.Duration, written, probe.Format, probe.Bitrate, string(qualitiesJSON), coverArt)
 	if err != nil {
 		os.RemoveAll(audioDir)
 		jsonError(w, "保存记录失败", 500)
@@ -112,7 +234,9 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func getDuration(path string) float64 {
-	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1", path)
 	out, err := cmd.Output()
 	if err != nil {
@@ -184,7 +308,7 @@ func (h *LibraryHandlers) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	diskPath := filepath.Join(h.DataDir, "library", strconv.FormatInt(user.UserID, 10), af.Filename)
+	diskPath := filepath.Join(h.DataDir, "library", strconv.FormatInt(af.OwnerID, 10), af.Filename)
 	os.RemoveAll(diskPath)
 
 	jsonOK(w, map[string]string{"message": "ok"})
@@ -314,11 +438,16 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 	}
 	quality := parts[2]
 
-	// Any logged-in user can access segments (needed for room playback sync)
-
 	af, err := h.DB.GetAudioFileByID(id)
 	if err != nil {
 		jsonError(w, "not found", 404)
+		return
+	}
+
+	// Access control: owner, shared, or in a room playing this audio
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, id)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, id)) {
+		jsonError(w, "forbidden", 403)
 		return
 	}
 
@@ -351,6 +480,13 @@ func (h *LibraryHandlers) GetSegments(w http.ResponseWriter, r *http.Request) {
 		"segment_time": manifest.SegmentTime,
 		"owner_id":     af.OwnerID,
 		"audio_uuid":   af.Filename,
+		"title":        af.Title,
+		"artist":       af.Artist,
+		"album":        af.Album,
+		"genre":        af.Genre,
+		"year":         af.Year,
+		"lyrics":       af.Lyrics,
+		"cover_art":    af.CoverArt,
 	})
 }
 
@@ -392,14 +528,137 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	filePath := filepath.Join(h.DataDir, "library", userID, audioID, "segments_"+quality, filename)
+	// Access control: look up audio file by UUID, verify permission
+	af, err := h.DB.GetAudioFileByUUID(audioID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Use DB owner ID for path, not URL parameter (prevent path manipulation)
+	ownerIDStr := strconv.FormatInt(af.OwnerID, 10)
+	filePath := filepath.Join(h.DataDir, "library", ownerIDStr, audioID, "segments_"+quality, filename)
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
 	if quality == "lossless" {
 		w.Header().Set("Content-Type", "audio/flac")
+	} else if strings.HasSuffix(filename, ".webm") {
+		w.Header().Set("Content-Type", "audio/webm")
 	} else {
 		w.Header().Set("Content-Type", "audio/mp4")
 	}
 	http.ServeFile(w, r, filePath)
+}
+
+// ServeCoverArt serves cover art for an audio file.
+// GET /api/library/cover/{userID}/{audioUUID}/cover.jpg
+func (h *LibraryHandlers) ServeCoverArt(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r)
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Parse: /api/library/cover/{userID}/{audioUUID}/cover.jpg
+	path := strings.TrimPrefix(r.URL.Path, "/api/library/cover/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 3 {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Sanitize path components
+	userID := filepath.Base(parts[0])
+	audioUUID := filepath.Base(parts[1])
+	filename := filepath.Base(parts[2])
+
+	// Prevent path traversal
+	for _, comp := range []string{userID, audioUUID, filename} {
+		if strings.Contains(comp, "..") || strings.Contains(comp, "/") || strings.Contains(comp, "\\") {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if filename != "cover.jpg" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Access control: look up audio file by UUID, verify permission
+	af, err := h.DB.GetAudioFileByUUID(audioUUID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Check if cover art exists
+	if af.CoverArt == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Use DB owner ID for path, not URL parameter
+	ownerIDStr := strconv.FormatInt(af.OwnerID, 10)
+	filePath := filepath.Join(h.DataDir, "library", ownerIDStr, audioUUID, "cover.jpg")
+
+	// Verify file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	w.Header().Set("Content-Type", "image/jpeg")
+	http.ServeFile(w, r, filePath)
+}
+
+// GetLyrics returns plain text lyrics for an audio file.
+// GET /api/library/lyrics/{userID}/{audioUUID}
+func (h *LibraryHandlers) GetLyrics(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r)
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/library/lyrics/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	audioUUID := filepath.Base(parts[1])
+	if strings.Contains(audioUUID, "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	af, err := h.DB.GetAudioFileByUUID(audioUUID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
+	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(af.Lyrics))
 }
 
 func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
@@ -412,6 +671,8 @@ func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/library/upload", wrap(h.Upload))
 	mux.HandleFunc("/api/library/files", wrap(h.ListFiles))
 	mux.HandleFunc("/api/library/segments/", wrap(h.ServeSegmentFile))
+	mux.HandleFunc("/api/library/cover/", wrap(h.ServeCoverArt))
+	mux.HandleFunc("/api/library/lyrics/", wrap(h.GetLyrics))
 	mux.HandleFunc("/api/library/files/", wrap(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.Contains(path, "/segments/") {
@@ -440,7 +701,23 @@ func (h *LibraryHandlers) RegisterRoutes(mux *http.ServeMux) {
 type PlaylistHandlers struct {
 	DB      *db.DB
 	DataDir string
+	Manager *room.Manager
 	OnPlaylistUpdate func(roomCode string)
+}
+
+// isRoomOwner checks if the user is the owner of the room with the given code.
+// Returns true if the room exists and the user is its owner.
+func (h *PlaylistHandlers) isRoomOwner(userID int64, code string) bool {
+	if h.Manager == nil {
+		return true // fallback: no manager means no check (shouldn't happen)
+	}
+	rm := h.Manager.GetRoom(code)
+	if rm == nil {
+		return false
+	}
+	rm.Mu.RLock()
+	defer rm.Mu.RUnlock()
+	return rm.OwnerID == userID
 }
 
 func (h *PlaylistHandlers) GetOrCreatePlaylist(w http.ResponseWriter, r *http.Request) {
@@ -457,14 +734,11 @@ func (h *PlaylistHandlers) GetOrCreatePlaylist(w http.ResponseWriter, r *http.Re
 	}
 
 	if r.Method == http.MethodPost {
-		// Create or get
-		pl, err := h.DB.GetPlaylistByRoom(code)
+		// Create or get (atomic: INSERT OR IGNORE + SELECT)
+		pl, err := h.DB.GetOrCreatePlaylist(code, user.UserID)
 		if err != nil {
-			pl, err = h.DB.CreatePlaylist(code, user.UserID)
-			if err != nil {
-				jsonError(w, "创建播放列表失败", 500)
-				return
-			}
+			jsonError(w, "创建播放列表失败", 500)
+			return
 		}
 		items, _ := h.DB.GetPlaylistItems(pl.ID)
 		if items == nil {
@@ -504,6 +778,12 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 
 	code := extractRoomCodeFromAdd(r.URL.Path)
 
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
+
 	var req struct {
 		AudioID int64 `json:"audio_id"`
 	}
@@ -519,16 +799,11 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pl, err := h.DB.GetPlaylistByRoom(code)
+	pl, err := h.DB.GetOrCreatePlaylist(code, user.UserID)
 	if err != nil {
-		pl, err = h.DB.CreatePlaylist(code, user.UserID)
-		if err != nil {
-			jsonError(w, "创建播放列表失败", 500)
-			return
-		}
+		jsonError(w, "创建播放列表失败", 500)
+		return
 	}
-
-	pos, _ := h.DB.GetNextPlaylistPosition(pl.ID)
 
 	af, err := h.DB.GetAudioFileByID(req.AudioID)
 	if err != nil {
@@ -536,7 +811,7 @@ func (h *PlaylistHandlers) AddItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := h.DB.AddPlaylistItem(pl.ID, req.AudioID, pos)
+	item, err := h.DB.AddPlaylistItem(pl.ID, req.AudioID, 0)
 	if err != nil {
 		jsonError(w, "添加失败", 500)
 		return
@@ -572,6 +847,13 @@ func (h *PlaylistHandlers) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
+
 	itemID, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		jsonError(w, "invalid item id", 400)
@@ -610,6 +892,12 @@ func (h *PlaylistHandlers) UpdateMode(w http.ResponseWriter, r *http.Request) {
 	// Path: /api/room/{code}/playlist/mode
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/room/"), "/")
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
 
 	var req struct {
 		Mode string `json:"mode"`
@@ -654,6 +942,12 @@ func (h *PlaylistHandlers) Reorder(w http.ResponseWriter, r *http.Request) {
 
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/room/"), "/")
 	code := parts[0]
+
+	// Only room owner can modify playlist
+	if !h.isRoomOwner(user.UserID, code) {
+		jsonError(w, "只有房主可以操作播放列表", 403)
+		return
+	}
 
 	var req struct {
 		Items []int64 `json:"items"`

@@ -1,9 +1,69 @@
 const $ = id => document.getElementById(id);
 let ws, roomCode, isHost = false, audioInfo = null, pausedPosition = 0;
+let reconnectAttempts = 0, reconnectDelay = 3000;
+const MAX_RECONNECT_ATTEMPTS = 10, MAX_RECONNECT_DELAY = 60000;
 let roomUsers = [], myClientID = null;
 let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
 let trackLoading = false, pendingPlay = null;
+let trackChangeGen = 0;
 let deviceKicked = false;
+
+// --- Cover Art ---
+function updateCoverArt(ownerID, audioUUID) {
+    const img = $('coverImage');
+    const placeholder = $('coverPlaceholder');
+    if (!img || !placeholder) return;
+    if (!ownerID || !audioUUID) {
+        img.style.display = 'none';
+        placeholder.style.display = 'flex';
+        // Also update bar cover
+        const barImg = $('barCoverImage');
+        const barPh = $('barCoverPlaceholder');
+        if (barImg) barImg.style.display = 'none';
+        if (barPh) barPh.style.display = 'flex';
+        return;
+    }
+    const url = `/api/library/cover/${ownerID}/${audioUUID}/cover.jpg`;
+    img.onload = () => { img.style.display = 'block'; placeholder.style.display = 'none'; };
+    img.onerror = () => { img.style.display = 'none'; placeholder.style.display = 'flex'; };
+    img.src = url;
+    // Also update bar cover
+    const barImg = $('barCoverImage');
+    const barPh = $('barCoverPlaceholder');
+    if (barImg) {
+        barImg.onload = () => { barImg.style.display = 'block'; if (barPh) barPh.style.display = 'none'; };
+        barImg.onerror = () => { barImg.style.display = 'none'; if (barPh) barPh.style.display = 'flex'; };
+        barImg.src = url;
+    }
+}
+
+function updateTrackMeta(item) {
+    const titleEl = $('trackTitle');
+    const artistEl = $('trackArtist');
+    if (titleEl) titleEl.textContent = item.title || item.original_name || '未知歌曲';
+    if (artistEl) artistEl.textContent = item.artist || '';
+    // Also update bar track info
+    const barTitle = $('barTrackTitle');
+    const barArtist = $('barTrackArtist');
+    if (barTitle) barTitle.textContent = item.title || item.original_name || '未知歌曲';
+    if (barArtist) barArtist.textContent = item.artist || '';
+}
+
+function updatePrevNextButtons() {
+    const prev = $('prevTrackBtn');
+    const next = $('nextTrackBtn');
+    if (!prev || !next) return;
+    const hasPlaylist = playlistItems && playlistItems.length > 0;
+    prev.disabled = !(isHost && hasPlaylist && playlistItems.length > 1);
+    next.disabled = !(isHost && hasPlaylist && playlistItems.length > 1);
+}
+
+// Unified fetch wrapper: auto-handles 401 (session expired)
+async function authFetch(url, opts = {}) {
+    const res = await fetch(url, { ...opts, credentials: 'include' });
+    if (res.status === 401) { sessionExpired(); }
+    return res;
+}
 
 function escapeHtml(text) {
     const div = document.createElement('div');
@@ -45,6 +105,9 @@ function renderAvatarBar() {
 function showScreen(id) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     $(id).classList.add('active');
+    // Show/hide bottom player bar when in room
+    const bar = $('bottomBar');
+    if (bar) { if (id === 'room') bar.classList.remove('hidden'); else bar.classList.add('hidden'); }
 }
 
 function formatTime(s) {
@@ -56,20 +119,33 @@ function formatTime(s) {
 function connect(onOpen) {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
-    ws.onopen = () => { console.log('WS connected'); if (onOpen) onOpen(); };
+    ws.onopen = () => { console.log('WS connected'); reconnectAttempts = 0; reconnectDelay = 3000; if (onOpen) onOpen(); };
     ws.onmessage = e => handleMessage(JSON.parse(e.data));
     ws.onclose = (ev) => {
         if (deviceKicked) return;
-        // 1006 = abnormal close (server rejected, e.g. 401)
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            $('syncStatus').textContent = '连接已断开，请刷新页面重试';
+            console.warn('WS max reconnect attempts reached');
+            return;
+        }
+        reconnectAttempts++;
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+        console.log(`WS closed, reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms`);
         // Check if session is still valid before reconnecting
         fetch('/api/auth/me', {credentials:'include'}).then(r => {
             if (!r.ok) {
-                // JWT invalid — kicked by new login on another device
                 sessionExpired();
             } else {
-                setTimeout(() => connect(), 3000);
+                setTimeout(() => connect(() => {
+                    if (roomCode) {
+                        ws.send(JSON.stringify({ type: 'join', roomCode }));
+                    }
+                }), delay);
             }
-        }).catch(() => setTimeout(() => connect(), 3000));
+        }).catch(() => setTimeout(() => connect(() => {
+            if (roomCode) ws.send(JSON.stringify({ type: 'join', roomCode }));
+        }), delay));
     };
     ws.onerror = e => console.error('WS error', e);
 }
@@ -96,6 +172,9 @@ async function handleMessage(msg) {
             playlist = null; playlistItems = []; currentTrackIndex = -1;
             trackLoading = false; pendingPlay = null;
             $('trackName').textContent = '未选择歌曲';
+            if ($('trackTitle')) $('trackTitle').textContent = '未选择歌曲';
+            if ($('trackArtist')) $('trackArtist').textContent = '';
+            updateCoverArt(null, null);
             $('currentTime').textContent = '0:00';
             $('totalTime').textContent = '0:00';
             $('progressBar').value = 0; $('progressBar').max = 0;
@@ -131,7 +210,7 @@ async function handleMessage(msg) {
         case 'play':
             // If play carries trackAudio and we don't have audio loaded, load it first
             if (msg.trackAudio && !audioInfo) {
-                await handleTrackChange(msg);
+                await handleTrackChange(msg, true); // join restore, don't re-broadcast play
                 if (!pendingPlay) await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
             } else {
                 await doPlay(msg.position, msg.serverTime, msg.scheduledAt);
@@ -180,8 +259,8 @@ async function handleMessage(msg) {
             if (window.audioPlayer.isPlaying && msg.position != null) {
                 window.audioPlayer.serverPlayTime = msg.serverTime;
                 window.audioPlayer.serverPlayPosition = msg.position;
-                // Immediate drift check after anchor update
-                const drift = window.audioPlayer.correctDrift();
+                // Immediate drift check after anchor update (skip debounce)
+                const drift = window.audioPlayer.correctDrift(true);
                 if (drift) console.log('syncTick drift corrected:', drift, 'ms');
             }
             break;
@@ -267,11 +346,23 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
-    driftInterval = setInterval(() => { // every 1s
+    // Aggressive initial sync: check every 200ms for first 5s, then every 1s
+    let driftChecks = 0;
+    const driftCheck = () => {
         if (!window.audioPlayer.isPlaying) return;
         const drift = window.audioPlayer.correctDrift();
         if (drift) console.log('Drift corrected:', drift, 'ms');
-    }, 1000);
+        driftChecks++;
+    };
+    // Fast phase: 200ms interval for first 25 checks (~5s)
+    driftInterval = setInterval(() => {
+        driftCheck();
+        if (driftChecks >= 25 && driftInterval) {
+            clearInterval(driftInterval);
+            // Switch to steady-state 1s interval
+            driftInterval = setInterval(driftCheck, 1000);
+        }
+    }, 200);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
@@ -361,6 +452,20 @@ $('progressBar').onchange = e => {
 
 $('volumeSlider').oninput = e => window.audioPlayer.setVolume(e.target.value / 100);
 
+// Prev/Next track buttons
+$('prevTrackBtn').onclick = () => {
+    if (!isHost || !playlistItems || playlistItems.length < 2) return;
+    let idx = currentTrackIndex - 1;
+    if (idx < 0) idx = playlistItems.length - 1;
+    ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
+};
+$('nextTrackBtn').onclick = () => {
+    if (!isHost || !playlistItems || playlistItems.length < 2) return;
+    let idx = currentTrackIndex + 1;
+    if (idx >= playlistItems.length) idx = 0;
+    ws.send(JSON.stringify({ type: 'nextTrack', trackIndex: idx }));
+};
+
 $('audiencePanelClose').onclick = () => $('audiencePanel').classList.add('hidden');
 $('copyInviteLink').onclick = () => {
     const link = location.origin + '/#' + roomCode;
@@ -374,7 +479,7 @@ $('copyInviteLink').onclick = () => {
 async function loadPlaylist() {
     if (!roomCode) return;
     try {
-        const res = await fetch(`/api/room/${roomCode}/playlist`, { method: 'POST', credentials:'include' });
+        const res = await authFetch(`/api/room/${roomCode}/playlist`, { method: 'POST' });
         const data = await res.json();
         playlist = data.playlist;
         playlistItems = data.items || [];
@@ -395,13 +500,14 @@ function renderPlaylist() {
     container.innerHTML = playlistItems.map((item, i) => {
         const active = i === currentTrackIndex ? ' active' : '';
         const delBtn = isHost ? `<button class="pi-del" data-id="${item.id}">✕</button>` : '';
-        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-info"><div class="pi-title">${escapeHtml(item.title || item.original_name)}</div><div class="pi-meta">${escapeHtml(item.artist || '')} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
+        const coverUrl = `/api/library/cover/${item.owner_id}/${item.audio_uuid || item.filename}/cover.jpg`;
+        return `<div class="playlist-item${active}" data-idx="${i}"><div class="pi-cover"><img src="${coverUrl}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" alt=""><div class="pi-cover-placeholder" style="display:none">♪</div></div><div class="pi-info"><div class="pi-title">${escapeHtml(item.title || item.original_name)}</div><div class="pi-meta">${escapeHtml(item.artist || '')} · ${formatTime(item.duration)}</div></div>${delBtn}</div>`;
     }).join('');
     container.querySelectorAll('.pi-del').forEach(btn => {
         btn.onclick = async (e) => {
             e.stopPropagation();
             const id = btn.dataset.id;
-            await fetch(`/api/room/${roomCode}/playlist/${id}`, { method: 'DELETE', credentials:'include' });
+            await authFetch(`/api/room/${roomCode}/playlist/${id}`, { method: 'DELETE' });
         };
     });
     container.querySelectorAll('.playlist-item').forEach(el => {
@@ -412,6 +518,7 @@ function renderPlaylist() {
         };
     });
     updatePlayModeBtn();
+    updatePrevNextButtons();
 }
 
 function updatePlayModeBtn() {
@@ -425,19 +532,21 @@ $('playModeBtn').onclick = async () => {
     if (!isHost || !roomCode) return;
     const modes = ['sequential', 'shuffle', 'repeat_one'];
     const next = modes[(modes.indexOf(playMode) + 1) % modes.length];
-    await fetch(`/api/room/${roomCode}/playlist/mode`, {
+    await authFetch(`/api/room/${roomCode}/playlist/mode`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: next }),
-        credentials: 'include'
+        body: JSON.stringify({ mode: next })
     });
     playMode = next;
     updatePlayModeBtn();
 };
 
 // handleTrackChange: server sends full audio metadata via trackChange
-async function handleTrackChange(msg) {
+async function handleTrackChange(msg, isJoinRestore) {
     const ta = msg.trackAudio;
     if (!ta) return;
+
+    // Increment generation counter to invalidate any in-flight async from previous calls
+    const gen = ++trackChangeGen;
 
     // Stop current playback
     if (window.audioPlayer) window.audioPlayer.stop();
@@ -446,6 +555,11 @@ async function handleTrackChange(msg) {
     trackLoading = true;
     currentTrackIndex = msg.trackIndex;
     renderPlaylist();
+    updatePrevNextButtons();
+
+    // Update cover art and metadata from trackAudio
+    updateCoverArt(ta.owner_id, ta.audio_uuid);
+    updateTrackMeta(ta);
 
     const qualities = ta.qualities || [];
     const preferredQ = localStorage.getItem('lt_quality') || 'medium';
@@ -455,9 +569,11 @@ async function handleTrackChange(msg) {
         : (qualities[qualities.length - 1] || 'medium');
 
     try {
-        const res = await fetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`, {credentials:'include'});
+        const res = await authFetch(`/api/library/files/${ta.audio_id}/segments/${initialQ}/`);
+        if (gen !== trackChangeGen) return; // stale — newer track change in progress
         if (!res.ok) throw new Error('segments fetch failed: ' + res.status);
         const data = await res.json();
+        if (gen !== trackChangeGen) return; // stale
         audioInfo = {
             filename: ta.filename,
             duration: data.duration || ta.duration,
@@ -471,6 +587,7 @@ async function handleTrackChange(msg) {
         };
         window.audioPlayer._trackSegBase = null;
         await setupAudio();
+        if (gen !== trackChangeGen) return; // stale
         updateQualitySelector();
         trackLoading = false;
 
@@ -478,8 +595,8 @@ async function handleTrackChange(msg) {
         if (pendingPlay) {
             const pp = pendingPlay; pendingPlay = null;
             await doPlay(pp.position, pp.serverTime, pp.scheduledAt);
-        } else if (isHost && ws) {
-            // Host: track loaded, send play to server to coordinate all clients
+        } else if (isHost && ws && !isJoinRestore) {
+            // Host: track loaded, send play to server (only for active track change, not join restore)
             ws.send(JSON.stringify({ type: 'play', position: 0 }));
         }
 
@@ -488,8 +605,10 @@ async function handleTrackChange(msg) {
         //     window.audioPlayer._upgradeQuality(preferredQ);
         // }
     } catch (e) {
+        if (gen !== trackChangeGen) return; // stale, don't touch state
         console.error('handleTrackChange:', e);
         trackLoading = false;
+        pendingPlay = null;
     }
 }
 
@@ -554,7 +673,7 @@ $('addFromLibBtn').onclick = async () => {
     list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted)">加载中...</div>';
     empty.style.display = 'none';
     try {
-        const res = await fetch('/api/library/files?accessible=true', {credentials:'include'});
+        const res = await authFetch('/api/library/files?accessible=true');
         const files = await res.json();
         if (!files || !files.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
         list.innerHTML = files.map(f => `<div class="library-item"><div class="li-info"><div class="li-title">${escapeHtml(f.title)}</div><div class="li-meta">${escapeHtml(f.artist || '')} · ${formatTime(f.duration)}${f.owner_name ? ' · ' + escapeHtml(f.owner_name) : ''}</div></div><button class="btn-add" data-id="${f.id}">添加</button></div>`).join('');
@@ -562,10 +681,9 @@ $('addFromLibBtn').onclick = async () => {
             btn.onclick = async () => {
                 btn.disabled = true; btn.textContent = '...';
                 try {
-                    await fetch(`/api/room/${roomCode}/playlist/add`, {
+                    await authFetch(`/api/room/${roomCode}/playlist/add`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ audio_id: parseInt(btn.dataset.id) }),
-                        credentials: 'include'
+                        body: JSON.stringify({ audio_id: parseInt(btn.dataset.id) })
                     });
                     btn.textContent = '✓';
                 } catch { btn.textContent = '✗'; }
@@ -581,7 +699,8 @@ document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && window.clockSync && window.audioPlayer.isPlaying) {
         console.log('[sync] page visible, triggering burst re-sync');
         window.clockSync.burst();
-        // Wait 500ms for offset to converge, then correct drift
+        // Immediately catch up on segment scheduling that was throttled in background
+        if (window.audioPlayer._scheduleAhead) window.audioPlayer._scheduleAhead();
         setTimeout(() => {
             if (window.audioPlayer.isPlaying) {
                 const drift = window.audioPlayer.correctDrift();

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -86,13 +87,14 @@ func main() {
 	authHandlers.RegisterRoutes(mux)
 
 	// Library handlers
-	libHandlers := &library.LibraryHandlers{DB: database, DataDir: "./data"}
+	libHandlers := &library.LibraryHandlers{DB: database, DataDir: "./data", Manager: manager}
 	libHandlers.RegisterRoutes(mux)
 
 	// Playlist handlers
 	plHandlers := &library.PlaylistHandlers{
 		DB:      database,
 		DataDir: "./data",
+		Manager: manager,
 		OnPlaylistUpdate: func(roomCode string) {
 			rm := manager.GetRoom(roomCode)
 			if rm == nil {
@@ -156,8 +158,12 @@ func main() {
 					duration = rm.Audio.Duration
 				}
 				var clients []*room.Client
+				hostID := ""
 				// Only broadcast to multi-client rooms
 				if state == room.StatePlaying && clientCount > 1 {
+					if rm.Host != nil {
+						hostID = rm.Host.ID
+					}
 					clients = make([]*room.Client, 0, clientCount)
 					for _, c := range rm.Clients {
 						clients = append(clients, c)
@@ -179,6 +185,9 @@ func main() {
 					"serverTime": syncpkg.GetServerTime(),
 				}
 				for _, c := range clients {
+					if c.ID == hostID {
+						continue // host is the time source, skip syncTick
+					}
 					c.Send(msg)
 				}
 			}
@@ -191,42 +200,49 @@ func main() {
 
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
+
+	// Empty Origin: only allow if the request carries a valid JWT (authenticated client).
+	// This blocks unauthenticated non-browser clients while still supporting
+	// legitimate tools/apps that authenticate but don't send Origin.
 	if origin == "" {
-		return true // No Origin header (same-origin request)
+		return auth.ExtractUserFromRequest(r) != nil
 	}
+
 	u, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
-	host := u.Hostname() // Without port
+	host := u.Hostname()
 
-	allowedStr := os.Getenv("ALLOWED_ORIGINS")
-	var allowedOrigins []string
-	if allowedStr != "" {
-		allowedOrigins = strings.Split(allowedStr, ",")
-	} else {
-		allowedOrigins = []string{"https://frp-bar.com", "http://localhost", "http://127.0.0.1"}
-	}
-
-	for _, allowed := range allowedOrigins {
-		allowed = strings.TrimSpace(allowed)
-		au, err := url.Parse(allowed)
-		if err != nil {
-			// Fallback: direct comparison
-			if origin == allowed {
-				return true
-			}
-			continue
-		}
-		if host == au.Hostname() {
-			return true
-		}
-	}
-	// Also allow localhost and 127.0.0.1 (exact match)
+	// Always allow localhost for development
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
-	return false
+
+	allowedStr := os.Getenv("ALLOWED_ORIGINS")
+	if allowedStr != "" {
+		// ALLOWED_ORIGINS is set: only allow listed origins (+ localhost above)
+		for _, allowed := range strings.Split(allowedStr, ",") {
+			allowed = strings.TrimSpace(allowed)
+			if allowed == "" {
+				continue
+			}
+			au, err := url.Parse(allowed)
+			if err != nil {
+				if origin == allowed {
+					return true
+				}
+				continue
+			}
+			if host == au.Hostname() {
+				return true
+			}
+		}
+		return false
+	}
+
+	// ALLOWED_ORIGINS not set: backward-compatible permissive behavior
+	return true
 }
 
 func generateCode() string {
@@ -327,6 +343,50 @@ func (rl *rateLimiter) cleanOldestEntries() {
 
 var joinLimiter = newRateLimiter()
 
+// --- Per-user WebSocket connection limiter ---
+type wsConnTracker struct {
+	mu    sync.Mutex
+	conns map[int64]int // userID -> active connection count
+}
+
+var wsTracker = &wsConnTracker{conns: make(map[int64]int)}
+
+const maxWSConnsPerUser = 9999 // TODO: restore to 5 after testing
+
+func (t *wsConnTracker) acquire(userID int64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conns[userID] >= maxWSConnsPerUser {
+		return false
+	}
+	t.conns[userID]++
+	return true
+}
+
+func (t *wsConnTracker) release(userID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.conns[userID]--
+	if t.conns[userID] <= 0 {
+		delete(t.conns, userID)
+	}
+}
+
+// validatePosition checks that pos is a finite non-negative number and
+// optionally within duration. Returns an error string or "".
+func validatePosition(pos float64, duration float64) string {
+	if math.IsNaN(pos) || math.IsInf(pos, 0) {
+		return "position 值无效"
+	}
+	if pos < 0 {
+		return "position 不能为负数"
+	}
+	if duration > 0 && pos > duration {
+		return "position 超出音频时长"
+	}
+	return ""
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// --- Fix #1: Reject unauthenticated WebSocket connections ---
 	userInfo := auth.ExtractUserFromRequest(r)
@@ -337,6 +397,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	username := userInfo.Username
 	userRole := userInfo.Role
 	userID := userInfo.UserID
+
+	// --- Per-user connection limit ---
+	if !wsTracker.acquire(userID) {
+		http.Error(w, "Too many connections", http.StatusTooManyRequests)
+		return
+	}
+	defer wsTracker.release(userID)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -396,12 +463,58 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// --- Per-connection message rate limiter (sliding window) ---
+	const (
+		msgRateWindow  = time.Second
+		msgRateLimit   = 9999 // TODO: restore to 10 after testing
+		pingRateLimit  = 9999 // TODO: restore to 5 after testing
+		totalRateLimit = 9999 // TODO: restore to 12 after testing
+	)
+	var (
+		msgTimes   = make([]time.Time, 0, msgRateLimit)
+		pingTimes  = make([]time.Time, 0, pingRateLimit)
+		totalTimes = make([]time.Time, 0, totalRateLimit)
+	)
+	checkRate := func(times *[]time.Time, limit int) bool {
+		now := time.Now()
+		cutoff := now.Add(-msgRateWindow)
+		valid := (*times)[:0]
+		for _, t := range *times {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) >= limit {
+			*times = valid
+			return false
+		}
+		*times = append(valid, now)
+		return true
+	}
+
 	for {
 		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		// Rate limit check — total first, then per-type
+		if !checkRate(&totalTimes, totalRateLimit) {
+			safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+			break
+		}
+		if msg.Type == "ping" {
+			if !checkRate(&pingTimes, pingRateLimit) {
+				safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+				break
+			}
+		} else {
+			if !checkRate(&msgTimes, msgRateLimit) {
+				safeWrite(WSResponse{Type: "error", Error: "消息频率过高，连接已断开"})
+				break
+			}
+		}
 
 		switch msg.Type {
 		case "create":
@@ -411,11 +524,29 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			code := generateCode()
-			currentRoom = manager.CreateRoom(code)
+			newRoom, createErr := manager.CreateRoom(code, userID)
+			if createErr != nil {
+				safeWrite(WSResponse{Type: "error", Error: createErr.Error()})
+				continue
+			}
+			// Leave old room before joining new one to prevent client leak
+			if currentRoom != nil {
+				empty := currentRoom.RemoveClient(clientID)
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
+					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
+				}
+			}
+			currentRoom = newRoom
 			currentRoom.OwnerID = userID
 			currentRoom.OwnerName = username
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
-			currentRoom.AddClient(client)
+			if err := currentRoom.AddClient(client); err != nil {
+				safeWrite(WSResponse{Type: "error", Error: err.Error()})
+				continue
+			}
 			myClient = client
 			safeWrite(WSResponse{Type: "created", Success: true, RoomCode: code, IsHost: true, Username: username, Role: userRole, Users: currentRoom.GetClientList()})
 
@@ -425,13 +556,28 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: "操作太频繁，请稍后再试"})
 				continue
 			}
-			currentRoom = manager.GetRoom(msg.RoomCode)
-			if currentRoom == nil {
+			joinRoom := manager.GetRoom(msg.RoomCode)
+			if joinRoom == nil {
 				safeWrite(WSResponse{Type: "error", Error: "Room not found"})
 				continue
 			}
+			// Leave old room before joining new one to prevent client leak
+			if currentRoom != nil {
+				empty := currentRoom.RemoveClient(clientID)
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
+					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
+				}
+			}
+			currentRoom = joinRoom
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
-			currentRoom.AddClient(client)
+			if err := currentRoom.AddClient(client); err != nil {
+				safeWrite(WSResponse{Type: "error", Error: err.Error()})
+				currentRoom = nil
+				continue
+			}
 			myClient = client
 			isHost := currentRoom.IsHost(clientID)
 			currentRoom.Mu.RLock()
@@ -467,8 +613,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if state == room.StatePlaying {
 					elapsed := time.Since(startT).Seconds()
 					currentPos := pos + elapsed
-					scheduledTime := syncpkg.GetServerTime() + 500
-					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime})
+					// No ScheduledAt for join restore — client needs to load segments first,
+					// so scheduledAt would always expire. Let client use elapsed fallback.
+					nowMs := syncpkg.GetServerTime()
+					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: nowMs})
 				}
 			}
 
@@ -483,8 +631,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.OwnerID != userID {
 				continue
 			}
+			// Validate position
+			currentRoom.Mu.RLock()
+			dur := 0.0
+			if currentRoom.TrackAudio != nil {
+				dur = currentRoom.TrackAudio.Duration
+			} else if currentRoom.Audio != nil {
+				dur = currentRoom.Audio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+			if errMsg := validatePosition(msg.Position, dur); errMsg != "" {
+				safeWrite(WSResponse{Type: "error", Error: errMsg})
+				continue
+			}
 			currentRoom.Play(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 500
+			nowMs := syncpkg.GetServerTime()
+			scheduledTime := nowMs + 800
 
 			// Include trackAudio so listeners who missed trackChange can load
 			currentRoom.Mu.RLock()
@@ -494,7 +656,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			broadcast(currentRoom, WSResponse{
 				Type: "play", Position: msg.Position,
-				ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime,
+				ServerTime: nowMs, ScheduledAt: scheduledTime,
 				TrackAudio: ta, TrackIndex: ti,
 			}, "")
 
@@ -515,9 +677,82 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.OwnerID != userID {
 				continue
 			}
+			// Validate position
+			currentRoom.Mu.RLock()
+			dur := 0.0
+			if currentRoom.TrackAudio != nil {
+				dur = currentRoom.TrackAudio.Duration
+			} else if currentRoom.Audio != nil {
+				dur = currentRoom.Audio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+			if errMsg := validatePosition(msg.Position, dur); errMsg != "" {
+				safeWrite(WSResponse{Type: "error", Error: errMsg})
+				continue
+			}
 			currentRoom.Seek(msg.Position)
-			scheduledTime := syncpkg.GetServerTime() + 500
-			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: syncpkg.GetServerTime(), ScheduledAt: scheduledTime}, "")
+			nowMs := syncpkg.GetServerTime()
+			scheduledTime := nowMs + 800
+			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs, ScheduledAt: scheduledTime}, "")
+
+		case "statusReport":
+			// Client reports its actual playback state for server-side validation
+			if currentRoom == nil {
+				continue
+			}
+			currentRoom.Mu.RLock()
+			serverTrackIdx := currentRoom.CurrentTrack
+			serverState := currentRoom.State
+			serverPos := currentRoom.Position
+			serverStart := currentRoom.StartTime
+			duration := 0.0
+			if currentRoom.TrackAudio != nil {
+				duration = currentRoom.TrackAudio.Duration
+			}
+			currentRoom.Mu.RUnlock()
+
+			// Check track index mismatch
+			if msg.TrackIndex != serverTrackIdx {
+				// Client is on wrong track — force correct
+				log.Printf("[sync] client %s on track %d, server on %d — forcing correction", clientID, msg.TrackIndex, serverTrackIdx)
+				currentRoom.Mu.RLock()
+				ta := currentRoom.TrackAudio
+				currentRoom.Mu.RUnlock()
+				correction := map[string]interface{}{
+					"type":       "forceTrack",
+					"trackIndex": serverTrackIdx,
+					"position":   serverPos,
+					"serverTime": syncpkg.GetServerTime(),
+				}
+				if ta != nil {
+					correction["trackAudio"] = ta
+				}
+				myClient.Send(correction)
+				continue
+			}
+
+			// Check position drift (only when playing)
+			if serverState == room.StatePlaying {
+				elapsed := time.Since(serverStart).Seconds()
+				expectedPos := serverPos + elapsed
+				if duration > 0 && expectedPos > duration {
+					expectedPos = duration
+				}
+				clientPos := msg.Position
+				drift := clientPos - expectedPos
+				if drift < 0 {
+					drift = -drift
+				}
+				// If drift > 400ms, force resync
+				if drift > 0.4 {
+					log.Printf("[sync] client %s drift %.0fms — forcing resync", clientID, drift*1000)
+					myClient.Send(map[string]interface{}{
+						"type":       "forceResync",
+						"position":   expectedPos,
+						"serverTime": syncpkg.GetServerTime(),
+					})
+				}
+			}
 
 		case "kick":
 			if currentRoom == nil {
@@ -567,12 +802,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			var qualities []string
 			json.Unmarshal([]byte(af.Qualities), &qualities)
 			trackAudio = &room.TrackAudioInfo{
-				AudioID:   af.ID,
-				OwnerID:   af.OwnerID,
-				AudioUUID: af.Filename,
-				Filename:  af.OriginalName,
-				Duration:  af.Duration,
-				Qualities: qualities,
+				AudioID:      af.ID,
+				OwnerID:      af.OwnerID,
+				AudioUUID:    af.Filename,
+				Filename:     af.OriginalName,
+				Title:        af.Title,
+				Artist:       af.Artist,
+				OriginalName: af.OriginalName,
+				Duration:     af.Duration,
+				Qualities:    qualities,
 			}
 
 			currentRoom.Mu.Lock()

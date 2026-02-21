@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	ffprobeTimeout = 30 * time.Second
+	ffmpegTimeout  = 5 * time.Minute
 )
 
 const (
@@ -53,9 +60,9 @@ type qualityDef struct {
 
 var allQualities = []qualityDef{
 	{Name: "lossless", DirSuffix: "segments_lossless", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
-	{Name: "high", DirSuffix: "segments_high", Codec: "aac", Bitrate: "256k", Ext: ".m4a", SegFormat: "mp4"},
-	{Name: "medium", DirSuffix: "segments_medium", Codec: "aac", Bitrate: "128k", Ext: ".m4a", SegFormat: "mp4"},
-	{Name: "low", DirSuffix: "segments_low", Codec: "aac", Bitrate: "64k", Ext: ".m4a", SegFormat: "mp4"},
+	{Name: "high", DirSuffix: "segments_high", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
+	{Name: "medium", DirSuffix: "segments_medium", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
+	{Name: "low", DirSuffix: "segments_low", Codec: "flac", Bitrate: "", Ext: ".flac", SegFormat: "flac"},
 }
 
 // ProbeResult holds ffprobe detection results.
@@ -77,7 +84,9 @@ func sanitizeInputPath(path string) string {
 func ProbeAudio(inputPath string) (*ProbeResult, error) {
 	inputPath = sanitizeInputPath(inputPath)
 	// Get bitrate
-	cmdBr := exec.Command("ffprobe", "-v", "error",
+	ctxBr, cancelBr := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelBr()
+	cmdBr := exec.CommandContext(ctxBr, "ffprobe", "-v", "error",
 		"-select_streams", "a:0",
 		"-show_entries", "format=bit_rate",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -91,7 +100,9 @@ func ProbeAudio(inputPath string) (*ProbeResult, error) {
 	}
 
 	// Get codec name
-	cmdCodec := exec.Command("ffprobe", "-v", "error",
+	ctxCodec, cancelCodec := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelCodec()
+	cmdCodec := exec.CommandContext(ctxCodec, "ffprobe", "-v", "error",
 		"-select_streams", "a:0",
 		"-show_entries", "stream=codec_name",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -141,25 +152,19 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	}
 	pattern := filepath.Join(dir, "seg_%03d"+q.Ext)
 
-	args := []string{"-i", inputPath, "-vn"}
-	if q.Codec == "flac" {
-		args = append(args, "-c:a", "flac")
-	} else {
-		args = append(args, "-c:a", "aac", "-b:a", q.Bitrate)
-	}
+	args := []string{"-i", inputPath, "-vn", "-c:a", "flac"}
 	args = append(args, "-f", "segment", "-segment_time", strconv.Itoa(SegmentDuration))
-	if q.SegFormat != "" {
-		args = append(args, "-segment_format", q.SegFormat)
-	}
+	args = append(args, "-segment_format", "flac")
 	args = append(args, "-y", pattern)
 
-	cmd := exec.Command("ffmpeg", args...)
+	ctxSeg, cancelSeg := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancelSeg()
+	cmd := exec.CommandContext(ctxSeg, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg (%s) failed: %w, output: %s", q.Name, err, string(out))
 	}
 
-	// List generated segments
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -279,7 +284,9 @@ func ProcessAudio(inputPath, outputDir, filename string) (*Manifest, error) {
 	}
 
 	segmentPattern := filepath.Join(outputDir, "segment_%03d.m4a")
-	cmd := exec.Command("ffmpeg",
+	ctxLegacy, cancelLegacy := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancelLegacy()
+	cmd := exec.CommandContext(ctxLegacy, "ffmpeg",
 		"-i", inputPath,
 		"-vn",
 		"-c:a", "aac",
@@ -324,7 +331,9 @@ func ProcessAudio(inputPath, outputDir, filename string) (*Manifest, error) {
 
 func getAudioDuration(filePath string) (float64, error) {
 	filePath = sanitizeInputPath(filePath)
-	cmd := exec.Command("ffprobe",
+	ctxDur, cancelDur := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancelDur()
+	cmd := exec.CommandContext(ctxDur, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
@@ -360,6 +369,164 @@ func listSegments(dir string) ([]string, error) {
 	}
 
 	return segments, nil
+}
+
+// AudioMetadata holds metadata extracted from audio file tags.
+type AudioMetadata struct {
+	Title    string
+	Artist   string
+	Album    string
+	Genre    string
+	Year     string
+	Lyrics   string
+	HasCover bool
+}
+
+// ffprobeTagsOutput represents the JSON output from ffprobe for tags.
+type ffprobeTagsOutput struct {
+	Format struct {
+		Tags map[string]string `json:"tags"`
+	} `json:"format"`
+}
+
+// ExtractMetadata extracts title, artist, album from audio file tags using ffprobe.
+func ExtractMetadata(inputPath string) (*AudioMetadata, error) {
+	inputPath = sanitizeInputPath(inputPath)
+	ctx, cancel := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-show_entries", "format_tags=title,artist,album,genre,date,lyrics,LYRICS,UNSYNCEDLYRICS",
+		"-of", "json",
+		inputPath)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe metadata failed: %w", err)
+	}
+
+	var result ffprobeTagsOutput
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("parse ffprobe output: %w", err)
+	}
+
+	meta := &AudioMetadata{}
+	tags := result.Format.Tags
+	// Tags can be case-insensitive, check common variants
+	for k, v := range tags {
+		lower := strings.ToLower(k)
+		switch lower {
+		case "title":
+			meta.Title = v
+		case "artist":
+			meta.Artist = v
+		case "album":
+			meta.Album = v
+		case "genre":
+			meta.Genre = v
+		case "date", "year":
+			if meta.Year == "" {
+				meta.Year = v
+			}
+		default:
+			if strings.Contains(lower, "lyric") || lower == "unsyncedlyrics" {
+				if meta.Lyrics == "" {
+					meta.Lyrics = v
+				}
+			}
+		}
+	}
+
+	return meta, nil
+}
+
+// ffprobeLyricsOutput represents the JSON output from ffprobe for lyrics extraction.
+type ffprobeLyricsOutput struct {
+	Format struct {
+		Tags map[string]string `json:"tags"`
+	} `json:"format"`
+	Streams []struct {
+		Tags map[string]string `json:"tags"`
+	} `json:"streams"`
+}
+
+// ExtractLyrics extracts lyrics from audio file using ffprobe, checking both format and stream tags.
+func ExtractLyrics(inputPath string) (string, error) {
+	inputPath = sanitizeInputPath(inputPath)
+	ctx, cancel := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-show_entries", "stream_tags=lyrics,LYRICS",
+		"-show_entries", "format_tags=lyrics,LYRICS,UNSYNCEDLYRICS",
+		"-of", "json",
+		inputPath)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe lyrics failed: %w", err)
+	}
+
+	var result ffprobeLyricsOutput
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "", fmt.Errorf("parse ffprobe lyrics output: %w", err)
+	}
+
+	// Check format tags first
+	for k, v := range result.Format.Tags {
+		lower := strings.ToLower(k)
+		if strings.Contains(lower, "lyric") || lower == "unsyncedlyrics" {
+			if v != "" {
+				return v, nil
+			}
+		}
+	}
+
+	// Check stream tags
+	for _, stream := range result.Streams {
+		for k, v := range stream.Tags {
+			lower := strings.ToLower(k)
+			if strings.Contains(lower, "lyric") {
+				if v != "" {
+					return v, nil
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+// ExtractCoverArt extracts embedded cover art from audio file to outputPath.
+// Returns error if no cover art exists or extraction fails.
+func ExtractCoverArt(inputPath, outputPath string) error {
+	inputPath = sanitizeInputPath(inputPath)
+	ctx, cancel := context.WithTimeout(context.Background(), ffprobeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-i", inputPath,
+		"-an",
+		"-vcodec", "mjpeg",
+		"-vframes", "1",
+		"-y",
+		outputPath)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("extract cover failed: %w, output: %s", err, string(out))
+	}
+
+	// Verify the file was created and has content
+	info, err := os.Stat(outputPath)
+	if err != nil || info.Size() == 0 {
+		os.Remove(outputPath)
+		return fmt.Errorf("no cover art in file")
+	}
+
+	return nil
 }
 
 // LoadManifest loads a manifest from a room's audio directory

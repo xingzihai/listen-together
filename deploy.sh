@@ -25,9 +25,12 @@ echo "Version: ${CURRENT_TAG} → ${NEW_TAG} (${SHORT_HASH})"
 echo "Building..."
 /usr/local/go/bin/go build -o listen-together . 2>&1
 
-# Restart
+# Restart — kill all listen-together processes (including zombies' parents)
 echo "Restarting..."
-pkill -f "./listen-together" 2>/dev/null || true
+pkill -9 -f "listen-together" 2>/dev/null || true
+sleep 1
+# Clean up any remaining zombie processes
+kill -9 $(ps aux | grep listen-together | grep -v grep | awk '{print $2}') 2>/dev/null || true
 sleep 1
 nohup ./listen-together > /tmp/listen-together.log 2>&1 &
 sleep 2

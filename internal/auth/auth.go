@@ -3,10 +3,11 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -92,17 +93,54 @@ func SetDB(d *db.DB) {
 }
 
 func InitJWT() {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		b := make([]byte, 32)
-		rand.Read(b)
-		secret = hex.EncodeToString(b)
-		log.Printf("JWT_SECRET not set, generated random secret")
+	// 1. Try JWT_SECRET env var
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		jwtSecret = []byte(secret)
+		log.Printf("[JWT] Secret loaded from environment variable")
+		padSecretIfNeeded()
+		return
 	}
-	jwtSecret = []byte(secret)
-	// Warn and pad if secret is too short
+
+	// 2. Determine data directory (same as SQLite DB location)
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	secretFile := filepath.Join(dataDir, ".jwt_secret")
+
+	// 3. Try reading from persisted file
+	if data, err := os.ReadFile(secretFile); err == nil && len(data) > 0 {
+		jwtSecret = data
+		log.Printf("[JWT] Secret loaded from file: %s", secretFile)
+		padSecretIfNeeded()
+		return
+	}
+
+	// 4. Generate new secret and persist to file
+	b := make([]byte, 32)
+	rand.Read(b)
+	jwtSecret = b
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Printf("[JWT] WARNING: failed to create data dir %s: %v (secret will not persist)", dataDir, err)
+		log.Printf("[JWT] Secret generated (not persisted)")
+		return
+	}
+
+	// Write secret file with 0600 permissions
+	if err := os.WriteFile(secretFile, jwtSecret, 0600); err != nil {
+		log.Printf("[JWT] WARNING: failed to write secret file %s: %v (secret will not persist)", secretFile, err)
+		log.Printf("[JWT] Secret generated (not persisted)")
+		return
+	}
+
+	log.Printf("[JWT] Secret generated and persisted to file: %s", secretFile)
+}
+
+func padSecretIfNeeded() {
 	if len(jwtSecret) < 32 {
-		log.Printf("WARNING: JWT_SECRET is %d bytes, minimum recommended is 32. Padding with random bytes.", len(jwtSecret))
+		log.Printf("[JWT] WARNING: secret is %d bytes, minimum recommended is 32. Padding with random bytes.", len(jwtSecret))
 		pad := make([]byte, 32-len(jwtSecret))
 		rand.Read(pad)
 		jwtSecret = append(jwtSecret, pad...)
@@ -160,12 +198,20 @@ func validateClaimsAgainstDB(claims *Claims) (string, error) {
 	return role, nil
 }
 
+const maxPasswordBytes = 72 // bcrypt silently truncates beyond this
+
 func HashPassword(password string) (string, error) {
+	if len([]byte(password)) > maxPasswordBytes {
+		return "", fmt.Errorf("password too long (max %d bytes)", maxPasswordBytes)
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	return string(hash), err
 }
 
 func CheckPassword(hash, password string) bool {
+	if len([]byte(password)) > maxPasswordBytes {
+		return false
+	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
@@ -193,24 +239,35 @@ func setTokenCookieWithRequest(w http.ResponseWriter, r *http.Request, token str
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   86400,
 	})
 }
 
-// tryAutoRenew checks if token needs renewal (< 2h remaining) and issues a new one
-func tryAutoRenew(w http.ResponseWriter, claims *Claims) {
+// tryAutoRenew checks if token needs renewal (< 2h remaining) and issues a new one.
+// It fetches the latest role/version from DB to prevent stale privilege in renewed tokens.
+func tryAutoRenew(w http.ResponseWriter, r *http.Request, claims *Claims) {
 	if claims.ExpiresAt == nil {
 		return
 	}
 	remaining := time.Until(claims.ExpiresAt.Time)
 	if remaining > 0 && remaining < 2*time.Hour {
-		newToken, err := GenerateToken(claims.UserID, claims.Username, claims.Role, claims.PasswordVersion, claims.SessionVersion)
+		// Fetch fresh role and versions from DB to avoid renewing with stale privileges
+		role, pwVer, sessVer := claims.Role, claims.PasswordVersion, claims.SessionVersion
+		if authDB != nil {
+			freshRole, freshPwVer, freshSessVer, err := authDB.GetUserRoleAndVersion(claims.UserID)
+			if err != nil {
+				// DB lookup failed; skip renewal, current request is unaffected
+				return
+			}
+			role, pwVer, sessVer = freshRole, freshPwVer, freshSessVer
+			GlobalRoleCache.Set(claims.UserID, role, pwVer, sessVer)
+		}
+		newToken, err := GenerateToken(claims.UserID, claims.Username, role, pwVer, sessVer)
 		if err != nil {
 			return
 		}
-		setTokenCookie(w, newToken)
-		w.Header().Set("X-New-Token", newToken)
+		setTokenCookieWithRequest(w, r, newToken)
 	}
 }
 
@@ -229,7 +286,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		if tokenStr != "" {
 			if claims, err := ValidateToken(tokenStr); err == nil {
 				if _, err := validateClaimsAgainstDB(claims); err == nil {
-					tryAutoRenew(w, claims)
+					tryAutoRenew(w, r, claims)
 					ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 						UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 					})
@@ -266,7 +323,7 @@ func RequireAuth(next http.Handler) http.Handler {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		tryAutoRenew(w, claims)
+		tryAutoRenew(w, r, claims)
 		ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 			UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 		})
