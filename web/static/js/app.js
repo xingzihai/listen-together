@@ -262,15 +262,18 @@ async function handleMessage(msg) {
             if (msg.position < 0 || msg.position > 86400 || msg.serverTime < 1e12) break;
 
             // Update server anchor (kept for elapsed calculations)
-            ap.serverPlayTime = msg.serverTime;
-            ap.serverPlayPosition = msg.position;
+            // But NOT during cooldown — playAtPosition just set these precisely
+            if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
+                ap.serverPlayTime = msg.serverTime;
+                ap.serverPlayPosition = msg.position;
+            }
 
-            // Drift detection using raw AudioContext time
-            const ctxElapsed = ap.ctx.currentTime - ap.startTime;
-            const actualPos = ap.startOffset + Math.max(0, ctxElapsed);
+            // Drift detection: compare server's authoritative position with our actual audio output
+            // Use getCurrentTime() which is the most accurate representation of what's actually playing
+            const actualPos = ap.getCurrentTime();
 
             // Server position with network delay compensation
-            const networkDelay = (window.clockSync.getServerTime() - msg.serverTime) / 1000;
+            const networkDelay = Math.max(0, (window.clockSync.getServerTime() - msg.serverTime) / 1000);
             const serverPos = msg.position + networkDelay;
 
             const drift = actualPos - serverPos;
@@ -304,7 +307,8 @@ async function handleMessage(msg) {
                         console.warn(`[sync] post-reset verify failed: drift=${(drift*1000).toFixed(0)}ms, re-resetting`);
                         ap._driftCount = 0;
                         ap._lastResetTime = performance.now();
-                        ap.playAtPosition(serverPos, msg.serverTime);
+                        const resetScheduledAt = window.clockSync.getServerTime() + 300;
+                        ap.playAtPosition(serverPos, msg.serverTime, resetScheduledAt);
                     } else {
                         console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms ignored (cooldown)`);
                     }
@@ -317,7 +321,8 @@ async function handleMessage(msg) {
                         ap._postResetVerify = true;
                         ap._postResetTime = performance.now();
                         console.warn(`[sync] forcing reset: drift=${(drift*1000).toFixed(0)}ms`);
-                        ap.playAtPosition(serverPos, msg.serverTime);
+                        const resetScheduledAt = window.clockSync.getServerTime() + 300;
+                        ap.playAtPosition(serverPos, msg.serverTime, resetScheduledAt);
                     }
                 }
             } else {
