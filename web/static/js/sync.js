@@ -1,4 +1,4 @@
-// Clock sync — NTP-like, aggressive tuning for <10ms precision
+// Clock sync — NTP-like, weighted-median filtering for robust <10ms precision
 class ClockSync {
     constructor() {
         this.offset = 0;
@@ -7,6 +7,8 @@ class ClockSync {
         this.samples = [];
         this.maxSamples = 64;
         this._lastNetType = null;
+        this._initialCount = 0;     // samples collected since start/reset
+        this._initialTarget = 10;   // fast-sample until this many collected
     }
 
     start(ws) {
@@ -14,34 +16,31 @@ class ClockSync {
         this.samples = [];
         this.synced = false;
         this.rtt = Infinity;
-        // Burst 16 pings for fast initial sync
-        for (let i = 0; i < 16; i++) setTimeout(() => this.ping(), i * 40);
+        this._initialCount = 0;
+        // Initial burst: 10 rapid pings at 200ms for fast convergence
+        for (let i = 0; i < this._initialTarget; i++) setTimeout(() => this.ping(), i * 200);
         this._scheduleNext();
     }
 
     _scheduleNext() {
         if (this._timer) clearTimeout(this._timer);
-        // Adaptive frequency: 150ms unsynced, 300ms normal, 2000ms when stable
-        let interval = !this.synced ? 150 : 300;
-        if (this.synced && this._isStable()) interval = 2000;
-        this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
-    }
-
-    // Check if recent offsets are stable (all changes < 3ms)
-    _isStable() {
-        if (this.samples.length < 5) return false;
-        const recent = this.samples.slice(-5);
-        for (let i = 1; i < recent.length; i++) {
-            if (Math.abs(recent[i].offset - recent[i-1].offset) > 3) return false;
+        // Initial phase (< 10 samples): 200ms; then steady-state: 5000ms; unsynced fallback: 300ms
+        let interval;
+        if (this._initialCount < this._initialTarget) {
+            interval = 200;
+        } else if (!this.synced) {
+            interval = 300;
+        } else {
+            interval = 5000;
         }
-        return true;
+        this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
     }
 
     stop() { if (this._timer) { clearTimeout(this._timer); this._timer = null; } }
 
-    // Burst mode: send 8 rapid pings for quick re-sync (e.g., after visibility change)
+    // Burst mode: send 8 rapid pings at 100ms for quick re-sync (e.g., after visibility change)
     burst() {
-        for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 50);
+        for (let i = 0; i < 8; i++) setTimeout(() => this.ping(), i * 100);
     }
 
     ping() {
@@ -67,7 +66,7 @@ class ClockSync {
                 this.samples = [];
                 this.synced = false;
                 this.rtt = Infinity;
-                // Network change: accelerate back to 300ms
+                this._initialCount = 0;
                 this._scheduleNext();
             }
             this._lastNetType = net;
@@ -79,28 +78,43 @@ class ClockSync {
         const offset = msg.serverTime - (this._pendingWall + rtt / 2);
         this.samples.push({ offset, rtt, ts: performance.now() });
         if (this.samples.length > this.maxSamples) this.samples.shift();
+        this._initialCount++;
 
         // Detect offset jump > 10ms: accelerate sync frequency
         if (this.synced && this.samples.length > 1) {
             const lastOffset = this.samples[this.samples.length - 2].offset;
             if (Math.abs(offset - lastOffset) > 10) {
-                this._scheduleNext(); // Reset to faster interval
+                this._scheduleNext();
             }
         }
 
-        // Expire old samples: 10s when unsynced (need fresh data), 30s when stable
-        const expiry = (this.synced && this._isStable()) ? 30000 : 10000;
+        // Transition from initial to steady-state when target reached
+        if (this._initialCount === this._initialTarget) {
+            this._scheduleNext();
+        }
+
+        // Expire old samples: 10s when unsynced, 30s when stable
+        const expiry = this.synced ? 30000 : 10000;
         const cutoff = performance.now() - expiry;
         this.samples = this.samples.filter(s => s.ts > cutoff);
 
         if (this.samples.length < 3) { this.synced = false; this.updateUI(); return; }
 
-        // Use average offset from the 3 lowest-RTT samples
+        // Weighted-median filtering:
+        // 1. Sort by RTT
+        // 2. Drop top 30% (high-RTT outliers)
+        // 3. Weighted average of remaining, weight = 1/RTT
         const byRtt = [...this.samples].sort((a, b) => a.rtt - b.rtt);
-        const topN = Math.min(3, byRtt.length);
-        let sum = 0;
-        for (let i = 0; i < topN; i++) sum += byRtt[i].offset;
-        const newOffset = sum / topN;
+        const keepN = Math.max(3, Math.ceil(byRtt.length * 0.7));
+        const kept = byRtt.slice(0, keepN);
+
+        let weightSum = 0, offsetSum = 0;
+        for (let i = 0; i < kept.length; i++) {
+            const w = 1 / Math.max(kept[i].rtt, 1); // avoid div-by-zero
+            weightSum += w;
+            offsetSum += kept[i].offset * w;
+        }
+        const newOffset = offsetSum / weightSum;
 
         // EMA: small changes (<10ms) blend with 0.7/0.3, large jumps apply immediately
         if (this.synced && Math.abs(newOffset - this.offset) < 10) {
