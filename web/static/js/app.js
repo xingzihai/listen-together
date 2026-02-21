@@ -298,20 +298,35 @@ async function handleMessage(msg) {
             // Drift counter logic
             if (absDrift > ap._DRIFT_THRESHOLD) {
                 if (ap._lastResetTime && performance.now() - ap._lastResetTime < ap._RESET_COOLDOWN) {
-                    console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms ignored (cooldown)`);
+                    // C3: Post-reset verification — if >500ms since reset, check once
+                    if (ap._postResetVerify && performance.now() - ap._postResetTime > 500) {
+                        ap._postResetVerify = false;
+                        console.warn(`[sync] post-reset verify failed: drift=${(drift*1000).toFixed(0)}ms, re-resetting`);
+                        ap._driftCount = 0;
+                        ap._lastResetTime = performance.now();
+                        ap.playAtPosition(serverPos, msg.serverTime);
+                    } else {
+                        console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms ignored (cooldown)`);
+                    }
                 } else {
                     ap._driftCount++;
                     console.log(`[sync] drift ${(drift*1000).toFixed(0)}ms, count=${ap._driftCount}/${ap._DRIFT_COUNT_LIMIT}`);
                     if (ap._driftCount >= ap._DRIFT_COUNT_LIMIT) {
                         ap._driftCount = 0;
                         ap._lastResetTime = performance.now();
+                        ap._postResetVerify = true;
+                        ap._postResetTime = performance.now();
                         console.warn(`[sync] forcing reset: drift=${(drift*1000).toFixed(0)}ms`);
                         ap.playAtPosition(serverPos, msg.serverTime);
                     }
                 }
             } else {
                 ap._driftCount = 0;
+                if (ap._postResetVerify) ap._postResetVerify = false; // reset succeeded
             }
+
+            // D1: Save drift for segment boundary micro-adjustment
+            ap._lastDrift = drift;
             break;
         }
         case 'forceResync': {
@@ -319,6 +334,8 @@ async function handleMessage(msg) {
             if (ap && ap.isPlaying && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
                 ap._driftCount = 0;
                 ap._lastResetTime = performance.now();
+                ap._postResetVerify = true;
+                ap._postResetTime = performance.now();
                 ap.playAtPosition(msg.position, msg.serverTime, msg.scheduledAt);
             }
             break;

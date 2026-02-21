@@ -23,6 +23,7 @@ class AudioPlayer {
         this._DRIFT_THRESHOLD = 0.15;   // 150ms
         this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
         this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
+        this._lastDrift = 0;            // latest drift from syncTick (seconds, positive=ahead)
     }
 
     init() {
@@ -198,7 +199,20 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.init(); this.stop();
+        this.init();
+
+        // C2: Preload target segments BEFORE stopping current playback
+        // preloadSegments only fills this.buffers Map, doesn't affect playing sources
+        const prePosition = position || 0;
+        const segIdx = Math.floor(prePosition / this.segmentTime);
+        if (!this.buffers.has(segIdx)) {
+            if (this.onBuffering) this.onBuffering(true);
+            await this.preloadSegments(segIdx, 2);
+            if (this.onBuffering) this.onBuffering(false);
+        }
+
+        // Now stop old playback (segments already cached)
+        this.stop();
         this.isPlaying = true;
         this._driftCount = 0;
 
@@ -221,12 +235,7 @@ class AudioPlayer {
         const dateSnap = Date.now();
         const latency = this._outputLatency || 0; // hardware output latency in seconds
 
-        const segIdx = Math.floor(this.serverPlayPosition / this.segmentTime);
-        if (!this.buffers.has(segIdx)) {
-            if (this.onBuffering) this.onBuffering(true);
-            await this.preloadSegments(segIdx, 2);
-            if (this.onBuffering) this.onBuffering(false);
-        }
+        // Segments already preloaded above (before stop), no need to preload again
         if (!this.isPlaying) return;
 
         // Convert elapsed perf time to ctx time (single clock domain, no Date.now mixing)
@@ -309,18 +318,27 @@ class AudioPlayer {
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
+            // D1: Segment boundary micro-adjustment for small persistent drift
+            // Only apply to non-first segments; correct 50% of drift per segment to avoid overshoot
+            let schedTime = t;
+            if (!this._isFirstSeg && i > 0) {
+                const ld = this._lastDrift;
+                if (Math.abs(ld) > 0.03 && Math.abs(ld) < this._DRIFT_THRESHOLD) {
+                    schedTime = t - ld * 0.5; // ahead→delay, behind→advance
+                }
+            }
             // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
-                segGain.gain.setValueAtTime(0, t);
-                segGain.gain.linearRampToValueAtTime(1, t + fadeTime);
+                segGain.gain.setValueAtTime(0, schedTime);
+                segGain.gain.linearRampToValueAtTime(1, schedTime + fadeTime);
             }
             if (i < this.segments.length - 1) {
-                const fadeOutStart = t + dur - fadeTime;
+                const fadeOutStart = schedTime + dur - fadeTime;
                 segGain.gain.setValueAtTime(1, fadeOutStart);
-                segGain.gain.linearRampToValueAtTime(0, t + dur);
+                segGain.gain.linearRampToValueAtTime(0, schedTime + dur);
             }
-            source.start(t, off);
+            source.start(schedTime, off);
             source.onended = () => {
                 const idx = this.sources.indexOf(source);
                 if (idx > -1) this.sources.splice(idx, 1);

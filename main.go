@@ -817,10 +817,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					}
 					lastForceResyncSent = now
 					log.Printf("[sync] client drift %.0fms — forcing resync", drift*1000)
+					nowResync := syncpkg.GetServerTime()
 					myClient.Send(map[string]interface{}{
-						"type":       "forceResync",
-						"position":   expectedPos,
-						"serverTime": syncpkg.GetServerTime(),
+						"type":        "forceResync",
+						"position":    expectedPos,
+						"serverTime":  nowResync,
+						"scheduledAt": nowResync + 400,
 					})
 				}
 			}
