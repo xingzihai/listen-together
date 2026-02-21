@@ -243,9 +243,14 @@ class AudioPlayer {
 
         // Try hardware-level scheduling if scheduledAt is still in the future
         if (scheduledAt) {
-            // Use dateSnap (captured at same instant as perfSnap) to stay in one clock domain
-            const localScheduled = scheduledAt - window.clockSync.offset;
-            const waitMs = localScheduled - dateSnap - (performance.now() - perfSnap);
+            // Convert scheduledAt (server time ms) to local performance.now() domain
+            // Using anchor model: perfTime = anchorPerfTime + (serverTime - anchorServerTime)
+            // Then waitMs = targetPerfTime - currentPerfTime
+            const cs = window.clockSync;
+            const targetPerf = cs.synced && cs.anchorPerfTime > 0
+                ? cs.anchorPerfTime + (scheduledAt - cs.anchorServerTime)
+                : perfSnap + (scheduledAt - (dateSnap + cs.offset)); // fallback before calibration
+            const waitMs = targetPerf - performance.now();
             if (waitMs > 2 && waitMs < 3000) {
                 // Schedule segment earlier by outputLatency so sound reaches ears on time
                 // But keep startTime as the logical anchor (without latency offset)
