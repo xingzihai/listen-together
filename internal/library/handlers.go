@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,10 @@ type LibraryHandlers struct {
 	DB      *db.DB
 	DataDir string
 	Manager *room.Manager
+
+	// cancelMu protects transcodeCancel map
+	cancelMu        sync.Mutex
+	transcodeCancel map[int64]context.CancelFunc // audioFileID → cancel
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
@@ -170,7 +175,7 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Multi-quality segmentation
-	manifest, probe, err := audio.ProcessAudioMultiQuality(storedPath, audioDir, header.Filename)
+	manifest, probe, bgCancel, err := audio.ProcessAudioMultiQuality(storedPath, audioDir, header.Filename)
 	if err != nil {
 		os.RemoveAll(audioDir)
 		jsonError(w, fmt.Sprintf("音频处理失败: %v", err), 500)
@@ -226,10 +231,18 @@ func (h *LibraryHandlers) Upload(w http.ResponseWriter, r *http.Request) {
 
 	af, err := h.DB.AddAudioFile(user.UserID, audioID, header.Filename, title, artist, album, genre, year, lyrics, manifest.Duration, written, probe.Format, probe.Bitrate, string(qualitiesJSON), coverArt)
 	if err != nil {
+		bgCancel()
 		os.RemoveAll(audioDir)
 		jsonError(w, "保存记录失败", 500)
 		return
 	}
+	// Store cancel func for background transcoding
+	h.cancelMu.Lock()
+	if h.transcodeCancel == nil {
+		h.transcodeCancel = make(map[int64]context.CancelFunc)
+	}
+	h.transcodeCancel[af.ID] = bgCancel
+	h.cancelMu.Unlock()
 	jsonOK(w, af)
 }
 
@@ -307,6 +320,14 @@ func (h *LibraryHandlers) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "删除失败", 500)
 		return
 	}
+
+	// Cancel background transcoding if still running
+	h.cancelMu.Lock()
+	if cancel, ok := h.transcodeCancel[id]; ok {
+		cancel()
+		delete(h.transcodeCancel, id)
+	}
+	h.cancelMu.Unlock()
 
 	diskPath := filepath.Join(h.DataDir, "library", strconv.FormatInt(af.OwnerID, 10), af.Filename)
 	os.RemoveAll(diskPath)

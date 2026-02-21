@@ -161,7 +161,7 @@ func (h *AuthHandlers) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := h.DB.CreateUser(req.Username, req.Password, "user")
 	if err != nil {
-		jsonError(w, "注册失败，用户名可能已存在", 400)
+		jsonError(w, "注册失败，请稍后重试", 400)
 		return
 	}
 	token, _ := GenerateToken(user.ID, user.Username, user.Role, user.PasswordVersion, user.SessionVersion)
@@ -331,8 +331,14 @@ func (h *AuthHandlers) ChangeUsername(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "修改失败", 500)
 		return
 	}
+	h.DB.BumpSessionVersion(user.UserID)
 	GlobalRoleCache.Invalidate(user.UserID)
-	token, _ := GenerateToken(user.UserID, req.NewUsername, user.Role, dbUser.PasswordVersion, dbUser.SessionVersion)
+	updatedUser, _ := h.DB.GetUserByID(user.UserID)
+	sessVer := dbUser.SessionVersion
+	if updatedUser != nil {
+		sessVer = updatedUser.SessionVersion
+	}
+	token, _ := GenerateToken(user.UserID, req.NewUsername, user.Role, dbUser.PasswordVersion, sessVer)
 	setTokenCookieWithRequest(w, r, token)
 	jsonOK(w, map[string]interface{}{"message": "ok", "username": req.NewUsername})
 }
@@ -460,6 +466,10 @@ func (h *AuthHandlers) UserSettings(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, "invalid json", 400)
 			return
 		}
+		if len(raw) > 10240 {
+			jsonError(w, "settings too large (max 10KB)", 400)
+			return
+		}
 		if err := h.DB.SaveUserSettings(user.UserID, string(raw)); err != nil {
 			jsonError(w, "save failed", 500)
 			return
@@ -504,14 +514,18 @@ func (h *AuthHandlers) AdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "删除失败", 500)
 		return
 	}
-	// Clean up audio files from disk
-	for _, fn := range deletedFiles {
-		audioDir := os.Getenv("AUDIO_DIR")
-		if audioDir == "" {
-			audioDir = "audio_files"
-		}
-		os.RemoveAll(filepath.Join(audioDir, fn))
+	// Clean up audio files from disk — use same path structure as upload
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
 	}
+	for _, fn := range deletedFiles {
+		diskPath := filepath.Join(dataDir, "library", strconv.FormatInt(target.ID, 10), fn)
+		os.RemoveAll(diskPath)
+	}
+	// Also try to remove the user's library directory if empty
+	userLibDir := filepath.Join(dataDir, "library", strconv.FormatInt(target.ID, 10))
+	os.Remove(userLibDir) // only succeeds if empty
 	GlobalRoleCache.Invalidate(target.ID)
 	jsonOK(w, map[string]string{"message": "ok"})
 }

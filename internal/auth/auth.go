@@ -140,10 +140,7 @@ func InitJWT() {
 
 func padSecretIfNeeded() {
 	if len(jwtSecret) < 32 {
-		log.Printf("[JWT] WARNING: secret is %d bytes, minimum recommended is 32. Padding with random bytes.", len(jwtSecret))
-		pad := make([]byte, 32-len(jwtSecret))
-		rand.Read(pad)
-		jwtSecret = append(jwtSecret, pad...)
+		log.Fatalf("[JWT] FATAL: secret is %d bytes, minimum required is 32. Set a longer JWT_SECRET.", len(jwtSecret))
 	}
 }
 
@@ -174,6 +171,18 @@ func ValidateToken(tokenStr string) (*Claims, error) {
 		return claims, nil
 	}
 	return nil, jwt.ErrSignatureInvalid
+}
+
+// isOwnerWithDefaultPassword checks if the user is owner still using admin123
+func isOwnerWithDefaultPassword(userID int64) bool {
+	if authDB == nil {
+		return false
+	}
+	u, err := authDB.GetUserByID(userID)
+	if err != nil || u.Role != "owner" {
+		return false
+	}
+	return CheckPassword(u.PasswordHash, "admin123")
 }
 
 // validateClaimsAgainstDB checks role, password_version and session_version against DB/cache.
@@ -287,6 +296,11 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			if claims, err := ValidateToken(tokenStr); err == nil {
 				if _, err := validateClaimsAgainstDB(claims); err == nil {
 					tryAutoRenew(w, r, claims)
+					// Block owner with default password from all routes except password change
+					if claims.Role == "owner" && r.URL.Path != "/api/auth/password" && isOwnerWithDefaultPassword(claims.UserID) {
+						http.Error(w, `{"error":"请先修改默认密码","needChangePassword":true}`, http.StatusForbidden)
+						return
+					}
 					ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 						UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 					})
@@ -324,6 +338,11 @@ func RequireAuth(next http.Handler) http.Handler {
 			return
 		}
 		tryAutoRenew(w, r, claims)
+		// Block owner with default password from all routes except password change
+		if claims.Role == "owner" && r.URL.Path != "/api/auth/password" && isOwnerWithDefaultPassword(claims.UserID) {
+			http.Error(w, `{"error":"请先修改默认密码","needChangePassword":true}`, http.StatusForbidden)
+			return
+		}
 		ctx := context.WithValue(r.Context(), UserContextKey, &UserInfo{
 			UserID: claims.UserID, Username: claims.Username, Role: claims.Role,
 		})

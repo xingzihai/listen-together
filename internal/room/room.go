@@ -153,6 +153,11 @@ func (m *Manager) CreateRoom(code string, ownerID int64) (*Room, error) {
 		return nil, ErrMaxRoomsReached
 	}
 
+	// Check for code collision
+	if _, exists := m.rooms[code]; exists {
+		return nil, errors.New("房间码冲突，请重试")
+	}
+
 	// Per-user room limit
 	count := 0
 	for _, r := range m.rooms {
@@ -382,6 +387,12 @@ func (r *Room) RemoveClient(clientID string) bool {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 
+	// Check if departing client is the owner before removing
+	wasOwner := false
+	if c, ok := r.Clients[clientID]; ok && r.OwnerID != 0 && c.UID == r.OwnerID {
+		wasOwner = true
+	}
+
 	delete(r.Clients, clientID)
 	r.LastActive = time.Now()
 
@@ -390,6 +401,11 @@ func (r *Room) RemoveClient(clientID string) bool {
 		for _, c := range r.Clients {
 			r.Host = c
 			c.IsHost = true
+			// Transfer ownership atomically within the same lock
+			if wasOwner {
+				r.OwnerID = c.UID
+				r.OwnerName = c.Username
+			}
 			break
 		}
 	}

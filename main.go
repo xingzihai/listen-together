@@ -530,8 +530,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: "没有创建房间的权限"})
 				continue
 			}
-			code := generateCode()
-			newRoom, createErr := manager.CreateRoom(code, userID)
+			var newRoom *room.Room
+			var code string
+			var createErr error
+			for i := 0; i < 3; i++ {
+				code = generateCode()
+				newRoom, createErr = manager.CreateRoom(code, userID)
+				if createErr == nil {
+					break
+				}
+			}
 			if createErr != nil {
 				safeWrite(WSResponse{Type: "error", Error: createErr.Error()})
 				continue
@@ -539,7 +547,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Leave old room before joining new one to prevent client leak
 			if currentRoom != nil {
 				empty := currentRoom.RemoveClient(clientID)
-				if !empty {
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
 					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 				}
 			}
@@ -568,7 +579,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Leave old room before joining new one to prevent client leak
 			if currentRoom != nil {
 				empty := currentRoom.RemoveClient(clientID)
-				if !empty {
+				if empty {
+					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
+					manager.DeleteRoom(currentRoom.Code)
+				} else {
 					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 				}
 			}
@@ -634,6 +648,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.OwnerID != userID {
 				continue
 			}
+			// Check audio exists
+			currentRoom.Mu.RLock()
+			hasAudio := currentRoom.TrackAudio != nil || currentRoom.Audio != nil
+			currentRoom.Mu.RUnlock()
+			if !hasAudio {
+				safeWrite(WSResponse{Type: "error", Error: "请先选择音频"})
+				continue
+			}
 			// Validate position
 			currentRoom.Mu.RLock()
 			dur := 0.0
@@ -670,6 +692,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom.OwnerID != userID {
 				continue
 			}
+			// Check audio exists
+			currentRoom.Mu.RLock()
+			hasAudioP := currentRoom.TrackAudio != nil || currentRoom.Audio != nil
+			currentRoom.Mu.RUnlock()
+			if !hasAudioP {
+				safeWrite(WSResponse{Type: "error", Error: "请先选择音频"})
+				continue
+			}
 			pos := currentRoom.Pause()
 			broadcast(currentRoom, WSResponse{Type: "pause", Position: pos, ServerTime: syncpkg.GetServerTime()}, "")
 
@@ -678,6 +708,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if currentRoom.OwnerID != userID {
+				continue
+			}
+			// Check audio exists
+			currentRoom.Mu.RLock()
+			hasAudioS := currentRoom.TrackAudio != nil || currentRoom.Audio != nil
+			currentRoom.Mu.RUnlock()
+			if !hasAudioS {
+				safeWrite(WSResponse{Type: "error", Error: "请先选择音频"})
 				continue
 			}
 			// Validate position
@@ -859,7 +897,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	if currentRoom != nil {
 		empty := currentRoom.RemoveClient(clientID)
-		if !empty {
+		if empty {
+			code := currentRoom.Code
+			audio.CleanupRoom(filepath.Join(dataDir, code))
+			manager.DeleteRoom(code)
+		} else {
 			users := currentRoom.GetClientList()
 			for _, c := range currentRoom.GetClients() {
 				if currentRoom.IsHost(c.ID) {

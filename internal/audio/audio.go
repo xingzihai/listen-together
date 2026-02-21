@@ -144,7 +144,7 @@ func QualityNames(probe *ProbeResult) []string {
 }
 
 // segmentOneQuality runs ffmpeg to segment into one quality tier.
-func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, error) {
+func segmentOneQuality(ctx context.Context, inputPath, outputDir string, q qualityDef) ([]string, error) {
 	inputPath = sanitizeInputPath(inputPath)
 	dir := filepath.Join(outputDir, q.DirSuffix)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -157,7 +157,7 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 	args = append(args, "-segment_format", "flac")
 	args = append(args, "-y", pattern)
 
-	ctxSeg, cancelSeg := context.WithTimeout(context.Background(), ffmpegTimeout)
+	ctxSeg, cancelSeg := context.WithTimeout(ctx, ffmpegTimeout)
 	defer cancelSeg()
 	cmd := exec.CommandContext(ctxSeg, "ffmpeg", args...)
 	out, err := cmd.CombinedOutput()
@@ -182,19 +182,19 @@ func segmentOneQuality(inputPath, outputDir string, q qualityDef) ([]string, err
 // ProcessAudioMultiQuality generates multi-quality segments.
 // It synchronously generates the "medium" tier first, then spawns background goroutines for the rest.
 // Returns the manifest (with at least medium populated) and the list of quality names.
-func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQualityManifest, *ProbeResult, error) {
+func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQualityManifest, *ProbeResult, context.CancelFunc, error) {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, nil, fmt.Errorf("mkdir: %w", err)
+		return nil, nil, nil, fmt.Errorf("mkdir: %w", err)
 	}
 
 	duration, err := getAudioDuration(inputPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("get duration: %w", err)
+		return nil, nil, nil, fmt.Errorf("get duration: %w", err)
 	}
 
 	probe, err := ProbeAudio(inputPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("probe: %w", err)
+		return nil, nil, nil, fmt.Errorf("probe: %w", err)
 	}
 
 	defs := determineQualities(probe)
@@ -214,10 +214,13 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 		}
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+
 	// Process the sync tier first
-	segs, err := segmentOneQuality(inputPath, outputDir, defs[syncIdx])
+	segs, err := segmentOneQuality(bgCtx, inputPath, outputDir, defs[syncIdx])
 	if err != nil {
-		return nil, nil, fmt.Errorf("segment %s: %w", defs[syncIdx].Name, err)
+		bgCancel()
+		return nil, nil, nil, fmt.Errorf("segment %s: %w", defs[syncIdx].Name, err)
 	}
 	manifest.Qualities[defs[syncIdx].Name] = &QualityInfo{
 		Format:   defs[syncIdx].Codec,
@@ -237,9 +240,16 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 	}
 	if len(remaining) > 0 {
 		go func() {
+			defer bgCancel()
 			for _, q := range remaining {
-				s, err := segmentOneQuality(inputPath, outputDir, q)
+				if bgCtx.Err() != nil {
+					return // cancelled
+				}
+				s, err := segmentOneQuality(bgCtx, inputPath, outputDir, q)
 				if err != nil {
+					if bgCtx.Err() != nil {
+						return // cancelled
+					}
 					log.Printf("background segment %s failed: %v", q.Name, err)
 					continue
 				}
@@ -254,9 +264,11 @@ func ProcessAudioMultiQuality(inputPath, outputDir, filename string) (*MultiQual
 				log.Printf("background segment %s done: %d segments", q.Name, len(s))
 			}
 		}()
+	} else {
+		bgCancel()
 	}
 
-	return manifest, probe, nil
+	return manifest, probe, bgCancel, nil
 }
 
 func parseBitrateInt(s string) int {
