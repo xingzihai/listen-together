@@ -419,246 +419,118 @@ button#prevTrackBtn:disabled, button#nextTrackBtn:disabled { color: #9ca3af; }
 #playPauseBtn { background: #10b981 !important; color: #fff !important; }
 #playPauseBtn:disabled { background: #d1d5db !important; color: #9ca3af !important; }
 
+
+/* Hide mobile-only elements on desktop */
+.mobile-player { display: none; }
+
 /* ==================== Mobile UI (≤639px) ==================== */
 @media (max-width: 639px) {
-    /* --- Room screen: fullscreen vertical layout --- */
-    #room {
-        padding: 0 !important;
-        max-width: 100vw !important;
-        min-height: 100vh;
-        overflow-x: hidden;
-        overflow-y: auto;
+    /* Hide PC bottom bar only, keep playerMain visible */
+    #playerBar { display: none !important; }
+    /* Hide PC cover/lyrics/info in playerMain (mobile player replaces them) */
+    #coverWrapper, #trackInfoPanel, #lyricsContainer { display: none !important; }
+    /* Make playerMain not take space when mobile player is active */
+    #playerMain { min-height: 0 !important; padding: 0 !important; }
+    .mobile-player {
+        flex-direction: column;
+        align-items: center;
+        position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
+        background: #111; color: #fff;
+        z-index: 40; overflow: hidden;
+        padding: 0 24px env(safe-area-inset-bottom, 0) 24px;
+        display: none;
     }
-
-    /* Simplify background on mobile */
-    #bgBlob1, #bgBlob2, #bgBlob3 { display: none; }
-    #bgOverlay { backdrop-filter: none; background: linear-gradient(160deg, #ecfdf5 0%, #fff 40%, #fff1f2 100%); }
-
-    /* --- Room header --- */
+    .mobile-player.active {
+        display: flex;
+    }
+    .mp-header { text-align: center; padding: 12px 0 4px; flex-shrink: 0; width: 100%; }
+    .mp-title { font-size: 22px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mp-artist { font-size: 15px; color: rgba(255,255,255,0.45); margin-top: 4px; }
+    .mp-cover-wrap { flex-shrink: 0; display: flex; justify-content: center; padding: 16px 0; }
+    .mp-cover {
+        width: min(70vw, 300px); height: min(70vw, 300px);
+        border-radius: 50%; overflow: hidden;
+        background: #222; display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+        transition: border-radius 0.5s ease, box-shadow 0.5s ease;
+    }
+    /* Vinyl style (default) */
+    .style-vinyl .mp-cover {
+        border-radius: 50%;
+        box-shadow: 0 0 0 8px #1a1a1a, 0 0 0 10px #333, 0 8px 30px rgba(0,0,0,0.5);
+    }
+    .style-vinyl .mp-cover.spinning {
+        animation: vinylSpin 20s linear infinite;
+    }
+    /* Card style */
+    .style-card .mp-cover {
+        border-radius: 16px;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+        animation: none !important;
+    }
+    /* Flip animations for cover/lyrics toggle */
+    @keyframes flipOut { from { transform: rotateY(0); } to { transform: rotateY(90deg); } }
+    @keyframes flipIn { from { transform: rotateY(-90deg); } to { transform: rotateY(0); } }
+    @keyframes pageFlipOut { from { transform: perspective(1200px) rotateY(0); opacity:1; } to { transform: perspective(1200px) rotateY(90deg); opacity:0; } }
+    @keyframes pageFlipIn { from { transform: perspective(1200px) rotateY(-90deg); opacity:0; } to { transform: perspective(1200px) rotateY(0); opacity:1; } }
+    .mobile-player.page-flip-out { animation: pageFlipOut 0.3s ease-in forwards; }
+    .mobile-player.page-flip-in { animation: pageFlipIn 0.35s ease-out forwards; }
+    .mp-cover-wrap { perspective: 1000px; }
+    .mp-cover-wrap.flip-out .mp-cover { animation: flipOut 0.25s ease-in forwards; }
+    /* Fullscreen lyrics overlay */
+    .mp-lyrics-overlay {
+        position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.95); z-index: 100;
+        display: none; flex-direction: column; align-items: center; justify-content: center;
+        padding: 20px; perspective: 1000px;
+    }
+    .mp-lyrics-overlay.active { display: flex; }
+    .mp-lyrics-overlay.flip-in .mp-lyrics-full { animation: flipIn 0.25s ease-out forwards; }
+    .mp-lyrics-overlay.flip-out .mp-lyrics-full { animation: flipOut 0.25s ease-in forwards; }
+    .mp-lyrics-full {
+        width: 100%; max-height: 80vh; overflow-y: auto; text-align: center;
+        scrollbar-width: none; -ms-overflow-style: none;
+    }
+    .mp-lyrics-full::-webkit-scrollbar { display: none; }
+    .mp-lyrics-full p { color: rgba(255,255,255,0.4); font-size: 18px; line-height: 2.2; padding: 4px 0; transition: all 0.3s; }
+    .mp-lyrics-full p.current-line { color: #5eead4; font-size: 24px; font-weight: 600; }
+    .mp-cover img { width: 100%; height: 100%; object-fit: cover; }
+    .mp-cover-placeholder { font-size: 48px; color: rgba(255,255,255,0.15); }
+    .mp-lyrics {
+        flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+        width: 100%; text-align: center; padding: 8px 0;
+        mask-image: linear-gradient(transparent, #000 15%, #000 85%, transparent);
+        -webkit-mask-image: linear-gradient(transparent, #000 15%, #000 85%, transparent);
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+    }
+    .mp-lyrics::-webkit-scrollbar { display: none; }
+    .mp-lyrics p { color: rgba(255,255,255,0.3); font-size: 16px; line-height: 2.4; transition: color 0.3s, font-size 0.3s; }
+    .mp-lyrics p.current-line { color: #5eead4; font-size: 20px; font-weight: 600; }
+    .mp-lyrics-empty { color: rgba(255,255,255,0.2) !important; font-size: 14px !important; padding-top: 40px; }
+    .mp-progress { display: flex; align-items: center; gap: 10px; width: 100%; flex-shrink: 0; padding: 4px 0; }
+    .mp-time { font-size: 13px; color: rgba(255,255,255,0.4); font-variant-numeric: tabular-nums; min-width: 34px; text-align: center; }
+    .mp-progress-track { flex: 1; height: 20px; position: relative; display: flex; align-items: center; }
+    .mp-progress-track::before { content: ''; position: absolute; left: 0; right: 0; height: 2px; background: rgba(255,255,255,0.15); border-radius: 1px; }
+    .mp-progress-fill { position: absolute; left: 0; height: 2px; background: #5eead4; border-radius: 1px; z-index: 1; }
+    .mp-progress-input { position: absolute; width: 100%; height: 20px; opacity: 0; cursor: pointer; z-index: 2; margin: 0; }
+    .mp-controls { display: flex; align-items: center; justify-content: center; gap: 40px; flex-shrink: 0; padding: 4px 0 12px; }
+    .mp-ctrl-main {
+        width: 60px; height: 60px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.8);
+        background: transparent; color: #fff; font-size: 22px;
+        display: flex; align-items: center; justify-content: center;
+    }
+    .mp-ctrl-main:disabled { border-color: rgba(255,255,255,0.2); color: rgba(255,255,255,0.2); }
+    .mp-ctrl-side { background: none; border: none; font-size: 24px; color: rgba(255,255,255,0.7); padding: 12px; }
+    #rhCompact, #rhFull { color: #fff; }
     #rhCompact { top: 0.25rem !important; left: 0.25rem !important; }
     #rhFull { top: 0.25rem !important; left: 0.25rem !important; right: 0.25rem !important; }
-
-    /* --- Player main: center everything vertically --- */
-    #playerMain {
-        flex-direction: column !important;
-        justify-content: center !important;
-        align-items: center !important;
-        padding: 48px 20px 140px 20px !important;
-        min-height: 100vh !important;
-        gap: 0 !important;
-        transition: none !important;
-    }
-
-    /* Cover wrapper */
-    #coverWrapper {
-        width: 100% !important;
-        display: flex;
-        justify-content: center;
-        margin: 0 !important;
-        transition: none !important;
-    }
-
-    /* Cover is tappable on mobile */
-    #coverContainer {
-        cursor: pointer;
-        transition: none !important; /* disable PC transition, use flip animations instead */
-    }
-
-    /* Disable transition on track info to prevent layout jump */
-    #trackInfoPanel {
-        transition: none !important;
-    }
-
-    /* Disable vinyl spin and PC transitions on mobile — they conflict with flip animations */
-    .cover-disc {
-        transition: none !important;
-        animation: none !important;
-    }
-    .style-vinyl .cover-wrapper.cover-playing .cover-disc,
-    .style-vinyl .cover-wrapper.cover-paused .cover-disc,
-    .style-card .cover-wrapper.cover-playing .cover-disc,
-    .style-card .cover-wrapper.cover-paused .cover-disc {
-        animation: none !important;
-    }
-    /* Re-enable only our flip animations */
-    #coverContainer.flip-out { animation: coverFlipOut 0.35s ease-in forwards !important; }
-    #coverContainer.flip-in { animation: coverFlipIn 0.35s ease-out forwards !important; }
-    /* Cover flip-out animation */
-    #coverContainer.flip-out {
-        animation: coverFlipOut 0.35s ease-in forwards;
-    }
-    #coverContainer.flip-in {
-        animation: coverFlipIn 0.35s ease-out forwards;
-    }
-    @keyframes coverFlipOut {
-        0% { transform: perspective(800px) rotateY(0deg); opacity: 1; }
-        100% { transform: perspective(800px) rotateY(90deg); opacity: 0; }
-    }
-    @keyframes coverFlipIn {
-        0% { transform: perspective(800px) rotateY(-90deg); opacity: 0; }
-        100% { transform: perspective(800px) rotateY(0deg); opacity: 1; }
-    }
-
-    /* --- Fullscreen lyrics overlay --- */
-    .mobile-lyrics-overlay {
-        position: fixed;
-        top: 0; left: 0; right: 0; bottom: 0;
-        background: rgba(10,10,10,0.95);
-        z-index: 55;
-        overflow-y: auto;
-        -webkit-overflow-scrolling: touch;
-        padding: 60px 24px 140px 24px;
-        transform: perspective(800px) rotateY(-90deg);
-        opacity: 0;
-        transition: none;
-        pointer-events: none;
-    }
-    .mobile-lyrics-overlay.flip-in {
-        animation: lyricsFlipIn 0.35s ease-out forwards !important;
-        pointer-events: auto;
-    }
-    .mobile-lyrics-overlay.flip-out {
-        animation: lyricsFlipOut 0.35s ease-in forwards !important;
-        pointer-events: none;
-    }
-    .mobile-lyrics-overlay.hidden { display: none !important; }
-    @keyframes lyricsFlipIn {
-        0% { transform: perspective(800px) rotateY(-90deg); opacity: 0; }
-        100% { transform: perspective(800px) rotateY(0deg); opacity: 1; }
-    }
-    @keyframes lyricsFlipOut {
-        0% { transform: perspective(800px) rotateY(0deg); opacity: 1; }
-        100% { transform: perspective(800px) rotateY(90deg); opacity: 0; }
-    }
-    .mobile-lyrics-content {
-        display: flex; flex-direction: column; align-items: center;
-        min-height: 100%;
-    }
-    .mobile-lyrics-content p {
-        color: rgba(255,255,255,0.3);
-        font-size: 16px;
-        line-height: 2.8;
-        text-align: center;
-        transition: color 0.3s, font-size 0.3s;
-        width: 100%;
-    }
-    .mobile-lyrics-content p.current-line {
-        color: #34d399;
-        font-size: 20px;
-        font-weight: 600;
-    }
-    #coverContainer { cursor: pointer; }
-
-    /* Track info: below cover, centered */
-    #trackInfoPanel {
-        opacity: 1 !important;
-        pointer-events: auto !important;
-        max-height: none !important;
-        overflow: visible !important;
-        padding-top: 16px !important;
-        width: 100%;
-        text-align: center;
-    }
-    #trackInfoPanel > .w-full { text-align: center !important; }
-    #trackTitle { font-size: 20px !important; }
-    #trackArtist { font-size: 14px !important; margin-top: 4px !important; }
-
-    /* Lyrics preview below title: 2 lines max */
-    #lyricsContainer {
-        max-height: 52px !important;
-        overflow: hidden !important;
-        margin-top: 8px !important;
-    }
-    #lyricsContent { text-align: center !important; }
-    #lyricsContent p { font-size: 13px !important; line-height: 1.6 !important; }
-    #lyricsResizeTop, #lyricsResizeBottom { display: none; }
-
-    /* --- Bottom bar: slim --- */
-    #playerBar {
-        padding: 4px 12px calc(4px + env(safe-area-inset-bottom, 0)) 12px !important;
-    }
-    /* Hide cover+title row in bar (shown in main area) */
-    #barCoverContainer, #barCoverPlaceholder, #barCoverImage { display: none !important; }
-    #playerBar .flex.items-center.gap-2.flex-1.min-w-0 > .min-w-0 { display: none !important; }
-    /* Hide volume, quality, style, debug */
-    .volume-bar-wrapper, #playerBar .fa-volume-up,
-    #qualitySelector, #styleToggleBtn, .fa-bug { display: none !important; }
-    #playerBar .flex.items-center.gap-2.flex-1.justify-end > .flex.items-center.gap-2:last-child { display: none !important; }
-    /* Center controls */
-    #playerBar .flex.items-center.gap-3.mt-1 {
-        justify-content: center !important;
-        margin-top: 2px !important;
-        gap: 16px !important;
-    }
-    #playPauseBtn { width: 48px !important; height: 48px !important; font-size: 18px !important; }
-    #prevTrackBtn, #nextTrackBtn { font-size: 16px !important; padding: 10px !important; }
-    #playModeBtn, #playlistToggleBtn { font-size: 16px !important; padding: 10px !important; }
-
-    /* Playlist: bottom sheet */
-    #playlistModal {
-        position: fixed !important;
-        bottom: 0 !important; left: 0 !important; right: 0 !important;
-        top: auto !important;
-        max-height: 70vh;
-        border-radius: 16px 16px 0 0 !important;
-        z-index: 200;
-    }
-    #playlistModal .playlist-sidebar-content {
-        max-height: 70vh;
-        border-radius: 16px 16px 0 0;
-    }
-
-    /* Library modal */
+    #bgBlob1, #bgBlob2, #bgBlob3 { display: none; }
+    #bgOverlay { background: #111 !important; backdrop-filter: none; }
+    #playlistModal { position: fixed !important; bottom: 0 !important; left: 0 !important; right: 0 !important; top: auto !important; max-height: 70vh; border-radius: 16px 16px 0 0 !important; z-index: 200; }
+    #playlistModal .playlist-sidebar-content { max-height: 70vh; border-radius: 16px 16px 0 0; }
     #libraryModal > div { width: 95vw !important; max-height: 80vh; }
-
-    /* Settings: bottom sheet */
-    #settingsPanel {
-        position: fixed !important;
-        bottom: 0 !important; left: 0 !important; right: 0 !important;
-        top: auto !important;
-        max-height: 80vh;
-        border-radius: 16px 16px 0 0 !important;
-        transform: none !important;
-    }
-
-    /* Hide layout editor on mobile */
+    #settingsOverlay { position: fixed !important; bottom: 0 !important; left: 0 !important; right: 0 !important; top: auto !important; max-height: 80vh; border-radius: 16px 16px 0 0 !important; transform: none !important; }
     #layoutEditor { display: none !important; }
-
-    /* Audience panel */
-    #audiencePanel {
-        position: fixed !important;
-        top: 48px !important; left: 8px !important; right: 8px !important;
-    }
-
-    /* --- Override PC absolute positioning for cover/lyrics --- */
-    .cover-wrapper.cover-active,
-    .cover-wrapper.cover-playing {
-        position: relative !important;
-        left: auto !important;
-        top: auto !important;
-        transform: none !important;
-    }
-    .track-info-panel.visible {
-        position: relative !important;
-        left: auto !important;
-        top: auto !important;
-        right: auto !important;
-        transform: none !important;
-        max-height: none !important;
-    }
-
-    /* Cover disc size on mobile */
-    .cover-disc {
-        width: min(72vw, 300px) !important;
-        height: min(72vw, 300px) !important;
-    }
-
-    /* Vinyl spin: keep but don't change positioning */
-    .style-vinyl .cover-wrapper.cover-active .cover-disc,
-    .style-vinyl .cover-wrapper.cover-playing .cover-disc {
-        border-radius: 50% !important;
-    }
-
-    /* When lyrics overlay is open */
-    #trackInfoPanel.mobile-hidden { display: none !important; }
+    #audiencePanel { position: fixed !important; top: 48px !important; left: 8px !important; right: 8px !important; }
 }

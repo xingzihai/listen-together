@@ -129,7 +129,14 @@ func main() {
 		http.ServeFile(w, r, "./web/static/admin.html")
 	})
 
-	mux.Handle("/", http.FileServer(http.Dir("./web/static")))
+	staticFS := http.FileServer(http.Dir("./web/static"))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".css") || strings.HasSuffix(r.URL.Path, ".js") || r.URL.Path == "/" {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+		}
+		staticFS.ServeHTTP(w, r)
+	}))
 
 	// Fix #2: Global request body limit (1MB for non-upload routes; upload has its own 50MB limit)
 	limitedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -532,10 +539,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Leave old room before joining new one to prevent client leak
 			if currentRoom != nil {
 				empty := currentRoom.RemoveClient(clientID)
-				if empty {
-					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
-					manager.DeleteRoom(currentRoom.Code)
-				} else {
+				if !empty {
 					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 				}
 			}
@@ -564,14 +568,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Leave old room before joining new one to prevent client leak
 			if currentRoom != nil {
 				empty := currentRoom.RemoveClient(clientID)
-				if empty {
-					audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
-					manager.DeleteRoom(currentRoom.Code)
-				} else {
+				if !empty {
 					broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 				}
 			}
 			currentRoom = joinRoom
+			// 取消该房间的延迟删除（有人加入）
+			// manager.CancelDelete(msg.RoomCode) // dead code, rooms no longer auto-delete
 			client := &room.Client{ID: clientID, Username: username, Conn: conn, UID: userID, JoinedAt: time.Now()}
 			if err := currentRoom.AddClient(client); err != nil {
 				safeWrite(WSResponse{Type: "error", Error: err.Error()})
@@ -775,6 +778,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			target.Conn.Close()
 			broadcast(currentRoom, WSResponse{Type: "userLeft", ClientCount: currentRoom.ClientCount(), Users: currentRoom.GetClientList()}, "")
 
+		case "closeRoom":
+			if currentRoom == nil {
+				continue
+			}
+			if currentRoom.OwnerID != userID {
+				safeWrite(WSResponse{Type: "error", Error: "只有房主可以关闭房间"})
+				continue
+			}
+			code := currentRoom.Code
+			// Notify all clients
+			broadcast(currentRoom, WSResponse{Type: "roomClosed"}, "")
+			// Disconnect all clients
+			for _, c := range currentRoom.GetClients() {
+				c.Conn.Close()
+			}
+			audio.CleanupRoom(filepath.Join(dataDir, code))
+			manager.DeleteRoom(code)
+			currentRoom = nil
+
 		case "nextTrack":
 			if currentRoom == nil {
 				continue
@@ -837,10 +859,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	if currentRoom != nil {
 		empty := currentRoom.RemoveClient(clientID)
-		if empty {
-			audio.CleanupRoom(filepath.Join(dataDir, currentRoom.Code))
-			manager.DeleteRoom(currentRoom.Code)
-		} else {
+		if !empty {
 			users := currentRoom.GetClientList()
 			for _, c := range currentRoom.GetClients() {
 				if currentRoom.IsHost(c.ID) {

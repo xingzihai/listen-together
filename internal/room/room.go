@@ -96,16 +96,52 @@ type Room struct {
 }
 
 type Manager struct {
-	rooms map[string]*Room
-	mu    sync.RWMutex
+	rooms         map[string]*Room
+	mu            sync.RWMutex
+	pendingDelete map[string]*time.Timer // 延迟删除定时器
+	pdMu          sync.Mutex
 }
 
 func NewManager() *Manager {
 	m := &Manager{
-		rooms: make(map[string]*Room),
+		rooms:         make(map[string]*Room),
+		pendingDelete: make(map[string]*time.Timer),
 	}
 	go m.cleanupLoop()
 	return m
+}
+
+// ScheduleDelete 延迟删除房间（30秒后执行，期间有人加入则取消）
+func (m *Manager) ScheduleDelete(code string, delay time.Duration, onDelete func()) {
+	m.pdMu.Lock()
+	defer m.pdMu.Unlock()
+	// 如果已有定时器，先取消
+	if t, ok := m.pendingDelete[code]; ok {
+		t.Stop()
+	}
+	m.pendingDelete[code] = time.AfterFunc(delay, func() {
+		m.pdMu.Lock()
+		delete(m.pendingDelete, code)
+		m.pdMu.Unlock()
+		// 再次检查房间是否仍为空
+		rm := m.GetRoom(code)
+		if rm != nil && rm.ClientCount() == 0 {
+			if onDelete != nil {
+				onDelete()
+			}
+			m.DeleteRoom(code)
+		}
+	})
+}
+
+// CancelDelete 取消延迟删除（有人加入时调用）
+func (m *Manager) CancelDelete(code string) {
+	m.pdMu.Lock()
+	defer m.pdMu.Unlock()
+	if t, ok := m.pendingDelete[code]; ok {
+		t.Stop()
+		delete(m.pendingDelete, code)
+	}
 }
 
 func (m *Manager) CreateRoom(code string, ownerID int64) (*Room, error) {
@@ -242,6 +278,29 @@ func (m *Manager) IsUserInRoomWithAudio(userID int64, audioID int64) bool {
 	return false
 }
 
+// IsCurrentTrackInRoom checks if audioID is the CURRENT track in the user's room.
+func (m *Manager) IsCurrentTrackInRoom(userID int64, audioID int64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, rm := range m.rooms {
+		rm.Mu.RLock()
+		inRoom := false
+		for _, c := range rm.Clients {
+			if c.UID == userID {
+				inRoom = true
+				break
+			}
+		}
+		if inRoom {
+			ta := rm.TrackAudio
+			rm.Mu.RUnlock()
+			return ta != nil && ta.AudioID == audioID
+		}
+		rm.Mu.RUnlock()
+	}
+	return false
+}
+
 func (m *Manager) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -291,6 +350,16 @@ func (r *Room) AddClient(client *Client) error {
 	defer r.Mu.Unlock()
 	if len(r.Clients) >= MaxClientsPerRoom {
 		return ErrRoomFull
+	}
+	// Deduplicate: remove old connection from same user (UID)
+	if client.UID != 0 {
+		for id, c := range r.Clients {
+			if c.UID == client.UID && id != client.ID {
+				delete(r.Clients, id)
+				go c.Conn.Close() // close old connection in background
+				break
+			}
+		}
 	}
 	r.Clients[client.ID] = client
 	if r.Host == nil {

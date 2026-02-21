@@ -535,9 +535,19 @@ func (h *LibraryHandlers) ServeSegmentFile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	canAccess, _ := h.DB.CanAccessAudioFile(user.UserID, af.ID)
-	if !canAccess && (h.Manager == nil || !h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)) {
+	inRoom := h.Manager != nil && h.Manager.IsUserInRoomWithAudio(user.UserID, af.ID)
+	if !canAccess && !inRoom {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
+	}
+
+	// Playback lock: non-owner in room can only fetch segments for the current track
+	if !canAccess && inRoom {
+		if !h.Manager.IsCurrentTrackInRoom(user.UserID, af.ID) {
+			w.Header().Set("Content-Type", "text/plain")
+			http.Error(w, "Track changed", http.StatusConflict)
+			return
+		}
 	}
 
 	// Use DB owner ID for path, not URL parameter (prevent path manipulation)
