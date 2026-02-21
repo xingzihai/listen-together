@@ -7,7 +7,8 @@ cd /root/.openclaw/workspace/github-projects/listen-together
 export JWT_SECRET="lt-s3cr3t-k8y-2026-xzh-permanent"
 
 # 杀掉旧的子进程（不杀start.sh自身，避免误杀）
-pkill -f './listen-together' 2>/dev/null
+pkill -f '^\./listen-together$' 2>/dev/null
+# 注意：不能用 './listen-together' 模糊匹配，会误杀 listen-together-demo
 pkill -f 'frpc.*25995194' 2>/dev/null
 sleep 1
 
