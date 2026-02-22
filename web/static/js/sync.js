@@ -230,12 +230,11 @@ class ClockSync {
     // ONE conversion, no intermediate clock domain
     serverTimeToCtx(serverTimeMs) {
         if (!this.synced || this.anchorCtxTime === 0) {
-            // Fallback: use perf-based conversion (less precise)
-            const perfTarget = this.anchorPerfTime + (serverTimeMs - this.anchorServerTime);
-            const perfNow = performance.now();
+            // Fallback: rough estimate using Date.now() + offset (no anchor available yet)
             const ctx = window.audioPlayer && window.audioPlayer.ctx;
             const ctxNow = ctx ? ctx.currentTime : 0;
-            return ctxNow - (perfNow - perfTarget) / 1000;
+            const serverNow = Date.now() + this.offset;
+            return ctxNow + (serverTimeMs - serverNow) / 1000;
         }
         // Direct mapping: no perfTime intermediate
         return this.anchorCtxTime + (serverTimeMs - this.anchorServerTime) / 1000;

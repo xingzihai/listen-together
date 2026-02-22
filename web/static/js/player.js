@@ -148,12 +148,12 @@ class AudioPlayer {
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
                 this._driftCount = 0;
+                // Only refresh ctx anchor, preserve serverPlayTime/Position
+                // so elapsed model stays consistent with server's (position, startTime)
                 const ctxNow = this.ctx.currentTime;
-                const serverNow = window.clockSync.getServerTime();
                 this._anchorCtxTime = ctxNow;
-                this._anchorServerTime = serverNow;
-                this.serverPlayTime = serverNow;
-                this.serverPlayPosition = resumePos;
+                this._anchorServerTime = window.clockSync.getServerTime();
+                this._lastCorrectedSegIdx = -1;
                 this._startLookahead(resumePos, ctxNow);
             }
         } catch (e) { console.error('_upgradeQuality failed:', e);
@@ -220,9 +220,14 @@ class AudioPlayer {
         this._driftCount = 0;
 
         if (!window.clockSync.synced) {
+            // Burst ping to speed up initial sync
+            if (window.clockSync.ws) window.clockSync.ping();
             const syncStart = performance.now();
-            while (!window.clockSync.synced && performance.now() - syncStart < 800) {
+            while (!window.clockSync.synced && performance.now() - syncStart < 1200) {
                 await new Promise(r => setTimeout(r, 50));
+            }
+            if (!window.clockSync.synced) {
+                console.warn('[sync] clockSync not ready after 1.2s, using rough estimate');
             }
         }
 
@@ -284,16 +289,21 @@ class AudioPlayer {
                     ? (i * this.segmentTime + this._firstSegOffset)
                     : (i * this.segmentTime);
                 // Where SHOULD we be at _nextSegTime according to server?
-                const ctxDelta = this._nextSegTime - this._anchorCtxTime;
+                // Use schedTime (after outputLatency compensation) as the reference
+                const schedTime = this._nextSegTime - this._outputLatency;
+                const ctxDelta = schedTime - this._anchorCtxTime;
                 const serverTimeAtNext = this._anchorServerTime + ctxDelta * 1000;
                 const serverElapsed = (serverTimeAtNext - this.serverPlayTime) / 1000;
                 const targetPos = this.serverPlayPosition + serverElapsed;
                 const drift = scheduledPos - targetPos; // positive = ahead
-                // Cap at ±30ms per segment boundary
-                if (Math.abs(drift) > 0.003) {
-                    const correction = Math.max(-0.030, Math.min(0.030, drift));
+                // Dynamic cap: larger drift → larger correction (faster convergence)
+                // 3-30ms: cap 30ms; 30-60ms: cap 50ms; 60ms+: cap 70ms
+                const absDrift = Math.abs(drift);
+                const cap = absDrift > 0.060 ? 0.070 : absDrift > 0.030 ? 0.050 : 0.030;
+                if (absDrift > 0.003) {
+                    const correction = Math.max(-cap, Math.min(cap, drift));
                     this._nextSegTime += correction;
-                    if (Math.abs(drift) > 0.008) {
+                    if (absDrift > 0.008) {
                         console.log(`[sync] seg ${i}: drift=${(drift*1000).toFixed(1)}ms corr=${(correction*1000).toFixed(1)}ms`);
                     }
                 }

@@ -677,10 +677,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: errMsg})
 				continue
 			}
-			currentRoom.Play(msg.Position)
-			// Use room.StartTime for serverTime — must match what syncTick uses for elapsed
+			startTime := currentRoom.Play(msg.Position)
+			playStartMs := startTime.UnixNano() / int64(time.Millisecond)
 			currentRoom.Mu.RLock()
-			playStartMs := currentRoom.StartTime.UnixNano() / int64(time.Millisecond)
 			ta := currentRoom.TrackAudio
 			ti := currentRoom.CurrentTrack
 			currentRoom.Mu.RUnlock()
@@ -737,11 +736,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				safeWrite(WSResponse{Type: "error", Error: errMsg})
 				continue
 			}
-			currentRoom.Seek(msg.Position)
-			// Use room.StartTime for consistency with syncTick elapsed calculation
-			currentRoom.Mu.RLock()
-			seekStartMs := currentRoom.StartTime.UnixNano() / int64(time.Millisecond)
-			currentRoom.Mu.RUnlock()
+			startTime := currentRoom.Seek(msg.Position)
+			seekStartMs := startTime.UnixNano() / int64(time.Millisecond)
 			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: seekStartMs}, "")
 
 		case "statusReport":

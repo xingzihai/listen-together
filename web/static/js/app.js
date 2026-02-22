@@ -291,12 +291,19 @@ async function handleMessage(msg) {
             if (!ap.isPlaying) break;
 
             // Refresh ctx↔server anchor for drift correction in _scheduleAhead
+            // Only refresh when drift is small (<30ms) to avoid disrupting active correction
             // Do NOT update serverPlayTime/Position — those are set at play/seek/forceResync only
-            // Updating them every tick would make drift detection meaningless
             if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
                 if (ap.ctx) {
-                    ap._anchorCtxTime = ap.ctx.currentTime;
-                    ap._anchorServerTime = window.clockSync.getServerTime();
+                    // Check current drift before refreshing anchor
+                    const serverPos = ap.getServerPosition();
+                    const ctxPos = ap.getCurrentTime();
+                    const currentDrift = Math.abs(serverPos - ctxPos);
+                    // Only refresh anchor when drift is small — active correction needs stable reference
+                    if (currentDrift < 0.030) {
+                        ap._anchorCtxTime = ap.ctx.currentTime;
+                        ap._anchorServerTime = window.clockSync.getServerTime();
+                    }
                 }
             }
 
