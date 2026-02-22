@@ -292,15 +292,17 @@ async function handleMessage(msg) {
 
             // Refresh ctx↔server anchor for drift correction in _scheduleAhead
             // Only refresh when drift is small (<30ms) to avoid disrupting active correction
+            // Also force refresh if anchor is too old (>60s) to prevent accumulated clock drift
             // Do NOT update serverPlayTime/Position — those are set at play/seek/forceResync only
             if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
                 if (ap.ctx) {
-                    // Check current drift before refreshing anchor
                     const serverPos = ap.getServerPosition();
                     const ctxPos = ap.getCurrentTime();
                     const currentDrift = Math.abs(serverPos - ctxPos);
-                    // Only refresh anchor when drift is small — active correction needs stable reference
-                    if (currentDrift < 0.030) {
+                    const anchorAge = ap._anchorServerTime > 0
+                        ? (window.clockSync.getServerTime() - ap._anchorServerTime) / 1000
+                        : Infinity;
+                    if (currentDrift < 0.030 || anchorAge > 60) {
                         ap._anchorCtxTime = ap.ctx.currentTime;
                         ap._anchorServerTime = window.clockSync.getServerTime();
                     }
@@ -372,12 +374,11 @@ async function handleMessage(msg) {
         case 'forceResync': {
             const ap = window.audioPlayer;
             if (ap && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
-                ap._driftCount = 0;
-                ap._lastResetTime = performance.now();
-                ap._postResetVerify = true;
-                ap._postResetTime = performance.now();
-                // Force play even if not currently playing (recovery case)
                 if (audioInfo) {
+                    ap._driftCount = 0;
+                    ap._lastResetTime = performance.now();
+                    ap._postResetVerify = true;
+                    ap._postResetTime = performance.now();
                     ap.playAtPosition(msg.position, msg.serverTime);
                     updatePlayButton(true);
                     startUIUpdate();

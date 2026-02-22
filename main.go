@@ -848,6 +848,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Room-level rate limit: max once per 5 seconds
 			now := time.Now()
 			currentRoom.Mu.Lock()
+			if currentRoom.State != room.StatePlaying {
+				currentRoom.Mu.Unlock()
+				continue
+			}
 			if !currentRoom.LastResyncTime.IsZero() && now.Sub(currentRoom.LastResyncTime) < 5*time.Second {
 				currentRoom.Mu.Unlock()
 				continue
