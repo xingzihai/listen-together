@@ -757,10 +757,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			lastStatusReport = now
 
-			// Input validation
-			if math.IsNaN(msg.Position) || math.IsInf(msg.Position, 0) || msg.Position < 0 {
-				continue
-			}
+			// Input validation — position -1 means client is not playing
+			clientNotPlaying := msg.Position < 0
 
 			// Single lock acquisition to read all needed room state
 			currentRoom.Mu.RLock()
@@ -774,6 +772,26 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			ta := currentRoom.TrackAudio
 			currentRoom.Mu.RUnlock()
+
+			// If server is playing but client is not, force resync immediately
+			if clientNotPlaying && serverState == room.StatePlaying {
+				if !lastForceResyncSent.IsZero() && now.Sub(lastForceResyncSent) < 5*time.Second {
+					continue
+				}
+				lastForceResyncSent = now
+				startMs := serverStart.UnixNano() / int64(time.Millisecond)
+				log.Printf("[sync] client not playing but server is — forcing resync")
+				myClient.Send(map[string]interface{}{
+					"type":       "forceResync",
+					"position":   serverPos,
+					"serverTime": startMs,
+				})
+				continue
+			}
+
+			if clientNotPlaying {
+				continue // client not playing, server not playing — nothing to do
+			}
 
 			// Clamp client position to duration
 			clientPos := msg.Position

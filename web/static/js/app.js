@@ -7,6 +7,26 @@ let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'seq
 let trackLoading = false, pendingPlay = null;
 let trackChangeGen = 0;
 let deviceKicked = false;
+let roomWatchdogInterval = null;
+
+// Room watchdog: sends statusReport every 2s so server can detect idle clients
+// Also handles auto-recovery via syncTick (see syncTick handler)
+function startRoomWatchdog() {
+    stopRoomWatchdog();
+    roomWatchdogInterval = setInterval(() => {
+        if (!ws || ws.readyState !== 1 || !roomCode) return;
+        const ap = window.audioPlayer;
+        ws.send(JSON.stringify({
+            type: 'statusReport',
+            position: ap.isPlaying ? ap.getCurrentTime() : -1,
+            playing: ap.isPlaying,
+            trackIndex: typeof currentTrackIndex !== 'undefined' ? currentTrackIndex : 0
+        }));
+    }, 2000);
+}
+function stopRoomWatchdog() {
+    if (roomWatchdogInterval) { clearInterval(roomWatchdogInterval); roomWatchdogInterval = null; }
+}
 
 // --- Cover Art ---
 function updateCoverArt(ownerID, audioUUID) {
@@ -156,7 +176,7 @@ function sessionExpired() {
     stopUIUpdate();
     if (window.clockSync) window.clockSync.stop();
     location.hash = '';
-    roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+    stopRoomWatchdog(); roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
     alert('你的账号已在其他设备登录，当前会话已失效');
     location.reload();
 }
@@ -188,6 +208,7 @@ async function handleMessage(msg) {
             $('userCount').textContent = msg.clientCount || 1;
             showScreen('room');
             window.clockSync.start(ws);
+            startRoomWatchdog();
             if (msg.audio) { audioInfo = msg.audio; await setupAudio(); }
             loadPlaylist();
             $('playlistPanel').classList.remove('hidden');
@@ -201,7 +222,7 @@ async function handleMessage(msg) {
             if (window.audioPlayer) window.audioPlayer.stop();
             stopUIUpdate();
             location.hash = '';
-            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            stopRoomWatchdog(); roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
             $('audiencePanel').classList.add('hidden');
             showScreen('home');
             break;
@@ -251,7 +272,7 @@ async function handleMessage(msg) {
             if (window.audioPlayer) window.audioPlayer.stop();
             stopUIUpdate();
             location.hash = '';
-            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            stopRoomWatchdog(); roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
             $('audiencePanel').classList.add('hidden');
             showScreen('home');
             break;
@@ -343,12 +364,17 @@ async function handleMessage(msg) {
         }
         case 'forceResync': {
             const ap = window.audioPlayer;
-            if (ap && ap.isPlaying && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
+            if (ap && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
                 ap._driftCount = 0;
                 ap._lastResetTime = performance.now();
                 ap._postResetVerify = true;
                 ap._postResetTime = performance.now();
-                ap.playAtPosition(msg.position, msg.serverTime);
+                // Force play even if not currently playing (recovery case)
+                if (audioInfo) {
+                    ap.playAtPosition(msg.position, msg.serverTime);
+                    updatePlayButton(true);
+                    startUIUpdate();
+                }
             }
             break;
         }
@@ -358,7 +384,7 @@ async function handleMessage(msg) {
             stopUIUpdate();
             window.clockSync.stop();
             location.hash = '';
-            roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+            stopRoomWatchdog(); roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
             $('audiencePanel').classList.add('hidden');
             showScreen('home');
             alert(msg.error || '你的账号已在其他设备连接');
@@ -424,7 +450,6 @@ function doPause() {
 }
 
 let uiInterval = null;
-let statusReportInterval = null;
 function startUIUpdate() {
     stopUIUpdate();
     uiInterval = setInterval(() => {
@@ -434,21 +459,9 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
-    // Status report: tell server our playback state every 2s for sync validation
-    statusReportInterval = setInterval(() => {
-        if (!ws || ws.readyState !== 1) return;
-        const ap = window.audioPlayer;
-        if (!ap.isPlaying) return;
-        ws.send(JSON.stringify({
-            type: 'statusReport',
-            position: ap.getCurrentTime(),
-            trackIndex: typeof currentTrackIndex !== 'undefined' ? currentTrackIndex : 0
-        }));
-    }, 2000);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
-    if (statusReportInterval) { clearInterval(statusReportInterval); statusReportInterval = null; }
 }
 
 function updatePlayButton(playing) {
@@ -499,7 +512,7 @@ $('leaveBtn').onclick = () => {
     if (window.clockSync) window.clockSync.stop();
     if (ws) { ws.close(); ws = null; }
     location.hash = '';
-    roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
+    stopRoomWatchdog(); roomCode = null; isHost = false; audioInfo = null; roomUsers = [];
     pausedPosition = 0; playlist = null; playlistItems = []; currentTrackIndex = -1;
     trackLoading = false; pendingPlay = null;
     $('audiencePanel').classList.add('hidden');
