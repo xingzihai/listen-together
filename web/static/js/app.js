@@ -261,20 +261,26 @@ async function handleMessage(msg) {
             if (!ap.isPlaying || typeof msg.position !== 'number' || typeof msg.serverTime !== 'number') break;
             if (msg.position < 0 || msg.position > 86400 || msg.serverTime < 1e12) break;
 
-            // Update server anchor (kept for elapsed calculations)
-            // But NOT during cooldown — playAtPosition just set these precisely
+            // Update server anchor — syncTick now sends the base anchor (position @ startTime)
+            // This is the SAME anchor that syncTick uses for elapsed, eliminating P0-2 mismatch
             if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
                 ap.serverPlayTime = msg.serverTime;
                 ap.serverPlayPosition = msg.position;
+                // Also refresh ctx↔server anchor for drift correction in _scheduleAhead
+                if (ap.ctx) {
+                    ap._anchorCtxTime = ap.ctx.currentTime;
+                    ap._anchorServerTime = window.clockSync.getServerTime();
+                }
             }
 
-            // Drift detection: compare server's authoritative position with our actual audio output
-            // Use getCurrentTime() which is the most accurate representation of what's actually playing
+            // Drift detection: compare our position with server's computed currentPos
             const actualPos = ap.getCurrentTime();
 
-            // Server position with network delay compensation
-            const networkDelay = Math.max(0, (window.clockSync.getServerTime() - msg.serverTime) / 1000);
-            const serverPos = msg.position + networkDelay;
+            // Server sends currentPos (pre-computed) and tickTime (when tick was generated)
+            // Use tickTime for network delay compensation instead of serverTime (which is startTime)
+            const tickTime = msg.tickTime || msg.serverTime;
+            const networkDelay = Math.max(0, (window.clockSync.getServerTime() - tickTime) / 1000);
+            const serverPos = (msg.currentPos != null ? msg.currentPos : msg.position) + networkDelay;
 
             const drift = actualPos - serverPos;
             ap._lastMeasuredDrift = drift;
@@ -299,10 +305,9 @@ async function handleMessage(msg) {
                 }
             }
 
-            // Drift counter logic — client requests server-coordinated resync (never resets itself)
+            // Drift counter logic — client requests server-coordinated resync for persistent drift
             if (absDrift > ap._DRIFT_THRESHOLD) {
                 if (ap._lastResetTime && performance.now() - ap._lastResetTime < ap._RESET_COOLDOWN) {
-                    // C3: Post-reset verification — if >500ms since reset, check once
                     if (ap._postResetVerify && performance.now() - ap._postResetTime > 500) {
                         ap._postResetVerify = false;
                         console.warn(`[sync] post-reset verify failed: drift=${(drift*1000).toFixed(0)}ms, requesting server resync`);
@@ -324,7 +329,7 @@ async function handleMessage(msg) {
                 }
             } else {
                 ap._driftCount = 0;
-                if (ap._postResetVerify) ap._postResetVerify = false; // reset succeeded
+                if (ap._postResetVerify) ap._postResetVerify = false;
             }
 
             break;

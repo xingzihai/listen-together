@@ -440,13 +440,14 @@ func (r *Room) SetAudio(audio *AudioInfo) {
 	r.LastActive = time.Now()
 }
 
-func (r *Room) Play(position float64) {
+func (r *Room) Play(position float64) time.Time {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 	r.State = StatePlaying
 	r.Position = position
 	r.StartTime = time.Now()
 	r.LastActive = time.Now()
+	return r.StartTime
 }
 
 func (r *Room) Pause() float64 {
@@ -462,7 +463,7 @@ func (r *Room) Pause() float64 {
 	return r.Position
 }
 
-func (r *Room) Seek(position float64) {
+func (r *Room) Seek(position float64) time.Time {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 	r.Position = position
@@ -470,6 +471,7 @@ func (r *Room) Seek(position float64) {
 		r.StartTime = time.Now()
 	}
 	r.LastActive = time.Now()
+	return r.StartTime
 }
 
 func (r *Room) GetPlaybackState() (PlayState, float64, time.Time) {

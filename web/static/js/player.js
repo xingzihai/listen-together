@@ -17,13 +17,16 @@ class AudioPlayer {
         this._lookaheadTimer = null;
         this._nextSegIdx = 0;       // next segment to schedule
         this._nextSegTime = 0;      // AudioContext time for next segment
-        // Server-authority sync: simple drift detection + hard reset
+        // Server-authority sync: drift detection + graduated correction
         this._driftCount = 0;           // consecutive over-threshold count
         this._lastResetTime = 0;        // last forced reset timestamp (performance.now())
-        this._DRIFT_THRESHOLD = 0.20;   // 200ms
+        this._DRIFT_THRESHOLD = 0.050;  // 50ms — request resync for persistent drift
         this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
         this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
-        // _lastDrift removed: no segment-level micro-adjustment, rely on syncTick hard reset only
+        // ctx↔server anchor: captured at the same instant for cross-clock-domain mapping
+        this._anchorCtxTime = 0;        // ctx.currentTime when anchor was set
+        this._anchorServerTime = 0;     // clockSync.getServerTime() when anchor was set
+        this._outputLatency = 0;        // set in init() from ctx.outputLatency
     }
 
     init() {
@@ -144,10 +147,14 @@ class AudioPlayer {
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
                 this._driftCount = 0;
-                // Update sync anchors
-                this.serverPlayTime = window.clockSync.getServerTime();
+                // Update sync anchors — capture ctx↔server at same instant
+                const ctxNow = this.ctx.currentTime;
+                const serverNow = window.clockSync.getServerTime();
+                this._anchorCtxTime = ctxNow;
+                this._anchorServerTime = serverNow;
+                this.serverPlayTime = serverNow;
                 this.serverPlayPosition = resumePos;
-                this._startLookahead(resumePos, this.ctx.currentTime);
+                this._startLookahead(resumePos, ctxNow);
             }
         } catch (e) { console.error('_upgradeQuality failed:', e);
         } finally { this._upgrading = false; if (this.onQualityChange) this.onQualityChange(this._actualQuality, false); }
@@ -235,8 +242,11 @@ class AudioPlayer {
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
 
-        // Snap ctx time and start playback immediately
+        // Capture ctx↔server anchor at the same instant for drift correction
         const ctxNow = this.ctx.currentTime;
+        this._anchorCtxTime = ctxNow;
+        this._anchorServerTime = now;
+
         this.startOffset = actualPos;
         this.startTime = ctxNow;
         this._startLookahead(actualPos, ctxNow);
@@ -270,6 +280,32 @@ class AudioPlayer {
         try {
         const LOOKAHEAD = this._actualQuality === 'lossless' ? 3.0 : 1.5;
         const preloadCount = 3;
+
+        // === Graduated drift correction ===
+        // Compare where audio WILL play vs where server says we SHOULD be
+        // Correct by adjusting _nextSegTime for the next segment (zero glitch)
+        if (this._nextSegIdx > 0 && window.clockSync.synced && this._anchorServerTime > 0) {
+            // What position does _nextSegTime correspond to?
+            const scheduledPos = this._nextSegIdx * this.segmentTime;
+            // What position should we be at when _nextSegTime arrives?
+            // Convert _nextSegTime (ctx domain) to server time, then to position
+            const ctxDelta = this._nextSegTime - this._anchorCtxTime; // seconds
+            const serverTimeAtNext = this._anchorServerTime + ctxDelta * 1000; // ms
+            const serverElapsed = (serverTimeAtNext - this.serverPlayTime) / 1000; // seconds
+            const targetPos = this.serverPlayPosition + serverElapsed;
+            const drift = scheduledPos - targetPos; // positive = we're ahead
+            // Graduated correction: absorb drift into _nextSegTime
+            // Cap correction at ±20ms per segment to avoid audible artifacts
+            const MAX_CORRECTION = 0.020; // 20ms per segment boundary
+            if (Math.abs(drift) > 0.003) { // only correct if >3ms
+                const correction = Math.max(-MAX_CORRECTION, Math.min(MAX_CORRECTION, drift));
+                this._nextSegTime += correction;
+                if (Math.abs(drift) > 0.010) {
+                    console.log(`[sync] drift correction: drift=${(drift*1000).toFixed(1)}ms, applied=${(correction*1000).toFixed(1)}ms`);
+                }
+            }
+        }
+
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
             const i = this._nextSegIdx;
@@ -289,7 +325,8 @@ class AudioPlayer {
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            const schedTime = t;
+            // Apply outputLatency compensation: schedule earlier so sound exits DAC on time
+            const schedTime = t - this._outputLatency;
             // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
@@ -338,6 +375,16 @@ class AudioPlayer {
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
+        // Server-authority model: position = serverPlayPosition + elapsed since serverPlayTime
+        // Use clockSync for elapsed to stay locked to server clock, not local ctx clock
+        if (window.clockSync && window.clockSync.synced && this.serverPlayTime > 0) {
+            const now = window.clockSync.getServerTime();
+            const elapsed = (now - this.serverPlayTime) / 1000;
+            let pos = this.serverPlayPosition + Math.max(0, elapsed);
+            if (this.duration > 0 && pos > this.duration) pos = this.duration;
+            return pos;
+        }
+        // Fallback: local ctx clock (before clockSync is ready)
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
         if (this.duration > 0 && pos > this.duration) pos = this.duration;

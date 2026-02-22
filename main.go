@@ -164,6 +164,8 @@ func main() {
 				} else if rm.Audio != nil {
 					duration = rm.Audio.Duration
 				}
+				// Compute elapsed INSIDE lock to avoid race with seek/pause
+				elapsed := time.Since(startT).Seconds()
 				var clients []*room.Client
 				// Only broadcast to multi-client rooms
 				if state == room.StatePlaying && clientCount > 1 {
@@ -176,16 +178,22 @@ func main() {
 				if clients == nil {
 					continue
 				}
-				elapsed := time.Since(startT).Seconds()
 				currentPos := pos + elapsed
 				// Clamp position to duration
 				if duration > 0 && currentPos > duration {
 					currentPos = duration
 				}
+				// Send both the base anchor (position, startTime) and computed currentPos
+				// Client uses position+startTime as the authoritative anchor for elapsed model
+				// currentPos is for drift detection only
+				startMs := startT.UnixNano() / int64(time.Millisecond)
+				nowMs := time.Now().UnixNano() / int64(time.Millisecond)
 				msg := map[string]interface{}{
-					"type":       "syncTick",
-					"position":   currentPos,
-					"serverTime": syncpkg.GetServerTime(),
+					"type":        "syncTick",
+					"position":    pos,         // base position at startTime
+					"serverTime":  startMs,     // when position was set (= room.StartTime)
+					"currentPos":  currentPos,  // computed current position (for drift check)
+					"tickTime":    nowMs,        // when this tick was generated
 				}
 				// Pre-serialize once, reuse for all clients
 				jsonBytes, err := json.Marshal(msg)
@@ -629,13 +637,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					ServerTime: syncpkg.GetServerTime(),
 				})
 				// If currently playing, send play to sync position
+				// Use startT (room.StartTime) as serverTime so client's elapsed model
+				// matches syncTick's elapsed calculation exactly
 				if state == room.StatePlaying {
-					elapsed := time.Since(startT).Seconds()
-					currentPos := pos + elapsed
-					// No ScheduledAt for join restore — client needs to load segments first,
-					// so scheduledAt would always expire. Let client use elapsed fallback.
-					nowMs := syncpkg.GetServerTime()
-					safeWrite(WSResponse{Type: "play", Position: currentPos, ServerTime: nowMs})
+					startMs := startT.UnixNano() / int64(time.Millisecond)
+					safeWrite(WSResponse{Type: "play", Position: pos, ServerTime: startMs})
 				}
 			}
 
@@ -672,17 +678,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Play(msg.Position)
-			nowMs := syncpkg.GetServerTime()
-
-			// Include trackAudio so listeners who missed trackChange can load
+			// Use room.StartTime for serverTime — must match what syncTick uses for elapsed
 			currentRoom.Mu.RLock()
+			playStartMs := currentRoom.StartTime.UnixNano() / int64(time.Millisecond)
 			ta := currentRoom.TrackAudio
 			ti := currentRoom.CurrentTrack
 			currentRoom.Mu.RUnlock()
 
 			broadcast(currentRoom, WSResponse{
 				Type: "play", Position: msg.Position,
-				ServerTime: nowMs,
+				ServerTime: playStartMs,
 				TrackAudio: ta, TrackIndex: ti,
 			}, "")
 
@@ -733,8 +738,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.Seek(msg.Position)
-			nowMs := syncpkg.GetServerTime()
-			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: nowMs}, "")
+			// Use room.StartTime for consistency with syncTick elapsed calculation
+			currentRoom.Mu.RLock()
+			seekStartMs := currentRoom.StartTime.UnixNano() / int64(time.Millisecond)
+			currentRoom.Mu.RUnlock()
+			broadcast(currentRoom, WSResponse{Type: "seek", Position: msg.Position, ServerTime: seekStartMs}, "")
 
 		case "statusReport":
 			// Client reports its actual playback state for server-side validation
@@ -809,11 +817,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					}
 					lastForceResyncSent = now
 					log.Printf("[sync] client drift %.0fms — forcing resync", drift*1000)
-					nowResync := syncpkg.GetServerTime()
+					// Send base anchor (position @ startTime) for consistency
+					startMs := serverStart.UnixNano() / int64(time.Millisecond)
 					myClient.Send(map[string]interface{}{
 						"type":        "forceResync",
-						"position":    expectedPos,
-						"serverTime":  nowResync,
+						"position":    serverPos,
+						"serverTime":  startMs,
 					})
 				}
 			}
@@ -830,22 +839,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			currentRoom.LastResyncTime = now
-			// Compute authoritative position under lock
-			currentPos := currentRoom.Position + time.Since(currentRoom.StartTime).Seconds()
-			dur := 0.0
-			if currentRoom.TrackAudio != nil {
-				dur = currentRoom.TrackAudio.Duration
-			}
-			if dur > 0 && currentPos > dur {
-				currentPos = dur
-			}
+			// Send base anchor (position @ startTime) for consistency with elapsed model
+			basePos := currentRoom.Position
+			startMs := currentRoom.StartTime.UnixNano() / int64(time.Millisecond)
 			currentRoom.Mu.Unlock()
 
-			nowMs := syncpkg.GetServerTime()
 			resyncMsg := map[string]interface{}{
 				"type":       "forceResync",
-				"position":   currentPos,
-				"serverTime": nowMs,
+				"position":   basePos,
+				"serverTime": startMs,
 			}
 			// Pre-serialize once, broadcast to all clients
 			jsonBytes, err := json.Marshal(resyncMsg)
@@ -855,7 +857,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					c.Send(raw)
 				}
 			}
-			log.Printf("[sync] server-coordinated resync: pos=%.2f", currentPos)
+			log.Printf("[sync] server-coordinated resync: pos=%.2f", basePos)
 
 		case "kick":
 			if currentRoom == nil {

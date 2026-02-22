@@ -66,7 +66,7 @@ class ClockSync {
         } else if (!this.synced) {
             interval = 300;
         } else {
-            interval = 10000;
+            interval = 5000;
         }
         this._timer = setTimeout(() => { this.ping(); this._scheduleNext(); }, interval);
     }
@@ -148,7 +148,7 @@ class ClockSync {
         }
 
         // Expire old samples
-        const expiry = this.synced ? 60000 : 15000;
+        const expiry = this.synced ? 30000 : 15000;
         const cutoff = perfNow - expiry;
         this.samples = this.samples.filter(s => s.ts > cutoff);
 
@@ -185,7 +185,7 @@ class ClockSync {
         if (this.synced && this.anchorPerfTime > 0) {
             const currentEstimate = this.anchorServerTime + (newAnchorPerf - this.anchorPerfTime);
             const delta = Math.abs(newAnchorServer - currentEstimate);
-            if (delta < 5) {
+            if (delta < 2) {
                 const blendedServer = 0.7 * currentEstimate + 0.3 * newAnchorServer;
                 // Maintain consistent ctx anchor: apply same blend ratio
                 const currentCtxEstimate = this.anchorCtxTime + (newAnchorPerf - this.anchorPerfTime) / 1000;
