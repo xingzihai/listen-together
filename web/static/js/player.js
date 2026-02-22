@@ -17,16 +17,18 @@ class AudioPlayer {
         this._lookaheadTimer = null;
         this._nextSegIdx = 0;       // next segment to schedule
         this._nextSegTime = 0;      // AudioContext time for next segment
-        // Server-authority sync: drift detection + graduated correction
-        this._driftCount = 0;           // consecutive over-threshold count
-        this._lastResetTime = 0;        // last forced reset timestamp (performance.now())
-        this._DRIFT_THRESHOLD = 0.100;  // 100ms — request resync for persistent drift
-        this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
-        this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
-        // ctx↔server anchor: captured at the same instant for cross-clock-domain mapping
-        this._anchorCtxTime = 0;        // ctx.currentTime when anchor was set
-        this._anchorServerTime = 0;     // clockSync.getServerTime() when anchor was set
-        this._outputLatency = 0;        // set in init() from ctx.outputLatency
+        // Server-authority sync
+        this._driftCount = 0;
+        this._lastResetTime = 0;
+        this._DRIFT_THRESHOLD = 0.100;  // 100ms hard resync threshold
+        this._DRIFT_COUNT_LIMIT = 3;
+        this._RESET_COOLDOWN = 5000;
+        // ctx↔server anchor for drift correction
+        this._anchorCtxTime = 0;
+        this._anchorServerTime = 0;
+        this._outputLatency = 0;
+        // Track which segments have already had drift correction applied
+        this._lastCorrectedSegIdx = -1;
     }
 
     init() {
@@ -36,7 +38,6 @@ class AudioPlayer {
             this.gainNode.connect(this.ctx.destination);
         }
         if (this.ctx.state === 'suspended') this.ctx.resume();
-        // Hardware output latency — applied to scheduling for cross-device sync
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
         console.log(`[sync] outputLatency: ${(this._outputLatency*1000).toFixed(1)}ms`);
     }
@@ -147,7 +148,6 @@ class AudioPlayer {
                 this.startOffset = resumePos;
                 this.startTime = this.ctx.currentTime;
                 this._driftCount = 0;
-                // Update sync anchors — capture ctx↔server at same instant
                 const ctxNow = this.ctx.currentTime;
                 const serverNow = window.clockSync.getServerTime();
                 this._anchorCtxTime = ctxNow;
@@ -189,7 +189,6 @@ class AudioPlayer {
             window.audioCache.put(url, data.slice(0));
         }
         const buffer = await this.ctx.decodeAudioData(data);
-        // Trim FLAC block-alignment padding: ensure each segment is exactly segmentTime
         const isLast = (idx === this.segments.length - 1);
         const expectedSamples = Math.round(this.segmentTime * buffer.sampleRate);
         if (!isLast && buffer.length > expectedSamples) {
@@ -208,7 +207,6 @@ class AudioPlayer {
     async playAtPosition(position, serverTime) {
         this.init();
 
-        // Preload target segments BEFORE stopping current playback
         const prePosition = position || 0;
         const segIdx = Math.floor(prePosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
@@ -217,12 +215,10 @@ class AudioPlayer {
             if (this.onBuffering) this.onBuffering(false);
         }
 
-        // Stop old playback (segments already cached)
         this.stop();
         this.isPlaying = true;
         this._driftCount = 0;
 
-        // Wait for ClockSync (max 800ms)
         if (!window.clockSync.synced) {
             const syncStart = performance.now();
             while (!window.clockSync.synced && performance.now() - syncStart < 800) {
@@ -235,27 +231,23 @@ class AudioPlayer {
 
         if (!this.isPlaying) return;
 
-        // === Direct elapsed model with clockSync ===
         // Server says: "at serverTime, position was P"
-        // Calculate where we should be RIGHT NOW using clockSync
+        // Calculate where we should be RIGHT NOW
         const now = window.clockSync.getServerTime();
         const elapsed = Math.max(0, (now - this.serverPlayTime) / 1000);
         const actualPos = this.serverPlayPosition + elapsed;
 
-        // Capture ctx↔server anchor at the same instant for drift correction
+        // Capture ctx↔server anchor at the same instant
         const ctxNow = this.ctx.currentTime;
         this._anchorCtxTime = ctxNow;
         this._anchorServerTime = now;
+        this._lastCorrectedSegIdx = -1;
 
         this.startOffset = actualPos;
         this.startTime = ctxNow;
         this._startLookahead(actualPos, ctxNow);
     }
     
-    // === Lookahead Scheduler ===
-    // Instead of scheduling all segments at once, schedule 2-3 ahead
-    // and use setInterval to keep feeding the queue.
-    // Drift correction adjusts _nextSegTime for the NEXT segment — zero glitch.
     _startLookahead(position, ctxStartTime) {
         this._stopLookahead();
         const segIdx = Math.floor(position / this.segmentTime);
@@ -264,9 +256,7 @@ class AudioPlayer {
         this._nextSegTime = ctxStartTime;
         this._firstSegOffset = segOffset;
         this._isFirstSeg = true;
-        // Schedule first 2 segments immediately
         this._scheduleAhead();
-        // Then check every 200ms to keep the queue fed
         this._lookaheadTimer = setInterval(() => this._scheduleAhead(), 200);
     }
 
@@ -281,34 +271,34 @@ class AudioPlayer {
         const LOOKAHEAD = this._actualQuality === 'lossless' ? 3.0 : 1.5;
         const preloadCount = 3;
 
-        // === Graduated drift correction ===
-        // Compare where audio WILL play vs where server says we SHOULD be
-        // Correct by adjusting _nextSegTime for the next segment (zero glitch)
-        if (this._nextSegIdx > 0 && window.clockSync.synced && this._anchorServerTime > 0) {
-            // What position does _nextSegTime correspond to?
-            const scheduledPos = this._nextSegIdx * this.segmentTime;
-            // What position should we be at when _nextSegTime arrives?
-            // Convert _nextSegTime (ctx domain) to server time, then to position
-            const ctxDelta = this._nextSegTime - this._anchorCtxTime; // seconds
-            const serverTimeAtNext = this._anchorServerTime + ctxDelta * 1000; // ms
-            const serverElapsed = (serverTimeAtNext - this.serverPlayTime) / 1000; // seconds
-            const targetPos = this.serverPlayPosition + serverElapsed;
-            const drift = scheduledPos - targetPos; // positive = we're ahead
-            // Graduated correction: absorb drift into _nextSegTime
-            // Cap correction at ±20ms per segment to avoid audible artifacts
-            const MAX_CORRECTION = 0.020; // 20ms per segment boundary
-            if (Math.abs(drift) > 0.003) { // only correct if >3ms
-                const correction = Math.max(-MAX_CORRECTION, Math.min(MAX_CORRECTION, drift));
-                this._nextSegTime += correction;
-                if (Math.abs(drift) > 0.010) {
-                    console.log(`[sync] drift correction: drift=${(drift*1000).toFixed(1)}ms, applied=${(correction*1000).toFixed(1)}ms`);
-                }
-            }
-        }
-
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
             const i = this._nextSegIdx;
+
+            // === Drift correction: apply ONCE per segment, right before scheduling ===
+            if (i > 0 && i !== this._lastCorrectedSegIdx &&
+                window.clockSync.synced && this._anchorServerTime > 0) {
+                this._lastCorrectedSegIdx = i;
+                // Where will this segment play in track-position terms?
+                const scheduledPos = this._isFirstSeg
+                    ? (i * this.segmentTime + this._firstSegOffset)
+                    : (i * this.segmentTime);
+                // Where SHOULD we be at _nextSegTime according to server?
+                const ctxDelta = this._nextSegTime - this._anchorCtxTime;
+                const serverTimeAtNext = this._anchorServerTime + ctxDelta * 1000;
+                const serverElapsed = (serverTimeAtNext - this.serverPlayTime) / 1000;
+                const targetPos = this.serverPlayPosition + serverElapsed;
+                const drift = scheduledPos - targetPos; // positive = ahead
+                // Cap at ±30ms per segment boundary
+                if (Math.abs(drift) > 0.003) {
+                    const correction = Math.max(-0.030, Math.min(0.030, drift));
+                    this._nextSegTime += correction;
+                    if (Math.abs(drift) > 0.008) {
+                        console.log(`[sync] seg ${i}: drift=${(drift*1000).toFixed(1)}ms corr=${(correction*1000).toFixed(1)}ms`);
+                    }
+                }
+            }
+
             if (!this.buffers.has(i)) {
                 if (this.onBuffering) this.onBuffering(true);
                 await this.loadSegment(i);
@@ -325,9 +315,9 @@ class AudioPlayer {
             const off = this._isFirstSeg ? this._firstSegOffset : 0;
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
-            // Apply outputLatency compensation: schedule earlier so sound exits DAC on time
+            // outputLatency compensation
             const schedTime = t - this._outputLatency;
-            // Crossfade: 3ms fade-in at start, 3ms fade-out at end to eliminate clicks
+            // Crossfade
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
                 segGain.gain.setValueAtTime(0, schedTime);
@@ -359,7 +349,6 @@ class AudioPlayer {
         this._upgrading = false;
         this._scheduling = false;
         this._driftCount = 0;
-        // Fade out to avoid click/pop, then stop sources
         if (this.gainNode && this.ctx) {
             const now = this.ctx.currentTime;
             this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, now);
@@ -373,7 +362,7 @@ class AudioPlayer {
         }, 10);
     }
 
-    // Get server-authoritative position (for sync/drift detection only, not UI)
+    // Server-authoritative position (for drift detection, not UI)
     getServerPosition() {
         if (window.clockSync && window.clockSync.synced && this.serverPlayTime > 0) {
             const now = window.clockSync.getServerTime();
@@ -385,8 +374,6 @@ class AudioPlayer {
 
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
-        // Use local ctx clock for smooth, continuous position (no jumps)
-        // Drift correction happens in _scheduleAhead, not here
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
         if (this.duration > 0 && pos > this.duration) pos = this.duration;

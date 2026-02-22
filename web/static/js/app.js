@@ -258,8 +258,16 @@ async function handleMessage(msg) {
         case 'pong': window.clockSync.handlePong(msg); break;
         case 'syncTick': {
             const ap = window.audioPlayer;
-            if (!ap.isPlaying || typeof msg.position !== 'number' || typeof msg.serverTime !== 'number') break;
+            if (typeof msg.position !== 'number' || typeof msg.serverTime !== 'number') break;
             if (msg.position < 0 || msg.position > 86400 || msg.serverTime < 1e12) break;
+
+            // Auto-recovery: server says playing but we're not — start playback
+            if (!ap.isPlaying && audioInfo) {
+                console.warn('[sync] syncTick received but not playing — auto-recovering');
+                await doPlay(msg.position, msg.serverTime);
+                break;
+            }
+            if (!ap.isPlaying) break;
 
             // Refresh ctx↔server anchor for drift correction in _scheduleAhead
             // Do NOT update serverPlayTime/Position — those are set at play/seek/forceResync only
@@ -416,6 +424,7 @@ function doPause() {
 }
 
 let uiInterval = null;
+let statusReportInterval = null;
 function startUIUpdate() {
     stopUIUpdate();
     uiInterval = setInterval(() => {
@@ -425,9 +434,21 @@ function startUIUpdate() {
         $('currentTime').textContent = formatTime(t);
         if (!seeking) $('progressBar').value = t;
     }, 250);
+    // Status report: tell server our playback state every 2s for sync validation
+    statusReportInterval = setInterval(() => {
+        if (!ws || ws.readyState !== 1) return;
+        const ap = window.audioPlayer;
+        if (!ap.isPlaying) return;
+        ws.send(JSON.stringify({
+            type: 'statusReport',
+            position: ap.getCurrentTime(),
+            trackIndex: typeof currentTrackIndex !== 'undefined' ? currentTrackIndex : 0
+        }));
+    }, 2000);
 }
 function stopUIUpdate() {
     if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+    if (statusReportInterval) { clearInterval(statusReportInterval); statusReportInterval = null; }
 }
 
 function updatePlayButton(playing) {
