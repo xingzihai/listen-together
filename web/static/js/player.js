@@ -20,7 +20,7 @@ class AudioPlayer {
         // Server-authority sync: drift detection + graduated correction
         this._driftCount = 0;           // consecutive over-threshold count
         this._lastResetTime = 0;        // last forced reset timestamp (performance.now())
-        this._DRIFT_THRESHOLD = 0.050;  // 50ms — request resync for persistent drift
+        this._DRIFT_THRESHOLD = 0.100;  // 100ms — request resync for persistent drift
         this._DRIFT_COUNT_LIMIT = 3;    // 3 consecutive triggers reset
         this._RESET_COOLDOWN = 5000;    // 5s cooldown after reset
         // ctx↔server anchor: captured at the same instant for cross-clock-domain mapping
@@ -373,18 +373,20 @@ class AudioPlayer {
         }, 10);
     }
 
-    getCurrentTime() {
-        if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
-        // Server-authority model: position = serverPlayPosition + elapsed since serverPlayTime
-        // Use clockSync for elapsed to stay locked to server clock, not local ctx clock
+    // Get server-authoritative position (for sync/drift detection only, not UI)
+    getServerPosition() {
         if (window.clockSync && window.clockSync.synced && this.serverPlayTime > 0) {
             const now = window.clockSync.getServerTime();
             const elapsed = (now - this.serverPlayTime) / 1000;
-            let pos = this.serverPlayPosition + Math.max(0, elapsed);
-            if (this.duration > 0 && pos > this.duration) pos = this.duration;
-            return pos;
+            return this.serverPlayPosition + Math.max(0, elapsed);
         }
-        // Fallback: local ctx clock (before clockSync is ready)
+        return this.getCurrentTime();
+    }
+
+    getCurrentTime() {
+        if (!this.isPlaying || !this.ctx) return this.lastPosition || this.startOffset || 0;
+        // Use local ctx clock for smooth, continuous position (no jumps)
+        // Drift correction happens in _scheduleAhead, not here
         const elapsed = this.ctx.currentTime - this.startTime;
         let pos = this.startOffset + Math.max(0, elapsed);
         if (this.duration > 0 && pos > this.duration) pos = this.duration;

@@ -261,20 +261,19 @@ async function handleMessage(msg) {
             if (!ap.isPlaying || typeof msg.position !== 'number' || typeof msg.serverTime !== 'number') break;
             if (msg.position < 0 || msg.position > 86400 || msg.serverTime < 1e12) break;
 
-            // Update server anchor — syncTick now sends the base anchor (position @ startTime)
-            // This is the SAME anchor that syncTick uses for elapsed, eliminating P0-2 mismatch
+            // Refresh ctx↔server anchor for drift correction in _scheduleAhead
+            // Do NOT update serverPlayTime/Position — those are set at play/seek/forceResync only
+            // Updating them every tick would make drift detection meaningless
             if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
-                ap.serverPlayTime = msg.serverTime;
-                ap.serverPlayPosition = msg.position;
-                // Also refresh ctx↔server anchor for drift correction in _scheduleAhead
                 if (ap.ctx) {
                     ap._anchorCtxTime = ap.ctx.currentTime;
                     ap._anchorServerTime = window.clockSync.getServerTime();
                 }
             }
 
-            // Drift detection: compare our position with server's computed currentPos
-            const actualPos = ap.getCurrentTime();
+            // Drift detection: compare server-authority position with server's computed currentPos
+            // Use getServerPosition() (clockSync-based) for accurate drift, not getCurrentTime() (ctx-based)
+            const actualPos = ap.getServerPosition();
 
             // Server sends currentPos (pre-computed) and tickTime (when tick was generated)
             // Use tickTime for network delay compensation instead of serverTime (which is startTime)
