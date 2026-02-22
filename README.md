@@ -5,7 +5,7 @@
 ## ✨ 功能特性
 
 - **房间系统** — 8位房间码，创建或加入房间即可同步听歌
-- **精确同步** — NTP风格时钟校准 + 三级漂移纠正，同步精度 <30ms
+- **精确同步** — 服务器权威模型 + 三重时钟锚点 + 渐进漂移纠正，同局域网 <15ms
 - **全质量FLAC** — 所有音质档位均使用FLAC无损编码，无拼接爆音
 - **多音质切换** — Lossless / High / Medium / Low 四档音质，按需选择
 - **音乐库管理** — 上传、管理、搜索你的音乐收藏
@@ -16,6 +16,7 @@
 - **布局编辑器** — 自定义界面布局，拖拽排列组件
 - **动态磨玻璃背景** — 基于专辑封面的Glassmorphism视觉效果
 - **用户设置同步** — 偏好设置服务端持久化，跨设备同步
+- **空闲客户端自动恢复** — 服务端检测未播放客户端并强制同步
 - **用户认证** — JWT认证 + 登录限流 + 安全Cookie
 - **响应式设计** — 桌面端和移动端自适应
 
@@ -24,7 +25,7 @@
 - **后端**: Go + Gorilla WebSocket + SQLite
 - **前端**: 原生HTML/JS + Tailwind CSS + Web Audio API
 - **音频处理**: ffmpeg（转码、分段、元数据提取）
-- **同步协议**: 自研NTP-like时钟同步 + 三级漂移纠正
+- **同步协议**: 服务器权威模型 + NTP-like三重时钟锚点 + Lookahead调度
 
 ## 🚀 快速开始
 
@@ -81,23 +82,34 @@ go build -o listen-together .
 
 ## 🎯 同步协议
 
-ListenTogether 使用自研的NTP风格时钟同步协议，实现 <30ms 的播放同步精度：
+ListenTogether v0.9.0 使用服务器权威同步模型，实现高精度播放同步：
 
-1. 客户端发送 `ping`（携带本地时间戳）
-2. 服务端回复 `pong`（携带客户端时间戳 + 服务端时间戳）
-3. 客户端计算RTT和时钟偏移
-4. 重复5轮，取中位数确保精度
-5. 每30秒重新校准
+### 三重时钟锚点
 
-播放指令包含 `scheduledAt`（服务端时间 + 缓冲），所有客户端在同一时刻开始播放。
+客户端同时校准三个时钟域，消除跨域转换误差：
 
-### 三级漂移纠正
+1. **anchorServerTime** — 服务端时间（ms），NTP-like ping/pong校准
+2. **anchorPerfTime** — performance.now()，用于非音频时间计算
+3. **anchorCtxTime** — AudioContext.currentTime，用于音频调度
 
-| 级别 | 偏差范围 | 策略 |
+### 服务器权威模型
+
+- 服务端维护唯一真相源：`(position, startTime)`
+- 所有 play/seek/forceResync/syncTick 统一使用 `room.StartTime` 作为时间基准
+- 客户端通过 `elapsed = clockSync.getServerTime() - startTime` 计算当前位置
+- 消除了之前 serverTime 与 StartTime 不一致导致的永久偏差
+
+### Lookahead 调度 + 渐进漂移纠正
+
+| 机制 | 触发条件 | 策略 |
 |------|---------|------|
-| Tier 1 | 5-50ms | 软纠正：微调下一分段的排列时间 |
-| Tier 2 | 50-300ms | 播放速率调整：动态调节 playbackRate ±2-5% |
-| Tier 3 | >300ms | 硬重置：重新定位播放位置 |
+| 渐进纠正 | 每个segment边界（5s） | 调整 _nextSegTime ±30ms，无感知 |
+| 硬重置 | 连续3次 >100ms | 客户端请求服务端协调全房间重同步 |
+| 空闲恢复 | 客户端未播放 | 服务端检测后发送 forceResync |
+
+### outputLatency 补偿
+
+自动检测设备音频输出延迟（有线/蓝牙），提前调度 segment 播放，确保声音在正确时刻到达耳朵。
 
 ## 📁 项目结构
 
