@@ -288,40 +288,51 @@ async function handleMessage(msg) {
                 await doPlay(msg.position, msg.serverTime);
                 break;
             }
-            if (!ap.isPlaying) break;
+            if (!ap.isPlaying || !ap.ctx) break;
 
-            // Refresh ctx↔server anchor for drift correction in _scheduleAhead
-            // Only refresh when drift is small (<30ms) to avoid disrupting active correction
-            // Also force refresh if anchor is too old (>60s) to prevent accumulated clock drift
-            // Do NOT update serverPlayTime/Position — those are set at play/seek/forceResync only
-            if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
-                if (ap.ctx) {
-                    const serverPos = ap.getServerPosition();
-                    const ctxPos = ap.getCurrentTime();
-                    const currentDrift = Math.abs(serverPos - ctxPos);
-                    const anchorAge = ap._anchorServerTime > 0
-                        ? (window.clockSync.getServerTime() - ap._anchorServerTime) / 1000
-                        : Infinity;
-                    if (currentDrift < 0.030 || anchorAge > 60) {
-                        ap._anchorCtxTime = ap.ctx.currentTime;
-                        ap._anchorServerTime = window.clockSync.getServerTime();
-                    }
-                }
-            }
-
-            // Drift detection: compare server-authority position with server's computed currentPos
-            // Use getServerPosition() (clockSync-based) for accurate drift, not getCurrentTime() (ctx-based)
-            const actualPos = ap.getServerPosition();
+            // === Drift detection: unified in ctx clock domain ===
+            // Both actualPos and serverPos are computed via ctx↔server anchor,
+            // eliminating cross-clock-domain errors between perf and ctx clocks.
 
             // Server sends currentPos (pre-computed) and tickTime (when tick was generated)
-            // Use tickTime for network delay compensation instead of serverTime (which is startTime)
+            // Use tickTime for network delay compensation
             const tickTime = msg.tickTime || msg.serverTime;
-            const networkDelay = Math.max(0, (window.clockSync.getServerTime() - tickTime) / 1000);
+            const networkDelay = Math.min(Math.max(0, (window.clockSync.getServerTime() - tickTime) / 1000), 0.1);
             const serverPos = (msg.currentPos != null ? msg.currentPos : msg.position) + networkDelay;
 
-            const drift = actualPos - serverPos;
+            // Convert serverPos to ctx domain: where should ctx be for this server position?
+            // targetCtxPos = anchorCtxTime + (serverTargetTime - anchorServerTime) / 1000
+            // serverTargetTime = serverPlayTime + serverPos * 1000 ... but simpler:
+            // We want: what ctx.currentTime corresponds to serverPos?
+            // serverPos is seconds from track start. serverPlayTime is when track started (ms).
+            // serverTimeAtPos = serverPlayTime + serverPos * 1000
+            // ctxAtPos = anchorCtxTime + (serverTimeAtPos - anchorServerTime) / 1000
+            const serverTimeAtTarget = ap.serverPlayTime + serverPos * 1000;
+            const expectedCtxTime = ap._anchorCtxTime + (serverTimeAtTarget - ap._anchorServerTime) / 1000;
+
+            // Actual ctx position: where is ctx right now in track-position terms?
+            const ctxNow = ap.ctx.currentTime;
+            const actualPos = ap.startOffset + (ctxNow - ap.startTime);
+
+            // Expected position from ctx perspective
+            const expectedPos = ap.startOffset + (expectedCtxTime - ap.startTime);
+
+            const drift = actualPos - expectedPos;
             ap._lastMeasuredDrift = drift;
             const absDrift = Math.abs(drift);
+
+            // === Anchor refresh: use _lastMeasuredDrift (same clock domain) ===
+            // Only refresh when drift is small to avoid disrupting active correction
+            // Force refresh if anchor is too old (>30s) to prevent accumulated clock drift
+            if (!ap._lastResetTime || performance.now() - ap._lastResetTime > ap._RESET_COOLDOWN) {
+                const anchorAge = ap._anchorServerTime > 0
+                    ? (window.clockSync.getServerTime() - ap._anchorServerTime) / 1000
+                    : Infinity;
+                if (absDrift < 0.030 || anchorAge > 30) {
+                    ap._anchorCtxTime = ctxNow;
+                    ap._anchorServerTime = window.clockSync.getServerTime();
+                }
+            }
 
             // Debug panel update
             const driftEl = document.getElementById('driftStatus');
@@ -336,7 +347,7 @@ async function handleMessage(msg) {
                     const lat = ((ap._outputLatency||0)*1000).toFixed(0);
                     dbg.textContent = [
                         `CLK offset:${off}ms rtt:${rtt}ms samples:${sam} synced:${syn}`,
-                        `POS actual:${actualPos.toFixed(3)} server:${serverPos.toFixed(3)} netDelay:${(networkDelay*1000).toFixed(0)}ms`,
+                        `POS actual:${actualPos.toFixed(3)} expected:${expectedPos.toFixed(3)} netDelay:${(networkDelay*1000).toFixed(0)}ms`,
                         `SEG idx:${ap._nextSegIdx} lat:${lat}ms cooldown:${ap._lastResetTime ? Math.max(0, ap._RESET_COOLDOWN - (performance.now() - ap._lastResetTime)).toFixed(0) : '0'}ms`,
                     ].join('\n');
                 }

@@ -220,6 +220,8 @@ class AudioPlayer {
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime) {
         this.init();
+        // Stop old lookahead immediately to prevent stale scheduling during preload
+        this._stopLookahead();
 
         const prePosition = position || 0;
         const segIdx = Math.floor(prePosition / this.segmentTime);
