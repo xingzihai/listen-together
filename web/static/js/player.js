@@ -12,7 +12,10 @@ class AudioPlayer {
         this._qualities = [];
         this._ownerID = null;
         this._audioID = null;
+        this._audioUUID = null;
         this.onQualityChange = null;
+        // Generation counter: incremented on every loadAudio to invalidate stale async ops
+        this._loadGeneration = 0;
         // Lookahead scheduler state
         this._lookaheadTimer = null;
         this._nextSegIdx = 0;       // next segment to schedule
@@ -44,6 +47,7 @@ class AudioPlayer {
 
     async loadAudio(audioInfo, roomCode) {
         this.stop();
+        const gen = ++this._loadGeneration;
         this.segments = audioInfo.segments || [];
         this.duration = audioInfo.duration || 0;
         this.segmentTime = audioInfo.segmentTime || 5;
@@ -61,12 +65,15 @@ class AudioPlayer {
                 : this._qualities[this._qualities.length - 1];
             this._actualQuality = initialQ;
             await this._loadQualitySegments(initialQ);
+            if (gen !== this._loadGeneration) return; // stale
         } else {
             this._actualQuality = 'medium';
         }
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
-        if (this.segments.length > 0) await this.preloadSegments(0, 1);
-        if (this.segments.length > 1) this.preloadSegments(1, 4);
+        if (gen !== this._loadGeneration) return; // stale
+        if (this.segments.length > 0) await this.preloadSegments(0, 1, gen);
+        if (gen !== this._loadGeneration) return; // stale
+        if (this.segments.length > 1) this.preloadSegments(1, 4, gen); // no await, but gen-guarded
     }
 
     async _loadQualitySegments(quality) {
@@ -98,10 +105,12 @@ class AudioPlayer {
         if (targetQuality === this._actualQuality) return;
         if (!this._audioID || !this._ownerID) return;
         this._upgrading = true;
+        const gen = this._loadGeneration;
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, true);
         try {
             const res = await fetch(`/api/library/files/${this._audioID}/segments/${targetQuality}/`, {credentials:'include'});
             if (!res.ok) throw new Error('upgrade segments fetch failed: ' + res.status);
+            if (gen !== this._loadGeneration) return; // stale
             const data = await res.json();
             const newSegments = data.segments || [];
             const newSegTime = data.segment_time || this.segmentTime;
@@ -109,7 +118,7 @@ class AudioPlayer {
             if (!newSegments.length) throw new Error('no segments for target quality');
             const newBuffers = new Map();
             for (let i = 0; i < newSegments.length; i++) {
-                if (!this._upgrading) return;
+                if (!this._upgrading || gen !== this._loadGeneration) return;
                 const url = `/api/library/segments/${this._ownerID}/${newAudioUUID}/${targetQuality}/${newSegments[i]}`;
                 let arrayBuf = await window.audioCache.get(url);
                 if (!arrayBuf) {
@@ -126,13 +135,13 @@ class AudioPlayer {
                 const buffer = await this.ctx.decodeAudioData(arrayBuf);
                 newBuffers.set(i, buffer);
             }
-            if (!this._upgrading) return;
+            if (!this._upgrading || gen !== this._loadGeneration) return;
             if (this.isPlaying) {
                 const curPos = this.getCurrentTime();
                 const curSegEnd = (Math.floor(curPos / this.segmentTime) + 1) * this.segmentTime;
                 const waitMs = Math.max(0, (curSegEnd - curPos) * 1000);
                 if (waitMs > 50) await new Promise(r => setTimeout(r, waitMs));
-                if (!this._upgrading || !this.isPlaying) return;
+                if (!this._upgrading || !this.isPlaying || gen !== this._loadGeneration) return;
             }
             const resumePos = this.isPlaying ? this.getCurrentTime() : this.lastPosition;
             const wasPlaying = this.isPlaying;
@@ -167,15 +176,17 @@ class AudioPlayer {
         return base + this.segments[idx];
     }
 
-    async preloadSegments(startIdx, count) {
+    async preloadSegments(startIdx, count, gen) {
+        const g = gen || this._loadGeneration;
         const end = Math.min(startIdx + count, this.segments.length);
         const promises = [];
-        for (let i = startIdx; i < end; i++) { if (!this.buffers.has(i)) promises.push(this.loadSegment(i)); }
+        for (let i = startIdx; i < end; i++) { if (!this.buffers.has(i)) promises.push(this.loadSegment(i, g)); }
         await Promise.all(promises);
     }
 
-    async loadSegment(idx) {
+    async loadSegment(idx, gen) {
         if (this.buffers.has(idx)) return this.buffers.get(idx);
+        const g = gen || this._loadGeneration;
         const url = this._getSegmentURL(idx);
         let data = await window.audioCache.get(url);
         if (!data) {
@@ -186,9 +197,12 @@ class AudioPlayer {
                     data = await res.arrayBuffer(); break;
                 } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 300)); }
             }
+            if (g !== this._loadGeneration) return null; // stale — don't cache or decode
             window.audioCache.put(url, data.slice(0));
         }
+        if (g !== this._loadGeneration) return null; // stale
         const buffer = await this.ctx.decodeAudioData(data);
+        if (g !== this._loadGeneration) return null; // stale — don't write to buffers
         const isLast = (idx === this.segments.length - 1);
         const expectedSamples = Math.round(this.segmentTime * buffer.sampleRate);
         if (!isLast && buffer.length > expectedSamples) {
@@ -211,7 +225,7 @@ class AudioPlayer {
         const segIdx = Math.floor(prePosition / this.segmentTime);
         if (!this.buffers.has(segIdx)) {
             if (this.onBuffering) this.onBuffering(true);
-            await this.preloadSegments(segIdx, 2);
+            await this.preloadSegments(segIdx, 2, this._loadGeneration);
             if (this.onBuffering) this.onBuffering(false);
         }
 
@@ -272,12 +286,14 @@ class AudioPlayer {
     async _scheduleAhead() {
         if (!this.isPlaying || this._scheduling) return;
         this._scheduling = true;
+        const gen = this._loadGeneration;
         try {
         const LOOKAHEAD = this._actualQuality === 'lossless' ? 3.0 : 1.5;
         const preloadCount = 3;
 
         while (this._nextSegIdx < this.segments.length &&
                this._nextSegTime < this.ctx.currentTime + LOOKAHEAD) {
+            if (gen !== this._loadGeneration) return; // track changed
             const i = this._nextSegIdx;
 
             // === Drift correction: apply ONCE per segment, right before scheduling ===
@@ -311,9 +327,9 @@ class AudioPlayer {
 
             if (!this.buffers.has(i)) {
                 if (this.onBuffering) this.onBuffering(true);
-                await this.loadSegment(i);
+                await this.loadSegment(i, gen);
                 if (this.onBuffering) this.onBuffering(false);
-                if (!this.isPlaying) return;
+                if (!this.isPlaying || gen !== this._loadGeneration) return;
             }
             const buffer = this.buffers.get(i);
             if (!buffer) break;
@@ -347,7 +363,7 @@ class AudioPlayer {
             this._nextSegTime = t + dur;
             this._nextSegIdx = i + 1;
             this._isFirstSeg = false;
-            if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount);
+            if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount, gen);
         }
         } finally { this._scheduling = false; }
     }
