@@ -435,6 +435,30 @@ async function handleMessage(msg) {
     }
 }
 
+async function ensureAudioUnlocked() {
+    if (!window.audioPlayer) return false;
+    const state = await window.audioPlayer.init();
+    if (state === 'running') return true;
+
+    // Mobile autoplay policy fallback: wait for user gesture, then resume and retry.
+    $('syncStatus').textContent = '点击页面以开启声音…';
+    const unlock = async () => {
+        try {
+            await window.audioPlayer.init();
+        } catch (e) {
+            console.warn('[audio] unlock retry failed:', e);
+        }
+        if (window.audioPlayer.isAudioReady()) {
+            document.removeEventListener('touchstart', unlock, true);
+            document.removeEventListener('click', unlock, true);
+            $('syncStatus').textContent = '声音已开启';
+        }
+    };
+    document.addEventListener('touchstart', unlock, true);
+    document.addEventListener('click', unlock, true);
+    return window.audioPlayer.isAudioReady();
+}
+
 async function setupAudio() {
     $('trackName').textContent = audioInfo.filename;
     $('totalTime').textContent = formatTime(audioInfo.duration);
@@ -443,7 +467,7 @@ async function setupAudio() {
     $('currentTime').textContent = '0:00';
     $('playPauseBtn').disabled = true;
     $('syncStatus').textContent = 'Loading audio...';
-    window.audioPlayer.init();
+    await ensureAudioUnlocked();
     window.audioPlayer.onBuffering = (buffering) => {
         $('syncStatus').textContent = buffering ? 'Buffering...' : (window.clockSync.synced ? `RTT: ${Math.round(window.clockSync.rtt)}ms | Offset: ${window.clockSync.offset >= 0 ? '+' : ''}${Math.round(window.clockSync.offset)}ms` : 'Ready');
     };
@@ -461,7 +485,10 @@ async function doPlay(position, serverTime) {
     pendingPlay = null;
     updatePlayButton(true);
     startUIUpdate();
-    window.audioPlayer.init();
+    if (!(await ensureAudioUnlocked())) {
+        $('syncStatus').textContent = '需要点击页面开启声音';
+        return;
+    }
     await window.audioPlayer.playAtPosition(position || 0, serverTime);
 }
 
