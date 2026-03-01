@@ -344,7 +344,12 @@ class AudioPlayer {
             const dur = buffer.duration - off;
             const t = this._nextSegTime;
             // outputLatency compensation
-            const schedTime = t - this._outputLatency;
+            const rawSchedTime = t - this._outputLatency;
+            // Guard: never schedule in the past (can happen around startup / high latency spikes)
+            const minSchedTime = this.ctx.currentTime + 0.002;
+            const schedTime = Math.max(rawSchedTime, minSchedTime);
+            // Keep ctx timeline aligned with actual scheduled time
+            const effectiveT = schedTime + this._outputLatency;
             // Crossfade
             const fadeTime = 0.003;
             if (!this._isFirstSeg && i > 0) {
@@ -362,7 +367,7 @@ class AudioPlayer {
                 if (idx > -1) this.sources.splice(idx, 1);
             };
             this.sources.push(source);
-            this._nextSegTime = t + dur;
+            this._nextSegTime = effectiveT + dur;
             this._nextSegIdx = i + 1;
             this._isFirstSeg = false;
             if (i + 1 < this.segments.length) this.preloadSegments(i + 1, preloadCount, gen);

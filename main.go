@@ -491,6 +491,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		totalTimes          = make([]time.Time, 0, totalRateLimit)
 		lastStatusReport    time.Time // per-client: max 1/sec
 		lastForceResyncSent time.Time // per-client: max 1/5sec
+		lastRequestResync   time.Time // per-client: max 1/5sec
 	)
 	checkRate := func(times *[]time.Time, limit int) bool {
 		now := time.Now()
@@ -845,14 +846,20 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if currentRoom == nil {
 				continue
 			}
-			// Room-level rate limit: max once per 5 seconds
 			now := time.Now()
+			// Per-client rate limit: max once per 5 seconds
+			if !lastRequestResync.IsZero() && now.Sub(lastRequestResync) < 5*time.Second {
+				continue
+			}
+			lastRequestResync = now
+
+			// Room-level rate limit: max once per 1 second (coalescing burst requests)
 			currentRoom.Mu.Lock()
 			if currentRoom.State != room.StatePlaying {
 				currentRoom.Mu.Unlock()
 				continue
 			}
-			if !currentRoom.LastResyncTime.IsZero() && now.Sub(currentRoom.LastResyncTime) < 5*time.Second {
+			if !currentRoom.LastResyncTime.IsZero() && now.Sub(currentRoom.LastResyncTime) < 1*time.Second {
 				currentRoom.Mu.Unlock()
 				continue
 			}

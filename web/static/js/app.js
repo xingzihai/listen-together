@@ -297,7 +297,11 @@ async function handleMessage(msg) {
             // Server sends currentPos (pre-computed) and tickTime (when tick was generated)
             // Use tickTime for network delay compensation
             const tickTime = msg.tickTime || msg.serverTime;
-            const networkDelay = Math.min(Math.max(0, (window.clockSync.getServerTime() - tickTime) / 1000), 0.1);
+            // Adaptive network-delay compensation:
+            // fixed 100ms cap under-compensates on high RTT links and inflates false drift.
+            const rttSec = Number.isFinite(window.clockSync?.rtt) ? (window.clockSync.rtt / 1000) : 0;
+            const maxDelay = Math.min(0.35, Math.max(0.10, rttSec * 0.75));
+            const networkDelay = Math.min(Math.max(0, (window.clockSync.getServerTime() - tickTime) / 1000), maxDelay);
             const serverPos = (msg.currentPos != null ? msg.currentPos : msg.position) + networkDelay;
 
             // Convert serverPos to ctx domain: where should ctx be for this server position?
