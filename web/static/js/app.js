@@ -5,6 +5,7 @@ const MAX_RECONNECT_ATTEMPTS = 10, MAX_RECONNECT_DELAY = 60000;
 let roomUsers = [], myClientID = null;
 let playlist = null, playlistItems = [], currentTrackIndex = -1, playMode = 'sequential';
 let trackLoading = false, pendingPlay = null;
+let autoRecoveryInFlight = false;  // prevent syncTick auto-recovery loop
 let trackChangeGen = 0;
 let deviceKicked = false;
 let roomWatchdogInterval = null;
@@ -284,8 +285,14 @@ async function handleMessage(msg) {
 
             // Auto-recovery: server says playing but we're not — start playback
             if (!ap.isPlaying && audioInfo) {
+                if (autoRecoveryInFlight) break;
+                autoRecoveryInFlight = true;
                 console.warn('[sync] syncTick received but not playing — auto-recovering');
-                await doPlay(msg.position, msg.serverTime);
+                try {
+                    await doPlay(msg.position, msg.serverTime);
+                } finally {
+                    setTimeout(() => { autoRecoveryInFlight = false; }, 5000);
+                }
                 break;
             }
             if (!ap.isPlaying || !ap.ctx) break;
@@ -386,13 +393,19 @@ async function handleMessage(msg) {
             const ap = window.audioPlayer;
             if (ap && typeof msg.position === 'number' && typeof msg.serverTime === 'number') {
                 if (audioInfo) {
+                    // Throttle: max once per 5 seconds to prevent stop→restart storm
+                    const nowPerf = performance.now();
+                    if (ap._lastForceResyncAt && nowPerf - ap._lastForceResyncAt < 5000) {
+                        console.log(`[sync] forceResync throttled (${(nowPerf - ap._lastForceResyncAt).toFixed(0)}ms since last)`);
+                        break;
+                    }
+                    ap._lastForceResyncAt = nowPerf;
                     ap._driftCount = 0;
                     ap._lastResetTime = performance.now();
                     ap._postResetVerify = true;
                     ap._postResetTime = performance.now();
-                    ap.playAtPosition(msg.position, msg.serverTime);
-                    updatePlayButton(true);
-                    startUIUpdate();
+                    // Use doPlay to ensure mobile AudioContext unlock
+                    await doPlay(msg.position, msg.serverTime);
                 }
             }
             break;
@@ -457,8 +470,35 @@ async function doPlay(position, serverTime) {
     pendingPlay = null;
     updatePlayButton(true);
     startUIUpdate();
-    window.audioPlayer.init();
-    await window.audioPlayer.playAtPosition(position || 0, serverTime);
+    // Ensure AudioContext is running (critical for mobile browsers)
+    const ap = window.audioPlayer;
+    ap.init();
+    if (ap.ctx && ap.ctx.state === 'suspended') {
+        try { await ap.ctx.resume(); } catch(e) { console.warn('[audio] ctx.resume failed:', e); }
+    }
+    if (ap.ctx && ap.ctx.state !== 'running') {
+        // AudioContext still not running (needs user gesture on mobile)
+        pendingPlay = { position, serverTime };
+        $('syncStatus').textContent = '需要点击页面开启声音';
+        console.warn('[audio] AudioContext not running, waiting for user gesture');
+        // Install one-time unlock handler
+        const unlock = async () => {
+            document.removeEventListener('touchstart', unlock, true);
+            document.removeEventListener('click', unlock, true);
+            if (ap.ctx) try { await ap.ctx.resume(); } catch(e) {}
+            if (pendingPlay && ap.ctx && ap.ctx.state === 'running') {
+                const pp = pendingPlay;
+                pendingPlay = null;
+                await ap.playAtPosition(pp.position || 0, pp.serverTime);
+                updatePlayButton(true);
+                startUIUpdate();
+            }
+        };
+        document.addEventListener('touchstart', unlock, true);
+        document.addEventListener('click', unlock, true);
+        return;
+    }
+    await ap.playAtPosition(position || 0, serverTime);
 }
 
 function doPause() {

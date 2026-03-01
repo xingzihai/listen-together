@@ -34,15 +34,21 @@ class AudioPlayer {
         this._lastCorrectedSegIdx = -1;
     }
 
-    init() {
+    async init() {
         if (!this.ctx) {
             this.ctx = new (window.AudioContext || window.webkitAudioContext)();
             this.gainNode = this.ctx.createGain();
             this.gainNode.connect(this.ctx.destination);
         }
-        if (this.ctx.state === 'suspended') this.ctx.resume();
+        if (this.ctx.state === 'suspended') {
+            try { await this.ctx.resume(); } catch(e) { console.warn('[audio] ctx.resume failed:', e); }
+        }
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
-        console.log(`[sync] outputLatency: ${(this._outputLatency*1000).toFixed(1)}ms`);
+        return this.ctx.state;  // 'running' | 'suspended' | 'closed'
+    }
+
+    isAudioReady() {
+        return this.ctx && this.ctx.state === 'running';
     }
 
     async loadAudio(audioInfo, roomCode) {
@@ -219,7 +225,12 @@ class AudioPlayer {
 
     // === Core: playAtPosition ===
     async playAtPosition(position, serverTime) {
-        this.init();
+        const state = await this.init();
+        if (state !== 'running') {
+            console.warn('[audio] playAtPosition skipped: AudioContext not running');
+            this.isPlaying = false;
+            return;
+        }
         // Stop old lookahead immediately to prevent stale scheduling during preload
         this._stopLookahead();
 
