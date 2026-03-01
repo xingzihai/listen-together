@@ -146,11 +146,15 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
-	// SyncTick: broadcast current playback position to all playing rooms every 1s
+	// SyncTick: broadcast current playback position for anchor maintenance
+	// - multi-client rooms: every 1s (tight correction)
+	// - single-client rooms: every 5s (keep anchors warm, lower overhead)
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		tickCount := 0
 		for range ticker.C {
+			tickCount++
 			for _, rm := range manager.GetRooms() {
 				rm.Mu.RLock()
 				state := rm.State
@@ -167,8 +171,12 @@ func main() {
 				// Compute elapsed INSIDE lock to avoid race with seek/pause
 				elapsed := time.Since(startT).Seconds()
 				var clients []*room.Client
-				// Only broadcast to multi-client rooms
-				if state == room.StatePlaying && clientCount > 1 {
+				if state == room.StatePlaying && clientCount > 0 {
+					// Single-client rooms broadcast every 5 ticks (~5s)
+					if clientCount == 1 && tickCount%5 != 0 {
+						rm.Mu.RUnlock()
+						continue
+					}
 					clients = make([]*room.Client, 0, clientCount)
 					for _, c := range rm.Clients {
 						clients = append(clients, c)
@@ -189,11 +197,11 @@ func main() {
 				startMs := startT.UnixNano() / int64(time.Millisecond)
 				nowMs := time.Now().UnixNano() / int64(time.Millisecond)
 				msg := map[string]interface{}{
-					"type":        "syncTick",
-					"position":    pos,         // base position at startTime
-					"serverTime":  startMs,     // when position was set (= room.StartTime)
-					"currentPos":  currentPos,  // computed current position (for drift check)
-					"tickTime":    nowMs,        // when this tick was generated
+					"type":       "syncTick",
+					"position":   pos,        // base position at startTime
+					"serverTime": startMs,    // when position was set (= room.StartTime)
+					"currentPos": currentPos, // computed current position (for drift check)
+					"tickTime":   nowMs,      // when this tick was generated
 				}
 				// Pre-serialize once, reuse for all clients
 				jsonBytes, err := json.Marshal(msg)
