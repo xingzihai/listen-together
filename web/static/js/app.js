@@ -435,6 +435,8 @@ async function handleMessage(msg) {
     }
 }
 
+let unlockHookInstalled = false;
+
 async function ensureAudioUnlocked() {
     if (!window.audioPlayer) return false;
     const state = await window.audioPlayer.init();
@@ -442,6 +444,8 @@ async function ensureAudioUnlocked() {
 
     // Mobile autoplay policy fallback: wait for user gesture, then resume and retry.
     $('syncStatus').textContent = '点击页面以开启声音…';
+    if (unlockHookInstalled) return window.audioPlayer.isAudioReady();
+
     const unlock = async () => {
         try {
             await window.audioPlayer.init();
@@ -451,9 +455,21 @@ async function ensureAudioUnlocked() {
         if (window.audioPlayer.isAudioReady()) {
             document.removeEventListener('touchstart', unlock, true);
             document.removeEventListener('click', unlock, true);
+            unlockHookInstalled = false;
             $('syncStatus').textContent = '声音已开启';
+            // If a play arrived while locked (e.g. refresh + join restore), replay it now.
+            if (pendingPlay) {
+                const pp = pendingPlay;
+                pendingPlay = null;
+                try {
+                    await doPlay(pp.position, pp.serverTime);
+                } catch (e) {
+                    console.warn('[audio] pending replay failed:', e);
+                }
+            }
         }
     };
+    unlockHookInstalled = true;
     document.addEventListener('touchstart', unlock, true);
     document.addEventListener('click', unlock, true);
     return window.audioPlayer.isAudioReady();
@@ -482,14 +498,34 @@ async function doPlay(position, serverTime) {
         return;
     }
     if (!audioInfo) return;
+
+    // De-dup burst play events (common during refresh/rejoin/recover)
+    const nowMs = Date.now();
+    const sig = `${Math.floor((position || 0) * 10)}|${Math.floor((serverTime || 0) / 100)}`;
+    if (lastDoPlaySig === sig && nowMs - lastDoPlayAt < 400) {
+        return;
+    }
+    lastDoPlaySig = sig;
+    lastDoPlayAt = nowMs;
+
     pendingPlay = null;
     updatePlayButton(true);
     startUIUpdate();
     if (!(await ensureAudioUnlocked())) {
+        // Keep play request for retry after user gesture unlock.
+        pendingPlay = { position, serverTime };
         $('syncStatus').textContent = '需要点击页面开启声音';
         return;
     }
     await window.audioPlayer.playAtPosition(position || 0, serverTime);
+    // After resume/rejoin playback, request one server-coordinated resync for fast convergence.
+    if (ws && ws.readyState === 1) {
+        setTimeout(() => {
+            if (window.audioPlayer.isPlaying && ws && ws.readyState === 1) {
+                ws.send(JSON.stringify({ type: 'requestResync' }));
+            }
+        }, 250);
+    }
 }
 
 function doPause() {
