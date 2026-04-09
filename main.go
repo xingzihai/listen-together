@@ -203,8 +203,32 @@ func main() {
 		}
 	}()
 
-	log.Println("ListenTogether server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", securityHeaders(limitedMux)))
+	// Start HTTPS server (port 8443)
+	go func() {
+		log.Println("HTTPS server starting on :8443")
+		err := http.ListenAndServeTLS(":8443", "certs/cert.pem", "certs/key.pem", securityHeaders(limitedMux))
+		if err != nil {
+			log.Fatalf("HTTPS server error: %v", err)
+		}
+	}()
+
+	// Start HTTP redirect server (port 8080)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Replace :8080 with :8443 in host
+		host := r.Host
+		if strings.HasSuffix(host, ":8080") {
+			host = host[:len(host)-5] + ":8443"
+		} else {
+			host = host + ":8443"
+		}
+		target := "https://" + host + r.URL.Path
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
+	log.Println("HTTP server starting on :8080 (redirects to HTTPS)")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func checkOrigin(r *http.Request) bool {
