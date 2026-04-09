@@ -26,13 +26,15 @@
 │  │   └── Soft Correction（已有）                    │
 │  │                                                  │
 │  └── player.js（重写）                              │
-│  │   ├── Lookahead Scheduler（保留）                │
+│  │   ├── PCM Feed 逻辑（新增）                      │
+│  │   │   └── 解码 segment → postMessage PCM        │
 │  │   ├── SharedArrayBuffer 读取（新增）             │
 │  │   ├── getCurrentTime()（重写）                   │
 │  │   │   └── return anchorPos + consumed/sr        │
 │  │   ├── _driftLoop()（重写）                       │
 │  │   │   └── Snapcast Soft Correction ±0.05%       │
-│  │   └── 移除 Tier 2/3 playbackRate                │
+│  │   └── 删除 Lookahead Scheduler                  │
+│  │   └── 删除 AudioBufferSourceNode                │
 │  │                                                  │
 │  └── Tier 3 硬重置（保留但阈值降低）                 │
 └─────────────────────────────────────────────────────┘
@@ -139,17 +141,69 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
 
 ---
 
-### Phase 3：player.js 重写
+### Phase 3：player.js 重写（方案B：worklet Ring Buffer 架构）
 
-**目标**：Snapcast 简化版同步逻辑
+**目标**：真正的 Snapcast 架构，player.js 只做 PCM feed，worklet 负责播放
 
-**判断边界**：[高判断区需人确认] — 核心同步逻辑重写，需验证设计正确性
+**判断边界**：[高判断区需人确认] — 完全重构播放架构
 
 **修改文件**：`player.js`
 
+**核心变化**：
+- **删除**：Lookahead Scheduler、AudioBufferSourceNode、Tier 1/2/3 playbackRate
+- **新增**：PCM Feed 逻辑（解码 → postMessage to worklet）
+- **保留**：ClockSync 集成、drift 检测逻辑
+
 **具体操作**：
 
-#### 3.1 添加 SharedArrayBuffer 初始化
+#### 3.1 删除 Lookahead Scheduler 相关代码
+
+**删除项**：
+- `_startLookahead()`, `_stopLookahead()`, `_scheduleAhead()` 方法
+- `_nextSegIdx`, `_nextSegTime`, `_firstSegOffset`, `_isFirstSeg` 属性
+- `_lookaheadTimer`
+- `AudioBufferSourceNode` 创建逻辑（`this.sources`）
+
+#### 3.2 新增 PCM Feed 逻辑
+
+```javascript
+// PCM Feed：解码 segment → postMessage PCM to worklet
+async _feedPCMSegments(startPos) {
+    const segIdx = Math.floor(startPos / this.segmentTime);
+    const segOffset = startPos % this.segmentTime;
+    
+    // 预加载 2-3 个 segment
+    for (let i = segIdx; i < Math.min(segIdx + 3, this.segments.length); i++) {
+        if (!this.buffers.has(i)) {
+            const buffer = await this.loadSegment(i);
+            // 转换为 PCM Float32Array
+            const left = buffer.getChannelData(0);
+            const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+            
+            // 发送到 worklet
+            this.workletNode.port.postMessage({
+                type: 'pcm',
+                left: left.buffer,
+                right: right.buffer
+            }, [left.buffer, right.buffer]); // Transfer ownership
+        }
+    }
+}
+
+// 持续 feed 循环
+_feedLoop() {
+    const currentPos = this.getCurrentTime();
+    const bufferedSec = this._workletBuffered / this._nominalRate;
+    
+    // 保持 3-5 秒的 buffer
+    if (bufferedSec < 3) {
+        const nextSeg = Math.floor(currentPos / this.segmentTime) + Math.ceil(bufferedSec / this.segmentTime);
+        this._feedPCMSegments(nextSeg * this.segmentTime);
+    }
+}
+```
+
+#### 3.3 添加 SharedArrayBuffer 初始化
 
 ```javascript
 constructor() {
@@ -158,25 +212,17 @@ constructor() {
     this._sharedView = null;
     this._sabSupported = typeof SharedArrayBuffer !== 'undefined';
     
-    // 新增：Snapcast 锚点
+    // Snapcast 锚点
     this._anchorPos = 0;
     this._anchorServerTime = 0;
     this._nominalRate = 48000;
     this._maxCorrectionRate = 0.0005; // ±0.05%
     
-    // 删除
-    // - _driftOffset
-    // - _pendingDriftCorrection
-    // - _softCorrectionTotal
-    // - _rateCorrectingUntil
-    // - _currentPlaybackRate
-    // - _rateStartTime
+    // worklet 统计
+    this._workletConsumed = 0;
+    this._workletBuffered = 0;
 }
-```
 
-#### 3.2 初始化 SharedArrayBuffer（在 _createWorkletNode 或 init 中）
-
-```javascript
 _initSharedBuffer() {
     if (this._sabSupported && !this._sharedBuffer) {
         try {
@@ -196,7 +242,7 @@ _initSharedBuffer() {
 }
 ```
 
-#### 3.3 重写 getCurrentTime()
+#### 3.4 重写 getCurrentTime()
 
 ```javascript
 getCurrentTime() {
@@ -223,13 +269,18 @@ getCurrentTime() {
 }
 ```
 
-#### 3.4 重写 playAtPosition()
+#### 3.5 重写 playAtPosition()
 
 ```javascript
 async playAtPosition(position, serverTime, scheduledAt) {
     this.init();
     this.stop();
     this.isPlaying = true;
+    
+    // 初始化 worklet（如果还没创建）
+    if (!this.workletNode) {
+        await this._createWorkletNode();
+    }
     
     // 初始化 SharedArrayBuffer
     this._initSharedBuffer();
@@ -244,19 +295,21 @@ async playAtPosition(position, serverTime, scheduledAt) {
     this._anchorServerTime = serverTime || window.clockSync.getServerTime();
     
     // 清空 worklet
-    if (this.workletNode) {
-        this.workletNode.port.postMessage({ type: 'clear' });
-        this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
-    }
+    this.workletNode.port.postMessage({ type: 'clear' });
+    this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
     
-    // ... 保留现有的 Lookahead Scheduler 逻辑 ...
+    // 开始 feed PCM
+    await this._feedPCMSegments(position);
+    
+    // 启动 feed loop（每 200ms 检查是否需要补充 buffer）
+    this._feedTimer = setInterval(() => this._feedLoop(), 200);
     
     // 启动 drift loop（每 250ms）
     this._driftTimer = setInterval(() => this._driftLoop(), 250);
 }
 ```
 
-#### 3.5 重写 _driftLoop()
+#### 3.6 重写 _driftLoop()
 
 ```javascript
 _driftLoop() {
@@ -277,12 +330,10 @@ _driftLoop() {
     
     const absDrift = Math.abs(driftSec);
     
-    // Tier 3：硬重置（阈值降低到 100ms）
+    // Tier 3：硬重置（阈值 100ms）
     if (absDrift > 0.1) {
         console.warn(`[sync] hard resync: drift=${(driftSec*1000).toFixed(0)}ms`);
-        const gen = this._resyncGen;
-        this.playAtPosition(expectedPos, serverNow)
-            .finally(() => { if (this._resyncGen === gen) this._resyncing = false; });
+        this.playAtPosition(expectedPos, serverNow);
         return;
     }
     
@@ -296,12 +347,9 @@ _driftLoop() {
         const clampedRate = Math.max(-maxRate, Math.min(maxRate, samplesPerSec));
         
         if (Math.abs(clampedRate) < 0.5) {
-            // drift 太小
             this.workletNode?.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
         } else {
             const corrX = Math.round(this._nominalRate / Math.abs(clampedRate));
-            // drift > 0 → 超前 → 减速 → duplicate → negative
-            // drift < 0 → 落后 → 加速 → drop → positive
             const sign = driftSec > 0 ? -1 : 1;
             this.workletNode?.port.postMessage({
                 type: 'correction',
@@ -314,23 +362,51 @@ _driftLoop() {
 }
 ```
 
-#### 3.6 删除不需要的代码
+#### 3.7 新增 worklet 创建逻辑
 
-**删除项**：
-- `_driftOffset` 相关逻辑
-- `_pendingDriftCorrection` 相关逻辑
-- `_softCorrectionTotal` 相关逻辑
-- `_rateCorrectingUntil` 相关逻辑
-- `_currentPlaybackRate` 相关逻辑
-- `_rateStartTime` 相关逻辑
-- Tier 1 `_nextSegTime` 调整逻辑
-- Tier 2 playbackRate ±2-3% 逻辑
-- `correctDrift()` 中的三层判断
+```javascript
+async _createWorkletNode() {
+    if (this.workletNode) return;
+    
+    await this.ctx.audioWorklet.addModule('/js/worklet-processor.js');
+    this.workletNode = new AudioWorkletNode(this.ctx, 'listen-together-processor', {
+        outputChannelCount: [2]
+    });
+    this.workletNode.connect(this.gainNode);
+    
+    // 监听 worklet stats
+    this.workletNode.port.onmessage = (e) => {
+        if (e.data.type === 'stats') {
+            this._workletConsumed = e.data.totalConsumedFrames;
+            this._workletBuffered = e.data.buffered;
+        }
+    };
+}
+```
+
+#### 3.8 修改 stop() 方法
+
+```javascript
+stop() {
+    if (this.isPlaying) this.lastPosition = this.getCurrentTime();
+    this.isPlaying = false;
+    
+    // 清理 timers
+    if (this._feedTimer) { clearInterval(this._feedTimer); this._feedTimer = null; }
+    if (this._driftTimer) { clearInterval(this._driftTimer); this._driftTimer = null; }
+    
+    // 清空 worklet
+    if (this.workletNode) {
+        this.workletNode.port.postMessage({ type: 'clear' });
+    }
+}
+```
 
 **验收标准**：
 - getCurrentTime() 精度 ±2ms
 - drift 收敛到 <10ms
-- 无 playbackRate 变调
+- 无 AudioBufferSourceNode（全部由 worklet 播放）
+- PCM 数据正确传输到 worklet
 
 ---
 

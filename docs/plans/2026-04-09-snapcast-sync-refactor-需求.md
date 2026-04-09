@@ -100,18 +100,53 @@ correctAfterXFrames = nominalRate / |driftSamples / correctionTime|
 
 ### 需求 5：移除不需要的逻辑
 
-**描述**：删除混乱的 Tier 2/3 和 playbackRate 相关代码
+**描述**：删除混乱的 Tier 2/3 和 playbackRate 相关代码，删除 AudioBufferSourceNode 调度
 
 **删除项**：
 - `_driftOffset`, `_pendingDriftCorrection`, `_softCorrectionTotal`
 - Tier 1 `_nextSegTime` 调整逻辑
 - Tier 2 playbackRate ±2-3% 逻辑
+- Lookahead Scheduler（_startLookahead, _stopLookahead, _scheduleAhead）
+- AudioBufferSourceNode 创建逻辑（this.sources）
 - 相关的 setTimeout/setInterval timers
 
 **保留项**：
-- Lookahead Scheduler（正确的 segment 调度）
 - ClockSync（正确的 NTP 式时钟同步）
 - Tier 3 硬重置（但阈值降低到 100ms）
+- segment 预加载逻辑（用于 PCM feed）
+
+---
+
+### 需求 6：新增 PCM Feed 逻辑
+
+**描述**：player.js 负责解码 segment 并发送 PCM 数据到 worklet
+
+**功能**：
+1. 解码 AudioBuffer → 提取 Float32Array PCM
+2. postMessage PCM 到 worklet（使用 transferable）
+3. 定期检查 buffer 水位，保持 3-5 秒
+
+**验收标准**：
+- PCM 数据正确传输到 worklet
+- worklet ring buffer 保持健康水位
+- 无内存泄漏（transfer ownership）
+
+---
+
+### 需求 7：新增 worklet 创建逻辑
+
+**描述**：player.js 需要创建 AudioWorkletNode 并连接到音频图
+
+**功能**：
+1. 加载 worklet-processor.js
+2. 创建 AudioWorkletNode
+3. 监听 stats 消息
+4. 连接到 gainNode
+
+**验收标准**：
+- worklet 节点创建成功
+- 能接收 stats 消息
+- 音频输出正常
 
 ---
 
