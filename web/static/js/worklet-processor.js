@@ -17,6 +17,8 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
         this._totalConsumedFrames = 0;
         this._reportCounter = 0;
         this._reportInterval = Math.ceil(sampleRate / 10); // 100ms reporting
+        // SharedArrayBuffer for zero-latency consumed frames reading
+        this._sharedView = null; // BigInt64Array over SharedArrayBuffer
         // Fade-out state for underrun smoothing
         this._lastSampleL = 0;
         this._lastSampleR = 0;
@@ -26,7 +28,11 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
     }
 
     _onMessage(msg) {
-        if (msg.type === 'pcm') {
+        if (msg.type === 'init-shared') {
+            // Receive SharedArrayBuffer from main thread
+            this._sharedView = new BigInt64Array(msg.buffer);
+            return;
+        } else if (msg.type === 'pcm') {
             const left = new Float32Array(msg.left);
             const right = new Float32Array(msg.right);
             const frames = left.length;
@@ -66,6 +72,10 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
             this._lastSampleL = 0;
             this._lastSampleR = 0;
             this._fadeOutRemaining = 0;
+            // Reset SharedArrayBuffer counter
+            if (this._sharedView) {
+                Atomics.store(this._sharedView, 0, 0n);
+            }
         } else if (msg.type === 'query') {
             this._doReport();
         }
@@ -152,6 +162,12 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
         this._totalPlayedFrames += outIdx;
         this._totalConsumedFrames += consumed;
         this._reportCounter += frames;
+        
+        // Atomically update consumed frames in SharedArrayBuffer
+        if (this._sharedView) {
+            Atomics.store(this._sharedView, 0, BigInt(this._totalConsumedFrames));
+        }
+        
         this._maybeReport();
         return true;
     }

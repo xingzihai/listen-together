@@ -32,28 +32,28 @@
 - **操作**：constructor 中添加 `this._sharedView = null`
 - **判断边界**：[低判断区]
 - **验收**：worklet 不报错
-- **状态**：待执行
+- **状态**：✅ 已完成
 
 ### 任务 2.2：添加 init-shared 消息处理
 - **文件**：`worklet-processor.js`
 - **操作**：_onMessage 中添加 `msg.type === 'init-shared'` 处理
 - **判断边界**：[低判断区]
 - **验收**：能接收 SharedArrayBuffer 并赋值到 _sharedView
-- **状态**：待执行
+- **状态**：✅ 已完成
 
 ### 任务 2.3：clear 时重置 shared counter
 - **文件**：`worklet-processor.js`
 - **操作**：_onMessage `clear` 处理中添加 `Atomics.store(this._sharedView, 0, 0n)`
 - **判断边界**：[低判断区]
 - **验收**：clear 后 shared counter 为 0
-- **状态**：待执行
+- **状态**：✅ 已完成
 
 ### 任务 2.4：process 末尾原子更新 consumed
 - **文件**：`worklet-processor.js`
 - **操作**：process() 末尾添加 `Atomics.store(this._sharedView, 0, BigInt(this._totalConsumedFrames))`
 - **判断边界**：[低判断区]
 - **验收**：主线程能读取到更新后的 consumed
-- **状态**：待执行
+- **状态**：✅ 已完成
 
 ---
 
@@ -184,10 +184,10 @@
 | Phase | 任务数 | 已完成 | 进度 |
 |-------|--------|--------|------|
 | Phase 1 | 3 | 2 | 67% |
-| Phase 2 | 4 | 0 | 0% |
+| Phase 2 | 4 | 4 | 100% |
 | Phase 3 | 12 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **总计** | **23** | **2** | **9%** |
+| **总计** | **23** | **6** | **26%** |
 
 ---
 
