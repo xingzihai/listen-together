@@ -139,6 +139,15 @@ func main() {
 		mux.ServeHTTP(w, r)
 	})
 
+	// Security headers for SharedArrayBuffer (COOP/COEP)
+	securityHeaders := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+			w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	// SyncTick: broadcast current playback position to all playing rooms every 1s
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
@@ -195,7 +204,7 @@ func main() {
 	}()
 
 	log.Println("ListenTogether server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", limitedMux))
+	log.Fatal(http.ListenAndServe(":8080", securityHeaders(limitedMux)))
 }
 
 func checkOrigin(r *http.Request) bool {
