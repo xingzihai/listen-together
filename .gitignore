@@ -5,3 +5,19 @@ listen-together
 *.crt
 *.key
 *.pem
+
+# Debug scripts (temporary)
+check_*.py
+upload_*.py
+deploy_*.py
+diagnose.py
+verify_*.py
+find_audio*.py
+*_test.py
+test_*.py
+simple_test.py
+reset_test.py
+quick_*.py
+fully_auto_test.py
+play_test.py
+real_test.py
