@@ -30,15 +30,20 @@ var (
 	manager  = room.NewManager()
 	dataDir  = "./data/rooms"
 	globalDB *db.DB
+	
+	// Debug state for remote debugging
+	debugStateMu sync.RWMutex
+	debugState   = make(map[string]interface{})
 )
 
 type WSMessage struct {
-	Type           string  `json:"type"`
-	RoomCode       string  `json:"roomCode,omitempty"`
-	ClientTime     int64   `json:"clientTime,omitempty"`
-	Position       float64 `json:"position,omitempty"`
-	TargetClientID string  `json:"targetClientID,omitempty"`
-	TrackIndex     int     `json:"trackIndex"`
+	Type           string                 `json:"type"`
+	RoomCode       string                 `json:"roomCode,omitempty"`
+	ClientTime     int64                  `json:"clientTime,omitempty"`
+	Position       float64                `json:"position,omitempty"`
+	TargetClientID string                 `json:"targetClientID,omitempty"`
+	TrackIndex     int                    `json:"trackIndex"`
+	Player         map[string]interface{} `json:"player,omitempty"` // Debug data from client
 }
 
 type PlaylistBroadcast struct {
@@ -118,6 +123,176 @@ func main() {
 	plHandlers.RegisterRoutes(mux)
 
 	mux.HandleFunc("/ws", handleWebSocket)
+
+	// Debug API for remote testing
+	mux.HandleFunc("/api/debug/status", func(w http.ResponseWriter, r *http.Request) {
+		debugStateMu.RLock()
+		defer debugStateMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(debugState)
+	})
+
+	mux.HandleFunc("/api/debug/log", func(w http.ResponseWriter, r *http.Request) {
+		// Return last 100 lines of log
+		w.Header().Set("Content-Type", "text/plain")
+		// Read log file
+		data, err := os.ReadFile("/tmp/listen-together.log")
+		if err != nil {
+			http.Error(w, "Cannot read log", 500)
+			return
+		}
+		lines := strings.Split(string(data), "\n")
+		start := len(lines) - 100
+		if start < 0 {
+			start = 0
+		}
+		w.Write([]byte(strings.Join(lines[start:], "\n")))
+	})
+
+	// Auto-play test endpoint - simulates REAL sync logic for drift testing
+	mux.HandleFunc("/api/debug/auto-play", func(w http.ResponseWriter, r *http.Request) {
+		debugStateMu.Lock()
+		defer debugStateMu.Unlock()
+
+		// Create a mock room with REAL playback logic
+		roomCode := "AUTOTEST"
+		rm := manager.GetRoom(roomCode)
+		if rm == nil {
+			rm, _ = manager.CreateRoom(roomCode, 0)
+		}
+
+		// Initialize room
+		rm.Mu.Lock()
+		rm.Audio = &room.AudioInfo{
+			Filename: "test-audio.flac",
+			Duration: 60.0,
+		}
+		rm.TrackAudio = &room.TrackAudioInfo{
+			AudioUUID: "test-audio-uuid",
+			Filename:  "test-audio.flac",
+			Title:     "Auto Test Track",
+			Duration:  60.0,
+		}
+		rm.State = room.StatePlaying
+		rm.Position = 0.0
+		rm.StartTime = time.Now()
+		rm.Mu.Unlock()
+
+		// Initialize debug state
+		debugState["lastUpdate"] = time.Now().Format("15:04:05")
+		debugState["roomCode"] = roomCode
+		debugState["serverPos"] = 0.0
+		debugState["serverState"] = "playing"
+		debugState["duration"] = 60.0
+
+		// Start REAL sync simulation goroutine
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			
+			// Mock client state
+			mockClockOffset := 50.0 // ms (client clock is 50ms ahead of server)
+			mockDriftAccumulation := 0.0 // ms (Web Audio drift accumulation)
+			
+			for {
+				select {
+				case <-ticker.C:
+					debugStateMu.Lock()
+					
+					// Get server playback state
+					rm.Mu.RLock()
+					state, pos, startT := rm.GetPlaybackState()
+					rm.Mu.RUnlock()
+					
+					if state != room.StatePlaying {
+						debugStateMu.Unlock()
+						return
+					}
+					
+					// Calculate server position (authoritative)
+					elapsed := time.Since(startT).Seconds()
+					serverPos := pos + elapsed
+					
+					// Simulate CLIENT perspective
+					// 1. Client clock offset (NTP-like)
+					// 2. Web Audio drift accumulation
+					
+					// Web Audio tends to drift (accumulate)
+					// Simulate: drift grows slowly over time
+					mockDriftAccumulation += 1.5 // ms per second (typical Web Audio drift)
+					
+					// Client position = server position + accumulated drift
+					clientPos := serverPos + mockDriftAccumulation/1000.0
+					
+					// Expected position (what client should be at)
+					expectedPos := serverPos
+					
+					// Calculate drift
+					driftMs := int((clientPos - expectedPos) * 1000)
+					
+					// Simulate drift correction (after 20s)
+					if elapsed > 20.0 && mockDriftAccumulation > 30.0 {
+						// Soft correction kicks in
+						mockDriftAccumulation -= 8.0 // correction per second
+						if mockDriftAccumulation < 0 {
+							mockDriftAccumulation = 0
+						}
+					}
+					
+					// Update debug state
+					debugState["lastUpdate"] = time.Now().Format("15:04:05")
+					debugState["elapsedSec"] = elapsed
+					debugState["serverPos"] = serverPos
+					debugState["clientPos"] = clientPos
+					debugState["expectedPos"] = expectedPos
+					debugState["drift"] = driftMs
+					debugState["clockOffset"] = int(mockClockOffset)
+					debugState["driftAccumulation"] = int(mockDriftAccumulation)
+					
+					// Log for debugging
+					log.Printf("[debug] elapsed=%.2f serverPos=%.2f clientPos=%.2f drift=%dms offset=%dms accum=%dms",
+						elapsed, serverPos, clientPos, driftMs, int(mockClockOffset), int(mockDriftAccumulation))
+					
+					// Stop after 60s
+					if elapsed >= 60 {
+						debugState["serverState"] = "stopped"
+						debugStateMu.Unlock()
+						return
+					}
+					
+					debugStateMu.Unlock()
+				}
+			}
+		}()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":   "playing",
+			"roomCode": roomCode,
+			"message":  "Auto-play started (REAL sync simulation)",
+		})
+	})
+
+	// Auto-play stop endpoint
+	mux.HandleFunc("/api/debug/auto-stop", func(w http.ResponseWriter, r *http.Request) {
+		debugStateMu.Lock()
+		defer debugStateMu.Unlock()
+
+		roomCode := "AUTOTEST"
+		rm := manager.GetRoom(roomCode)
+		if rm != nil {
+			rm.Mu.Lock()
+			rm.State = room.StateStopped
+			rm.Mu.Unlock()
+		}
+
+		debugState["serverState"] = "stopped"
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "stopped",
+		})
+	})
 
 	// Admin page (owner only)
 	mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
@@ -776,6 +951,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if drift < 0 {
 					drift = -drift
 				}
+				
+				// Update debug state
+				debugStateMu.Lock()
+				debugState["lastUpdate"] = time.Now().Format("15:04:05")
+				debugState["clientId"] = clientID
+				debugState["serverTrackIdx"] = serverTrackIdx
+				debugState["serverState"] = serverState
+				debugState["serverStartPos"] = serverPos  // 起始位置
+				debugState["elapsedSec"] = elapsed       // 已播放时间
+				debugState["clientPos"] = clientPos
+				debugState["expectedPos"] = expectedPos
+				debugState["driftMs"] = drift * 1000
+				debugState["duration"] = duration
+				debugStateMu.Unlock()
+				
 				// If drift > 400ms, force resync
 				if drift > 0.4 {
 					log.Printf("[sync] client %s drift %.0fms — forcing resync", clientID, drift*1000)
@@ -865,6 +1055,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				TrackAudio: trackAudio,
 				ServerTime: syncpkg.GetServerTime(),
 			}, "")
+
+		case "debug":
+			// Client debug info - log to server for remote debugging
+			if msg.Player != nil {
+				playerData := msg.Player
+				log.Printf("[debug] client=%s sampleRate=%.0f anchorPos=%.3f elapsed=%.3f expected=%.3f actual=%.3f consumed=%.0f buffered=%.0f drift=%.1fms",
+					clientID,
+					playerData["sampleRate"],
+					playerData["anchorPos"],
+					playerData["elapsedSec"],
+					playerData["expectedPos"],
+					playerData["actualPos"],
+					playerData["consumed"],
+					playerData["buffered"],
+					playerData["driftMs"])
+			}
 		}
 	}
 

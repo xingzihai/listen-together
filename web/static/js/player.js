@@ -34,10 +34,15 @@ class AudioPlayer {
         // Snapcast sync state
         this._anchorPos = 0;
         this._anchorServerTime = 0;
-        this._nominalRate = 48000;
+        this._nominalRate = 48000; // Will be updated from actual AudioContext
         this._maxCorrectionRate = 0.0005; // ±0.05%
         this._workletConsumed = 0;
         this._workletBuffered = 0;
+        this._anchorSet = false; // Anchor will be set when PCM actually starts
+        
+        // Debug state
+        this._debugCounter = 0;
+        this._lastDebugLog = 0;
         
         // Timers
         this._feedTimer = null;
@@ -52,6 +57,9 @@ class AudioPlayer {
             this.ctx = new (window.AudioContext || window.webkitAudioContext)();
             this.gainNode = this.ctx.createGain();
             this.gainNode.connect(this.ctx.destination);
+            // Update nominal rate from actual AudioContext sample rate
+            this._nominalRate = this.ctx.sampleRate;
+            console.log(`[sync] AudioContext sampleRate: ${this._nominalRate}`);
         }
         if (this.ctx.state === 'suspended') this.ctx.resume();
         this._outputLatency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
@@ -222,7 +230,7 @@ class AudioPlayer {
     // === Worklet Management ===
     
     async _createWorkletNode() {
-        if (this.workletNode) return;
+        // Always create fresh node - called after stop() which clears old node
         
         await this.ctx.audioWorklet.addModule('/js/worklet-processor.js');
         this.workletNode = new AudioWorkletNode(this.ctx, 'listen-together-processor', {
@@ -230,19 +238,26 @@ class AudioPlayer {
         });
         this.workletNode.connect(this.gainNode);
         
-        // Listen for stats
+        // Listen for stats - set anchor on first playback
         this.workletNode.port.onmessage = (e) => {
             if (e.data.type === 'stats') {
                 this._workletConsumed = e.data.totalConsumedFrames;
                 this._workletBuffered = e.data.buffered;
+                
+                // Set anchor when PCM actually starts playing
+                if (!this._anchorSet && e.data.totalConsumedFrames > 0) {
+                    this._anchorSet = true;
+                    this._anchorServerTime = window.clockSync.getServerTime();
+                    console.log(`[sync] ANCHOR_SET: sampleRate=${this._nominalRate} anchorPos=${this._anchorPos.toFixed(3)} anchorServerTime=${this._anchorServerTime}`);
+                }
             }
         };
         
-        console.log('[sync] worklet node created');
+        console.log('[sync] worklet node created (fresh)');
     }
 
     _initSharedBuffer() {
-        if (!this._sabSupported || this._sharedBuffer) return;
+        if (!this._sabSupported) return;
         
         try {
             this._sharedBuffer = new SharedArrayBuffer(8);
@@ -263,11 +278,17 @@ class AudioPlayer {
     // === PCM Feed ===
     
     async _feedPCMSegments(startPos) {
-        if (!this.workletNode) return;
+        if (!this.workletNode) {
+            console.warn('[sync] _feedPCMSegments: no workletNode');
+            return;
+        }
         
         const startSeg = Math.floor(startPos / this.segmentTime);
         const preloadCount = 5; // Preload 5 segments at a time
         
+        console.log(`[sync] _feedPCMSegments: startPos=${startPos.toFixed(2)} startSeg=${startSeg} segments=${this.segments.length}`);
+        
+        let fedCount = 0;
         for (let i = startSeg; i < Math.min(startSeg + preloadCount, this.segments.length); i++) {
             if (!this.buffers.has(i)) {
                 if (this.onBuffering) this.onBuffering(true);
@@ -276,7 +297,10 @@ class AudioPlayer {
             }
             
             const buffer = this.buffers.get(i);
-            if (!buffer) continue;
+            if (!buffer) {
+                console.warn(`[sync] _feedPCMSegments: no buffer for seg ${i}`);
+                continue;
+            }
             
             // Extract PCM data - create copies for transfer
             const leftData = buffer.getChannelData(0);
@@ -292,7 +316,11 @@ class AudioPlayer {
                 left: left.buffer,
                 right: right.buffer
             }, [left.buffer, right.buffer]);
+            
+            fedCount++;
         }
+        
+        console.log(`[sync] _feedPCMSegments: fed ${fedCount} segments to worklet`);
     }
 
     _feedLoop() {
@@ -315,7 +343,7 @@ class AudioPlayer {
         this.stop();
         this.isPlaying = true;
         
-        // Create worklet if needed
+        // Always create a fresh worklet node for each playback session
         await this._createWorkletNode();
         
         // Initialize SharedArrayBuffer
@@ -334,13 +362,16 @@ class AudioPlayer {
             }
         }
         
-        // Set Snapcast anchor
+        // Set initial position (anchor will be set when PCM actually starts)
         this._anchorPos = position || 0;
-        this._anchorServerTime = serverTime || window.clockSync.getServerTime();
+        this._anchorSet = false;
+        this._anchorServerTime = 0;
         
-        // Clear worklet buffer
+        // Clear worklet buffer (fresh node, but clear anyway)
         this.workletNode.port.postMessage({ type: 'clear' });
         this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
+        
+        console.log(`[sync] playAtPosition: pos=${this._anchorPos.toFixed(2)}s, worklet created, waiting for PCM...`);
         
         // Start feeding PCM
         await this._feedPCMSegments(this._anchorPos);
@@ -350,14 +381,17 @@ class AudioPlayer {
         
         // Start drift loop
         this._driftTimer = setInterval(() => this._driftLoop(), 250);
-        
-        console.log(`[sync] playAtPosition: pos=${this._anchorPos.toFixed(2)}s, anchor=${this._anchorServerTime}`);
     }
 
     // === Position Tracking ===
     
     getCurrentTime() {
         if (!this.isPlaying || !this.ctx) return this.lastPosition || 0;
+        
+        // If anchor not set yet, return anchorPos (initial position)
+        if (!this._anchorSet) {
+            return this._anchorPos || 0;
+        }
         
         // Read consumed frames from SharedArrayBuffer (zero latency)
         let consumed;
@@ -379,29 +413,71 @@ class AudioPlayer {
     // === Drift Detection & Correction ===
     
     _driftLoop() {
-        if (!this.isPlaying || !this._anchorServerTime) return;
+        if (!this.isPlaying) return;
+        
+        // Skip drift calculation if anchor not set yet
+        if (!this._anchorSet || !this._anchorServerTime) {
+            this._debugCounter++;
+            if (this._debugCounter % 4 === 0) {
+                console.log(`[sync] WAITING_ANCHOR: anchorSet=${this._anchorSet} buffered=${this._workletBuffered} consumed=${this._workletConsumed}`);
+            }
+            return;
+        }
         
         const serverNow = window.clockSync.getServerTime();
         const elapsedSec = (serverNow - this._anchorServerTime) / 1000;
         const expectedPos = this._anchorPos + elapsedSec;
-        const actualPos = this.getCurrentTime();
+        
+        // Read consumed from SharedArrayBuffer
+        let consumed;
+        if (this._sabSupported && this._sharedView) {
+            consumed = Number(Atomics.load(this._sharedView, 0));
+        } else {
+            consumed = this._workletConsumed || 0;
+        }
+        
+        const actualPos = this._anchorPos + consumed / this._nominalRate;
         const driftSec = actualPos - expectedPos;
-        const driftSamples = driftSec * this._nominalRate;
+        const driftMs = driftSec * 1000;
+        
+        // Debug output every 1 second (4 cycles)
+        this._debugCounter++;
+        const now = performance.now();
+        if (now - this._lastDebugLog > 1000) {
+            this._lastDebugLog = now;
+            const debugMsg = `[sync] DRIFT: sampleRate=${this._nominalRate} anchorPos=${this._anchorPos.toFixed(3)} elapsed=${elapsedSec.toFixed(3)} expected=${expectedPos.toFixed(3)} actual=${actualPos.toFixed(3)} consumed=${consumed} buffered=${this._workletBuffered} drift=${driftMs.toFixed(1)}ms`;
+            console.log(debugMsg);
+            
+            // Send to server via WebSocket
+            this._sendDebugToServer({
+                sampleRate: this._nominalRate,
+                anchorPos: this._anchorPos,
+                anchorServerTime: this._anchorServerTime,
+                elapsedSec: elapsedSec,
+                expectedPos: expectedPos,
+                actualPos: actualPos,
+                consumed: consumed,
+                buffered: this._workletBuffered,
+                driftMs: driftMs
+            });
+        }
         
         // Debug display
         const driftEl = document.getElementById('driftStatus');
         if (driftEl) {
-            driftEl.textContent = `Drift: ${(driftSec*1000).toFixed(1)}ms`;
+            driftEl.textContent = `Drift: ${driftMs.toFixed(1)}ms`;
         }
         
         const absDrift = Math.abs(driftSec);
+        const driftSamples = driftSec * this._nominalRate;
         
         // Tier 3: Hard resync (>100ms)
         if (absDrift > 0.1) {
-            console.warn(`[sync] hard resync: drift=${(driftSec*1000).toFixed(0)}ms`);
+            console.warn(`[sync] HARD_RESYNC: drift=${driftMs.toFixed(0)}ms expected=${expectedPos.toFixed(3)} actual=${actualPos.toFixed(3)}`);
             // Reset anchor
             this._anchorPos = expectedPos;
             this._anchorServerTime = serverNow;
+            this._anchorSet = false;
             if (this._sharedView) {
                 Atomics.store(this._sharedView, 0, 0n);
             }
@@ -440,6 +516,20 @@ class AudioPlayer {
         }
     }
 
+    _sendDebugToServer(data) {
+        // Send debug data to server via WebSocket for server-side logging
+        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+            try {
+                window.ws.send(JSON.stringify({
+                    type: 'debug',
+                    player: data
+                }));
+            } catch (e) {
+                // Ignore send errors
+            }
+        }
+    }
+
     // === Control ===
     
     stop() {
@@ -450,11 +540,21 @@ class AudioPlayer {
         if (this._feedTimer) { clearInterval(this._feedTimer); this._feedTimer = null; }
         if (this._driftTimer) { clearInterval(this._driftTimer); this._driftTimer = null; }
         
-        // Clear worklet
+        // Disconnect and destroy worklet node (critical for proper reset)
         if (this.workletNode) {
-            this.workletNode.port.postMessage({ type: 'clear' });
-            this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
+            try {
+                this.workletNode.port.postMessage({ type: 'clear' });
+                this.workletNode.disconnect();
+            } catch (e) {}
+            this.workletNode = null;
         }
+        
+        // Reset state
+        this._workletConsumed = 0;
+        this._workletBuffered = 0;
+        this._anchorSet = false;
+        this._sharedBuffer = null;
+        this._sharedView = null;
         
         this._upgrading = false;
     }

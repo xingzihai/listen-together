@@ -31,6 +31,7 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
         if (msg.type === 'init-shared') {
             // Receive SharedArrayBuffer from main thread
             this._sharedView = new BigInt64Array(msg.buffer);
+            console.log('[worklet] SharedArrayBuffer received');
             return;
         } else if (msg.type === 'pcm') {
             const left = new Float32Array(msg.left);
@@ -59,6 +60,7 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
                 this._buffered += frames;
                 this.port.postMessage({ type: 'overflow', dropped: need });
             }
+            console.log(`[worklet] PCM received: ${frames} frames, buffered=${this._buffered}`);
         } else if (msg.type === 'correction') {
             this._correctAfterXFrames = msg.correctAfterXFrames | 0;
             this._playedFrames = 0;
@@ -76,6 +78,7 @@ class ListenTogetherProcessor extends AudioWorkletProcessor {
             if (this._sharedView) {
                 Atomics.store(this._sharedView, 0, 0n);
             }
+            console.log('[worklet] clear: buffer reset');
         } else if (msg.type === 'query') {
             this._doReport();
         }
