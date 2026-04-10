@@ -34,15 +34,22 @@ class AudioPlayer {
         // Snapcast sync state
         this._anchorPos = 0;
         this._anchorServerTime = 0;
+        this._anchorConsumedBase = 0; // Baseline consumed when anchor is set
         this._nominalRate = 48000; // Will be updated from actual AudioContext
         this._maxCorrectionRate = 0.0005; // ±0.05%
         this._workletConsumed = 0;
         this._workletBuffered = 0;
         this._anchorSet = false; // Anchor will be set when PCM actually starts
         
+        // Server anchor (from syncTick)
+        this.serverPlayTime = 0;
+        this.serverPlayPosition = 0;
+        
         // Debug state
         this._debugCounter = 0;
         this._lastDebugLog = 0;
+        this._playInProgress = false; // Prevent duplicate playback
+        this._lastHardResync = 0; // Hard resync cooldown
         
         // Timers
         this._feedTimer = null;
@@ -50,6 +57,9 @@ class AudioPlayer {
         
         // Output latency
         this._outputLatency = 0;
+        
+        // Segment feed tracking (prevent duplicate segment feeds)
+        this._fedSegEnd = -1; // Last segment index that was fed to worklet
     }
 
     init() {
@@ -93,7 +103,7 @@ class AudioPlayer {
         }
         
         if (this.onQualityChange) this.onQualityChange(this._actualQuality, false);
-        if (this.segments.length > 0) await this.preloadSegments(0, 2);
+        if (this.segments.length > 0) await this.preloadSegments(0, 4); // Preload first 4 segments
     }
 
     async _loadQualitySegments(quality) {
@@ -248,7 +258,10 @@ class AudioPlayer {
                 if (!this._anchorSet && e.data.totalConsumedFrames > 0) {
                     this._anchorSet = true;
                     this._anchorServerTime = window.clockSync.getServerTime();
-                    console.log(`[sync] ANCHOR_SET: sampleRate=${this._nominalRate} anchorPos=${this._anchorPos.toFixed(3)} anchorServerTime=${this._anchorServerTime}`);
+                    this._anchorConsumedBase = e.data.totalConsumedFrames; // Record baseline
+                } else if (this._anchorSet && this._anchorConsumedBase === 0 && e.data.totalConsumedFrames > 0) {
+                    // Hard resync just happened, update baseline
+                    this._anchorConsumedBase = e.data.totalConsumedFrames;
                 }
             }
         };
@@ -279,26 +292,26 @@ class AudioPlayer {
     
     async _feedPCMSegments(startPos) {
         if (!this.workletNode) {
-            console.warn('[sync] _feedPCMSegments: no workletNode');
             return;
         }
         
         const startSeg = Math.floor(startPos / this.segmentTime);
-        const preloadCount = 5; // Preload 5 segments at a time
+        const preloadCount = 5;
         
-        console.log(`[sync] _feedPCMSegments: startPos=${startPos.toFixed(2)} startSeg=${startSeg} segments=${this.segments.length}`);
+        // KEY FIX: Only feed segments after _fedSegEnd to prevent duplicates
+        const actualStartSeg = Math.max(startSeg, this._fedSegEnd + 1);
+        const endSeg = Math.min(actualStartSeg + preloadCount, this.segments.length);
         
-        let fedCount = 0;
-        for (let i = startSeg; i < Math.min(startSeg + preloadCount, this.segments.length); i++) {
-            if (!this.buffers.has(i)) {
-                if (this.onBuffering) this.onBuffering(true);
-                await this.loadSegment(i);
-                if (this.onBuffering) this.onBuffering(false);
-            }
-            
+        if (actualStartSeg >= endSeg) {
+            // No new segments to feed
+            return;
+        }
+        
+        for (let i = actualStartSeg; i < endSeg; i++) {
             const buffer = this.buffers.get(i);
             if (!buffer) {
-                console.warn(`[sync] _feedPCMSegments: no buffer for seg ${i}`);
+                // Trigger background load, don't wait
+                this._loadSegmentBackground(i);
                 continue;
             }
             
@@ -306,81 +319,120 @@ class AudioPlayer {
             const leftData = buffer.getChannelData(0);
             const rightData = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : leftData;
             
-            // Create new arrays for transfer (don't detach cached buffer)
             const left = new Float32Array(leftData);
             const right = new Float32Array(rightData);
             
-            // Send to worklet with transfer
             this.workletNode.port.postMessage({
                 type: 'pcm',
+                segIdx: i,  // Add segment index for debugging
                 left: left.buffer,
                 right: right.buffer
             }, [left.buffer, right.buffer]);
             
-            fedCount++;
+            // Update fed segment range
+            this._fedSegEnd = Math.max(this._fedSegEnd, i);
         }
         
-        console.log(`[sync] _feedPCMSegments: fed ${fedCount} segments to worklet`);
+        console.log(`[feed] fed segments ${actualStartSeg}-${endSeg-1}, _fedSegEnd now ${this._fedSegEnd}`);
+    }
+    
+    // Background segment loading (non-blocking)
+    _loadSegmentBackground(idx) {
+        if (this.buffers.has(idx)) return;
+        if (this._loadingSegments && this._loadingSegments.has(idx)) return;
+        
+        if (!this._loadingSegments) this._loadingSegments = new Set();
+        this._loadingSegments.add(idx);
+        
+        this.loadSegment(idx).then(() => {
+            this._loadingSegments.delete(idx);
+        }).catch(e => {
+            this._loadingSegments.delete(idx);
+        });
     }
 
     _feedLoop() {
         if (!this.isPlaying) return;
         
-        const currentPos = this.getCurrentTime();
         const bufferedSec = this._workletBuffered / this._nominalRate;
         
-        // Keep 3-5 seconds of buffer
-        if (bufferedSec < 3 && this._workletBuffered < this._nominalRate * 10) {
-            const currentSeg = Math.floor(currentPos / this.segmentTime);
-            this._feedPCMSegments(currentSeg * this.segmentTime);
+        // KEY FIX: Calculate buffered end based on fed segments, not current position
+        // This ensures we feed the NEXT segments, not re-feed what's already in buffer
+        const fedEndPos = (this._fedSegEnd + 1) * this.segmentTime;
+        const remainingBufferSec = fedEndPos - this.getCurrentTime();
+        
+        // Start feeding when remaining buffer < 5 seconds
+        if (remainingBufferSec < 5) {
+            const nextSeg = this._fedSegEnd + 1;
+            
+            // Only feed if we haven't reached the end
+            if (nextSeg < this.segments.length) {
+                this._feedPCMSegments(nextSeg * this.segmentTime);
+            }
         }
     }
 
     // === Core Playback ===
     
     async playAtPosition(position, serverTime, scheduledAt) {
-        this.init();
-        this.stop();
-        this.isPlaying = true;
-        
-        // Always create a fresh worklet node for each playback session
-        await this._createWorkletNode();
-        
-        // Initialize SharedArrayBuffer
-        this._initSharedBuffer();
-        
-        // Reset shared counter
-        if (this._sharedView) {
-            Atomics.store(this._sharedView, 0, 0n);
+        // Prevent duplicate playback calls
+        if (this._playInProgress) {
+            console.warn('[sync] playAtPosition already in progress, skipping');
+            return;
         }
+        this._playInProgress = true;
         
-        // Wait for clock sync
-        if (!window.clockSync.synced) {
-            const syncStart = performance.now();
-            while (!window.clockSync.synced && performance.now() - syncStart < 800) {
-                await new Promise(r => setTimeout(r, 50));
+        try {
+            this.init();
+            this.stop();
+            this.isPlaying = true;
+            
+            // Always create a fresh worklet node for each playback session
+            await this._createWorkletNode();
+            
+            // Initialize SharedArrayBuffer
+            this._initSharedBuffer();
+            
+            // Reset shared counter
+            if (this._sharedView) {
+                Atomics.store(this._sharedView, 0, 0n);
             }
+            
+            // Wait for clock sync
+            if (!window.clockSync.synced) {
+                const syncStart = performance.now();
+                while (!window.clockSync.synced && performance.now() - syncStart < 800) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
+            }
+            
+            // Set initial position (anchor will be set when PCM actually starts)
+            this._anchorPos = position || 0;
+            this._anchorSet = false;
+            this._anchorServerTime = 0;
+            this._anchorConsumedBase = 0; // Record consumed when anchor is set
+            
+            // KEY FIX: Reset fed segment tracking before first feed
+            const startSeg = Math.floor(this._anchorPos / this.segmentTime);
+            this._fedSegEnd = startSeg - 1;  // Will feed from startSeg
+            
+            // Clear worklet buffer (fresh node, but clear anyway)
+            this.workletNode.port.postMessage({ type: 'clear' });
+            this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
+            
+            console.log(`[sync] playAtPosition: pos=${this._anchorPos.toFixed(2)}s, startSeg=${startSeg}, worklet created, waiting for PCM...`);
+            
+            // Start feeding PCM
+            await this._feedPCMSegments(this._anchorPos);
+            
+            // Start feed loop
+            this._feedTimer = setInterval(() => this._feedLoop(), 200);
+            
+            // Start drift loop
+            this._driftTimer = setInterval(() => this._driftLoop(), 250);
+        } finally {
+            this._playInProgress = false;
         }
-        
-        // Set initial position (anchor will be set when PCM actually starts)
-        this._anchorPos = position || 0;
-        this._anchorSet = false;
-        this._anchorServerTime = 0;
-        
-        // Clear worklet buffer (fresh node, but clear anyway)
-        this.workletNode.port.postMessage({ type: 'clear' });
-        this.workletNode.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
-        
-        console.log(`[sync] playAtPosition: pos=${this._anchorPos.toFixed(2)}s, worklet created, waiting for PCM...`);
-        
-        // Start feeding PCM
-        await this._feedPCMSegments(this._anchorPos);
-        
-        // Start feed loop
-        this._feedTimer = setInterval(() => this._feedLoop(), 200);
-        
-        // Start drift loop
-        this._driftTimer = setInterval(() => this._driftLoop(), 250);
     }
 
     // === Position Tracking ===
@@ -402,8 +454,9 @@ class AudioPlayer {
             consumed = this._workletConsumed || 0;
         }
         
-        // Snapcast formula: position = anchorPos + consumed / sampleRate
-        const pos = this._anchorPos + consumed / this._nominalRate;
+        // Snapcast formula: position = anchorPos + (consumed - base) / sampleRate
+        const consumedDelta = consumed - (this._anchorConsumedBase || 0);
+        const pos = this._anchorPos + consumedDelta / this._nominalRate;
         
         // Clamp to duration
         if (this.duration > 0 && pos > this.duration) return this.duration;
@@ -417,10 +470,6 @@ class AudioPlayer {
         
         // Skip drift calculation if anchor not set yet
         if (!this._anchorSet || !this._anchorServerTime) {
-            this._debugCounter++;
-            if (this._debugCounter % 4 === 0) {
-                console.log(`[sync] WAITING_ANCHOR: anchorSet=${this._anchorSet} buffered=${this._workletBuffered} consumed=${this._workletConsumed}`);
-            }
             return;
         }
         
@@ -436,30 +485,21 @@ class AudioPlayer {
             consumed = this._workletConsumed || 0;
         }
         
-        const actualPos = this._anchorPos + consumed / this._nominalRate;
+        // Use delta from anchor baseline
+        const consumedDelta = consumed - (this._anchorConsumedBase || 0);
+        const actualPos = this._anchorPos + consumedDelta / this._nominalRate;
         const driftSec = actualPos - expectedPos;
         const driftMs = driftSec * 1000;
         
-        // Debug output every 1 second (4 cycles)
+        // Debug output only when drift exceeds threshold
         this._debugCounter++;
         const now = performance.now();
         if (now - this._lastDebugLog > 1000) {
             this._lastDebugLog = now;
-            const debugMsg = `[sync] DRIFT: sampleRate=${this._nominalRate} anchorPos=${this._anchorPos.toFixed(3)} elapsed=${elapsedSec.toFixed(3)} expected=${expectedPos.toFixed(3)} actual=${actualPos.toFixed(3)} consumed=${consumed} buffered=${this._workletBuffered} drift=${driftMs.toFixed(1)}ms`;
-            console.log(debugMsg);
-            
-            // Send to server via WebSocket
-            this._sendDebugToServer({
-                sampleRate: this._nominalRate,
-                anchorPos: this._anchorPos,
-                anchorServerTime: this._anchorServerTime,
-                elapsedSec: elapsedSec,
-                expectedPos: expectedPos,
-                actualPos: actualPos,
-                consumed: consumed,
-                buffered: this._workletBuffered,
-                driftMs: driftMs
-            });
+            // Only log if drift is abnormal (>50ms)
+            if (Math.abs(driftMs) > 50) {
+                console.warn(`[sync] ABNORMAL DRIFT: ${driftMs.toFixed(1)}ms`);
+            }
         }
         
         // Debug display
@@ -471,19 +511,66 @@ class AudioPlayer {
         const absDrift = Math.abs(driftSec);
         const driftSamples = driftSec * this._nominalRate;
         
-        // Tier 3: Hard resync (>100ms)
-        if (absDrift > 0.1) {
+        // Tier 3: Hard resync (>500ms) with cooldown
+        const HARD_RESYNC_THRESHOLD = 0.5; // 500ms
+        const COOLDOWN_MS = 3000; // 3 second cooldown
+        
+        if (absDrift > HARD_RESYNC_THRESHOLD) {
+            // Check cooldown
+            const nowMs = performance.now();
+            if (this._lastHardResync && nowMs - this._lastHardResync < COOLDOWN_MS) {
+                // In cooldown period, skip hard resync
+                return;
+            }
+            
             console.warn(`[sync] HARD_RESYNC: drift=${driftMs.toFixed(0)}ms expected=${expectedPos.toFixed(3)} actual=${actualPos.toFixed(3)}`);
-            // Reset anchor
+            
+            this._lastHardResync = nowMs;
+            
+            // KEY FIX: Read current consumed and use as new baseline
+            // Don't reset to 0! Use actual current value
+            let currentConsumed = 0;
+            if (this._sabSupported && this._sharedView) {
+                currentConsumed = Number(Atomics.load(this._sharedView, 0));
+            } else {
+                currentConsumed = this._workletConsumed || 0;
+            }
+            
+            // Reset anchor - use current consumed as baseline
             this._anchorPos = expectedPos;
             this._anchorServerTime = serverNow;
-            this._anchorSet = false;
-            if (this._sharedView) {
-                Atomics.store(this._sharedView, 0, 0n);
-            }
-            this.workletNode?.port.postMessage({ type: 'clear' });
+            this._anchorSet = true; // Set immediately
+            this._anchorConsumedBase = currentConsumed; // KEY: use current value, not 0
+            
+            // KEY FIX: Reset fed segment tracking for resync position
+            const resyncSeg = Math.floor(expectedPos / this.segmentTime);
+            this._fedSegEnd = resyncSeg - 1;
+            
+            // DO NOT reset SharedArrayBuffer - worklet is still running
+            // DO NOT send 'clear' - we're just adjusting anchor, not stopping playback
+            
             this.workletNode?.port.postMessage({ type: 'correction', correctAfterXFrames: 0 });
             this._feedPCMSegments(expectedPos);
+            return;
+        }
+        
+        // Tier 2: Medium correction (100-500ms) - more aggressive soft correction
+        if (absDrift > 0.1) {
+            const correctionTimeSec = Math.max(2, absDrift * 5); // Faster correction
+            const samplesPerSec = driftSamples / correctionTimeSec;
+            
+            // Allow ±0.2% for medium drift
+            const maxRate = this._nominalRate * 0.002;
+            const clampedRate = Math.max(-maxRate, Math.min(maxRate, samplesPerSec));
+            
+            if (Math.abs(clampedRate) >= 0.5) {
+                const corrX = Math.round(this._nominalRate / Math.abs(clampedRate));
+                const sign = driftSec > 0 ? -1 : 1;
+                this.workletNode?.port.postMessage({
+                    type: 'correction',
+                    correctAfterXFrames: sign * corrX
+                });
+            }
             return;
         }
         
@@ -535,6 +622,7 @@ class AudioPlayer {
     stop() {
         if (this.isPlaying) this.lastPosition = this.getCurrentTime();
         this.isPlaying = false;
+        // Note: Do NOT reset _playInProgress here! It's managed by playAtPosition's try-finally
         
         // Clear timers
         if (this._feedTimer) { clearInterval(this._feedTimer); this._feedTimer = null; }
@@ -553,10 +641,48 @@ class AudioPlayer {
         this._workletConsumed = 0;
         this._workletBuffered = 0;
         this._anchorSet = false;
+        this._anchorConsumedBase = 0; // Reset baseline
         this._sharedBuffer = null;
         this._sharedView = null;
+        this._fedSegEnd = -1; // Reset segment feed tracking
         
         this._upgrading = false;
+    }
+    
+    // === Server Anchor Correction ===
+    
+    correctDrift(skipDebounce = false) {
+        if (!this.isPlaying || !this._anchorSet) return null;
+        
+        // If we have server anchor (from syncTick), use it for correction
+        if (this.serverPlayTime && this.serverPlayPosition !== undefined) {
+            const serverNow = window.clockSync.getServerTime();
+            const elapsed = (serverNow - this.serverPlayTime) / 1000;
+            const serverExpected = this.serverPlayPosition + elapsed;
+            const actualPos = this.getCurrentTime();
+            const driftSec = actualPos - serverExpected;
+            const driftMs = Math.round(driftSec * 1000);
+            
+            // Large drift correction (>100ms)
+            if (Math.abs(driftMs) > 100) {
+                // Update anchor to server position
+                this._anchorPos = serverExpected;
+                this._anchorServerTime = serverNow;
+                this._anchorConsumedBase = this._workletConsumed || 0;
+                
+                // KEY FIX: Reset fed segment tracking for new position
+                const newStartSeg = Math.floor(serverExpected / this.segmentTime);
+                this._fedSegEnd = newStartSeg - 1;
+                
+                // Feed PCM from new position
+                this._feedPCMSegments(serverExpected);
+                
+                console.log(`[sync] correctDrift: corrected ${driftMs}ms to pos=${serverExpected.toFixed(2)}s, reset _fedSegEnd to ${this._fedSegEnd}`);
+                return driftMs;
+            }
+        }
+        
+        return null;
     }
 
     setVolume(v) {
